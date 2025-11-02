@@ -1,10 +1,10 @@
 # WORK IN PROGRESS!
 
 # CornishRTK
-CornishRTK (Cornish Real-Time Kernel) is a compact, single-core, preemptive scheduler and synchronization kernel written in modern C++. 
+CornishRTK (Cornish Real-Time Kernel) is a compact, single-core, preemptive scheduler and synchronization kernel written in modern C++.
 It provides just enough kernel primitives to build or host higher-level threading systems - including the ability to run std::thread, std::mutex, and related C++ standard library features via the GCC gthreads API.
 
-# Architectural Overview
+## Architectural Overview
  ┌──────────────────────────────────────────────────────────┐
  │                 Application/User Layer                   │
  │                                                          │
@@ -56,3 +56,14 @@ It provides just enough kernel primitives to build or host higher-level threadin
         │   CPU + Timer + IRQ    │
         └────────────────────────┘
 
+
+## Ports
+
+### Linux
+
+#### Boost.Context
+
+Prerequisite
+- Ubuntu/Debian: `sudo apt install libboost-context-dev`
+- Arch: `sudo pacman -S boost`
+- macOS (Homebrew): `brew install boost`
