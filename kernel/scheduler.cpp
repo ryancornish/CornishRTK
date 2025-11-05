@@ -46,12 +46,16 @@ namespace rtk
       std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque
       std::bitset<MAX_PRIORITIES> ready_bitmap;
       std::deque<TaskControlBlock*> sleep_queue{}; // TODO: replace with wheel/heap later
+      std::atomic<uint32_t> next_wake_tick{UINT32_MAX};
+      std::atomic<bool> slice_tick_pending{false};
 
-      void reset()
+      void reset() // Should I just do a self assignment from default ctor instead?
       {
          preempt_disabled.store(false);
          need_reschedule.store(false);
          current_task = nullptr;
+         next_wake_tick.store(UINT32_MAX);
+         slice_tick_pending.store(false);
       }
    };
    static /*constinit*/ InternalSchedulerState iss;
@@ -75,6 +79,9 @@ namespace rtk
       tcb->state = TaskControlBlock::State::Ready;
       iss.ready[tcb->priority].push_back(tcb);
       iss.ready_bitmap.set(tcb->priority);
+      if (!iss.current_task || tcb->priority < iss.current_task->priority) {
+         iss.need_reschedule.store(true, std::memory_order_relaxed);
+      }
    }
 
    static void context_switch_to(TaskControlBlock* next)
@@ -94,30 +101,38 @@ namespace rtk
       DEBUG_DUMP_READY_QUEUE("schedule() need_reschedule -> true");
 
       uint32_t const now = Scheduler::tick_now();
-      for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end();) {
+      uint32_t next_due = UINT32_MAX;
+      for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end(); ) {
          TaskControlBlock* tcb = *it;
          if (static_cast<int32_t>(now - tcb->wake_tick) >= 0) {
-            iss.need_reschedule.store(true, std::memory_order_relaxed);
             it = iss.sleep_queue.erase(it);
             set_ready(tcb);
          } else {
+            next_due = std::min(next_due, tcb->wake_tick);
             ++it;
          }
       }
+      iss.next_wake_tick.store(next_due, std::memory_order_relaxed);
 
-      // Round-robin: if current’s slice expired, move it to tail first
-      if (iss.current_task &&
-         iss.current_task->state == TaskControlBlock::State::Running &&
-         iss.current_task->timeslice_left == 0)
+      // Round robin rotation
+      if (iss.slice_tick_pending.exchange(false, std::memory_order_acq_rel) &&
+         iss.current_task &&
+         iss.current_task->state == TaskControlBlock::State::Running)
       {
-         set_ready(iss.current_task);
-         iss.current_task->state = TaskControlBlock::State::Ready;
+         if (iss.current_task->timeslice_left) --iss.current_task->timeslice_left;
+         if (iss.current_task->timeslice_left == 0) {
+            set_ready(iss.current_task);
+            iss.current_task->state = TaskControlBlock::State::Ready;
+            iss.current_task->timeslice_left = TIME_SLICE;
+         }
       }
 
-      auto next = pick_highest_ready();
-      if (!next) return; // Nothing ready yet!
-      remove_ready_head(next->priority);
-      context_switch_to(next);
+      auto* next_task = pick_highest_ready();
+      if (!next_task) return; // Shhhh everyone is sleeping!
+      remove_ready_head(next_task->priority);
+      // Serve a fresh slice
+      if (next_task->timeslice_left == 0) next_task->timeslice_left = TIME_SLICE;
+      context_switch_to(next_task);
    }
 
    void Scheduler::init(uint32_t tick_hz)
@@ -172,6 +187,12 @@ namespace rtk
       iss.current_task->state = TaskControlBlock::State::Sleeping;
       iss.current_task->wake_tick = tick_now() + ticks;
       iss.sleep_queue.push_back(iss.current_task);
+
+      auto cur = iss.next_wake_tick.load(std::memory_order_relaxed);
+      if (static_cast<int32_t>(iss.current_task->wake_tick - cur) < 0) {
+         iss.next_wake_tick.store(iss.current_task->wake_tick, std::memory_order_relaxed);
+      }
+
       rtk_request_reschedule();
       port_yield();
    }
@@ -227,32 +248,13 @@ namespace rtk
 
    extern "C" void rtk_on_tick(void)
    {
-      // Wake sleepers whose time expired
-      // (linear walk now, replace with timer wheel later)
-      uint32_t const now = Scheduler::tick_now();
-      for (auto tcb : iss.sleep_queue) {
-         if (static_cast<int32_t>(now - tcb->wake_tick) >= 0) {
-            iss.need_reschedule.store(true, std::memory_order_relaxed);
-            break;
-         }
+      // Request reschedule if a wakeup is due
+      if (static_cast<int32_t>(Scheduler::tick_now() - iss.next_wake_tick.load(std::memory_order_relaxed)) >= 0) {
+         iss.need_reschedule.store(true, std::memory_order_relaxed);
       }
 
-      // Round-robin slice accounting for current thread (if any)
-      if (iss.current_task && iss.current_task->state == TaskControlBlock::State::Running) {
-         if (iss.current_task->timeslice_left > 0) --iss.current_task->timeslice_left;
-         if (iss.current_task->timeslice_left == 0) {
-            iss.need_reschedule.store(true, std::memory_order_relaxed);
-            iss.current_task->timeslice_left = TIME_SLICE; // reset for next run
-         }
-      }
-
-      // If any higher-prio thread is ready, request reschedule
-      if (iss.ready_bitmap.any()) {
-         uint8_t best = std::countr_zero(iss.ready_bitmap.to_ulong());
-         if (!iss.current_task || best < iss.current_task->priority) {
-            iss.need_reschedule.store(1, std::memory_order_relaxed);
-         }
-      }
+      // Flag that slice might have expired
+      iss.slice_tick_pending.store(true, std::memory_order_relaxed);
    }
 
    extern "C" void rtk_request_reschedule(void)

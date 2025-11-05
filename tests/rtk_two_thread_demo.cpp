@@ -13,7 +13,7 @@ static void worker(void* arg)
    {
       std::cout << static_cast<char const*>(arg) << "\n";
       // Sleep ~250 ms at 100 hz tick
-      rtk::Scheduler::sleep_for(25000);
+      rtk::Scheduler::sleep_for(250);
    }
 }
 
