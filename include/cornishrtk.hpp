@@ -10,7 +10,7 @@
 
 #include <cstdint>
 #include <cstddef>
-#include <port.h>
+#include <type_traits>
 
 namespace rtk
 {
@@ -18,7 +18,7 @@ namespace rtk
    static constexpr uint32_t MAX_PRIORITIES = 32; // 0 = highest, 31 = lowest
    static constexpr uint32_t TIME_SLICE     = 10; // In ticks
 
-   static_assert(MAX_PRIORITIES <= sizeof(unsigned long)*8, "std::bit_set<>::to_ulong() truncates");
+   static_assert(MAX_PRIORITIES <= sizeof(unsigned long)*8, "Unsupported configuration");
 
    struct Scheduler
    {
@@ -134,6 +134,7 @@ namespace rtk
       }
    };
    static_assert(sizeof(Tick) == sizeof(uint32_t), "It is important that Tick be as cheap as uint32_t");
+   static_assert(std::is_trivially_copyable_v<Tick>, "test");
 
 
 

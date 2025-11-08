@@ -2,6 +2,7 @@
  *
  */
 #include <cornishrtk.hpp>
+#include <port.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@ namespace rtk
 
    // Could try make a std::atomic<tick> work? Will have to investigate
    using AtomicTick = std::atomic<uint32_t>;
+   static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
    struct TaskControlBlock
    {
@@ -45,6 +47,7 @@ namespace rtk
       std::atomic<bool> preempt_disabled{false};
       std::atomic<bool> need_reschedule{false};
       TaskControlBlock* current_task{nullptr};
+      Thread* idle_thread{nullptr};
 
       std::array<std::deque<TaskControlBlock*>, MAX_PRIORITIES> ready{}; // TODO: replace deque with something that does not use heap
       std::bitset<MAX_PRIORITIES> ready_bitmap;
@@ -57,6 +60,7 @@ namespace rtk
          preempt_disabled.store(false);
          need_reschedule.store(false);
          current_task = nullptr;
+         idle_thread = nullptr;
          next_wake_tick.store(UINT32_MAX);
          next_slice_tick.store(UINT32_MAX);
       }
@@ -106,6 +110,7 @@ namespace rtk
 
       auto const now = Scheduler::tick_now();
 
+      // Wake sleepers
       uint32_t next_due = UINT32_MAX;
       for (auto it = iss.sleep_queue.begin(); it != iss.sleep_queue.end(); ) {
          TaskControlBlock* tcb = *it;
@@ -121,13 +126,14 @@ namespace rtk
 
       // Round robin rotation
       if (now.has_reached(iss.next_slice_tick.load(std::memory_order_relaxed)) &&
-         iss.current_task &&
-         !iss.ready[iss.current_task->priority].empty() && // Don't requeue for singular threads at a priority level
-         iss.current_task->state == TaskControlBlock::State::Running)
+          iss.current_task &&
+          iss.current_task->state == TaskControlBlock::State::Running &&
+         !iss.ready[iss.current_task->priority].empty()) // Don't requeue for singular threads at a priority level
       {
          set_ready(iss.current_task);
       }
 
+      // Choose next runnable
       auto* next_task = pick_highest_ready();
       if (!next_task) {
          iss.next_slice_tick.store(UINT32_MAX, std::memory_order_relaxed);
@@ -142,15 +148,24 @@ namespace rtk
       }
 
       remove_ready_head(next_task->priority);
-      // Serve a fresh slice
-      iss.next_slice_tick.store(now.value() + TIME_SLICE, std::memory_order_relaxed);
+      if (next_task->priority == IDLE_PRIORITY) {
+         iss.next_slice_tick.store(UINT32_MAX, std::memory_order_relaxed);
+      } else {
+         // Serve a fresh slice
+         iss.next_slice_tick.store(now.value() + TIME_SLICE, std::memory_order_relaxed);
+      }
       context_switch_to(next_task);
    }
+
+   alignas(16) static std::array<uint8_t, 1024> idle_stack{};
+   static void idle_entry(void*) { while(true) port_idle(); }
 
    void Scheduler::init(uint32_t tick_hz)
    {
       iss.reset();
       port_init(tick_hz);
+      // Create the idle thread
+      iss.idle_thread = new Thread(idle_entry, nullptr, idle_stack.data(), idle_stack.size(), IDLE_PRIORITY);
    }
 
    void Scheduler::start()
@@ -208,7 +223,7 @@ namespace rtk
       port_yield();
    }
 
-   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
+   void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_acquire); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
    static port_context_t* alloc_port_context()

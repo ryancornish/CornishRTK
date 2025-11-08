@@ -111,6 +111,7 @@ void port_idle()
    // Sleep 1 ms
    struct timespec req{.tv_nsec = 1'000'000};
    nanosleep(&req, nullptr);
+   port_yield(); // Under linux sim, we must explicitly resume the scheduler.
 }
 
 // Tick source: SIGALRM -> bump tick & call kernel hook. No switching here.
