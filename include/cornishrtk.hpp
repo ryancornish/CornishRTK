@@ -12,10 +12,20 @@
 #include <cstddef>
 #include <type_traits>
 
+#ifndef RTK_SIZEOF_PORT_CONTEXT_T
+# error "RTK_SIZEOF_PORT_CONTEXT_T must be defined on the command line (e.g. -DRTK_SIZEOF_PORT_CONTEXT_T=64)."\
+        "Calculate this by peeking the 'sizeof(port_context_t)' evaluation within the port implementation."
+#endif
+#ifndef RTK_ALIGNOF_PORT_CONTEXT_T
+# error "RTK_ALIGNOF_PORT_CONTEXT_T must be defined on the command line (e.g. -DRTK_ALIGNOF_PORT_CONTEXT_T=8)."\
+        "Calculate this by peeking the 'alignof(port_context_t)' evaluation within the port implementation."
+#endif
+
 namespace rtk
 {
    //-------------- Config ---------------
    static constexpr uint32_t MAX_PRIORITIES = 32; // 0 = highest, 31 = lowest
+   static constexpr uint32_t MAX_THREADS    = 64;
    static constexpr uint32_t TIME_SLICE     = 10; // In ticks
 
    static_assert(MAX_PRIORITIES <= UINT32_WIDTH, "Unsupported configuration");

@@ -34,17 +34,55 @@ namespace rtk
       uint8_t priority{0};
       Tick wake_tick{0};
 
-      port_context_t* context{nullptr};
       void*  stack_base{nullptr};
       size_t stack_size{0};
       Thread::EntryFunction entry_fn;
       void*  arg{nullptr};
 
-      // Intrusive queue links
+      // Intrusive queue/array links
       TaskControlBlock* next{nullptr};
       TaskControlBlock* prev{nullptr};
-
       uint16_t sleep_index{UINT16_MAX};
+      uint16_t pool_index{UINT16_MAX};
+
+      // Opaque, in-place port context storage
+      alignas(RTK_ALIGNOF_PORT_CONTEXT_T) std::array<std::byte, RTK_SIZEOF_PORT_CONTEXT_T> context_storage{};
+      port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
+   };
+   static_assert(std::is_trivially_copyable_v<TaskControlBlock>, "TaskControlBlock must be trivially copyable for reset-in-place to work!");;
+
+   class TaskPool
+   {
+      std::array<TaskControlBlock, MAX_THREADS> pool{};
+      std::bitset<MAX_THREADS> free_map;
+   public:
+      constexpr TaskPool() noexcept { free_map.set(); }
+
+      TaskControlBlock* allocate() noexcept
+      {
+         for (std::size_t i = 0; i < MAX_THREADS; ++i) {
+            if (free_map[i]) {
+            free_map.reset(i);
+            auto& tcb = pool[i];
+
+            // Reset object
+            tcb = TaskControlBlock();
+            tcb.pool_index = i;
+
+            // Start lifetime of port_context_t inside the byte storage.
+            // (If port_context_t is trivially default constructible, this is a no-op,
+            // but it keeps the program well-defined.)
+            std::construct_at(tcb.context());
+
+            return &tcb;
+            }
+         }
+         return nullptr; // pool exhausted
+      }
+      void free(TaskControlBlock* tcb) noexcept
+      {
+
+      }
    };
 
    class ReadyMatrix
@@ -147,7 +185,7 @@ namespace rtk
 
    class SleepMinHeap
    {
-      std::array<TaskControlBlock*, 64> heap_buffer{}; // TODO: Size this array
+      std::array<TaskControlBlock*, MAX_THREADS> heap_buffer{};
       uint16_t size_count{0};
 
       static uint16_t parent(uint16_t i) noexcept { return (i - 1u) >> 1; }
@@ -261,6 +299,8 @@ namespace rtk
       SleepMinHeap sleepers;
       AtomicDeadline next_wake_tick; // When next sleeper must be woken
       AtomicDeadline next_slice_tick; // When the next RR rotation is due
+
+
 
       void reset() // Should I just do a self assignment from default ctor instead?
       {

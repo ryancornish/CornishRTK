@@ -37,6 +37,7 @@ void   port_irq_disable(void);
 void   port_irq_enable(void);
 
 size_t port_context_size(void);               /* sizeof(port_context_t) */
+size_t port_context_align(void);
 size_t port_stack_align(void);                /* e.g., 16 on x86-64 */
 
 /* What the port wants to do during the idle thread. I.e. power saving */

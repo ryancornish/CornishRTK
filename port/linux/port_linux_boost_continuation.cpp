@@ -39,11 +39,14 @@ struct port_context
    void*        arg;
    bool         started;
 };
+static_assert(RTK_SIZEOF_PORT_CONTEXT_T == sizeof(port_context_t));
+static_assert(RTK_ALIGNOF_PORT_CONTEXT_T == alignof(port_context_t));
 
 // "Current" context for this OS thread (our sim is single core, single OS thread)
 static thread_local port_context* tls_current = nullptr;
 
 size_t port_context_size(void) { return sizeof(port_context); }
+size_t port_context_align(void) { return alignof(port_context); }
 
 void port_context_init(port_context_t* context, void* stack_base, size_t stack_size, port_entry_t entry, void* arg)
 {

@@ -5,10 +5,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Include path for public headers
+# Public headers
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
-add_subdirectory(port/linux)
+# Select backend
+set(RTK_PORT "linux" CACHE STRING "CornishRTK backend port")
+set_property(CACHE RTK_PORT PROPERTY STRINGS linux)
+
+# Bring in the selected port. It must define the alias target rtk::port
+add_subdirectory(port/${RTK_PORT})
+
+# Kernel + tests
 add_subdirectory(kernel)
 add_subdirectory(tests)
-
