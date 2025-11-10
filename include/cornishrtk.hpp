@@ -56,6 +56,8 @@ namespace rtk
       using EntryFunction = void(*)(void*);
       Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority);
       ~Thread();
+
+      static std::size_t reserved_stack_size();
    };
 
 

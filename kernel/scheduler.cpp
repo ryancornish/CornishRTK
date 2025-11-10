@@ -23,16 +23,14 @@ namespace rtk
    static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
    static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
+   static constexpr std::size_t align_down(std::size_t sz, std::size_t al) { return sz & ~(al - 1); }
+   static constexpr std::size_t align_up(std::size_t sz, std::size_t al)   { return (sz + (al - 1)) & ~(al - 1); }
+
    struct TaskControlBlock
    {
-      enum class State : uint8_t {
-         Ready,
-         Running,
-         Sleeping,
-         Blocked,
-      } state{State::Ready};
+      enum class State : uint8_t { Ready, Running, Sleeping, Blocked} state{State::Ready};
       uint8_t priority{0};
-      Tick wake_tick{0};
+      Tick    wake_tick{0};
 
       void*  stack_base{nullptr};
       size_t stack_size{0};
@@ -43,47 +41,12 @@ namespace rtk
       TaskControlBlock* next{nullptr};
       TaskControlBlock* prev{nullptr};
       uint16_t sleep_index{UINT16_MAX};
-      uint16_t pool_index{UINT16_MAX};
 
       // Opaque, in-place port context storage
       alignas(RTK_ALIGNOF_PORT_CONTEXT_T) std::array<std::byte, RTK_SIZEOF_PORT_CONTEXT_T> context_storage{};
       port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
    };
    static_assert(std::is_trivially_copyable_v<TaskControlBlock>, "TaskControlBlock must be trivially copyable for reset-in-place to work!");;
-
-   class TaskPool
-   {
-      std::array<TaskControlBlock, MAX_THREADS> pool{};
-      std::bitset<MAX_THREADS> free_map;
-   public:
-      constexpr TaskPool() noexcept { free_map.set(); }
-
-      TaskControlBlock* allocate() noexcept
-      {
-         for (std::size_t i = 0; i < MAX_THREADS; ++i) {
-            if (free_map[i]) {
-            free_map.reset(i);
-            auto& tcb = pool[i];
-
-            // Reset object
-            tcb = TaskControlBlock();
-            tcb.pool_index = i;
-
-            // Start lifetime of port_context_t inside the byte storage.
-            // (If port_context_t is trivially default constructible, this is a no-op,
-            // but it keeps the program well-defined.)
-            std::construct_at(tcb.context());
-
-            return &tcb;
-            }
-         }
-         return nullptr; // pool exhausted
-      }
-      void free(TaskControlBlock* tcb) noexcept
-      {
-
-      }
-   };
 
    class ReadyMatrix
    {
@@ -331,7 +294,11 @@ namespace rtk
       iss.current_task = next;
       if (previous_task) previous_task->state = TaskControlBlock::State::Ready;
       iss.current_task->state = TaskControlBlock::State::Running;
-      port_switch(previous_task ? &previous_task->context : nullptr, iss.current_task->context);
+
+      port_set_thread_pointer(next);
+
+      port_context_t* previous_context = previous_task ? previous_task->context() : nullptr;
+      port_switch(&previous_context, iss.current_task->context());
    }
 
    static void schedule()
@@ -410,7 +377,8 @@ namespace rtk
       iss.current_task->state = TaskControlBlock::State::Running;
       iss.next_slice_tick.store(Scheduler::tick_now() + TIME_SLICE);
 
-      port_start_first(iss.current_task->context);
+      port_set_thread_pointer(iss.current_task); // I think this is correct?
+      port_start_first(iss.current_task->context());
 
       if constexpr (RTK_SIMULATION) {
          while (true) {
@@ -456,19 +424,6 @@ namespace rtk
    void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
-   static port_context_t* alloc_port_context()
-   {
-      size_t const size      = port_context_size();
-      size_t const alignment = port_stack_align();
-      size_t const allocate  = ((size + alignment - 1) / alignment) * alignment;
-
-      return static_cast<port_context_t*>(std::aligned_alloc(alignment, allocate));
-   }
-   static void free_port_context(port_context_t* port_context_handle)
-   {
-      free(port_context_handle);
-   }
-
    static void thread_trampoline(void* arg_void)
    {
       auto tcb = static_cast<TaskControlBlock*>(arg_void);
@@ -477,29 +432,68 @@ namespace rtk
       while (true) Scheduler::yield();
    }
 
+
+   struct StackLayout
+   {
+      TaskControlBlock* tcb;
+      void* tls_base;
+      std::size_t tls_size;
+      void* stack_base;
+      std::size_t stack_size;
+
+      StackLayout(void* buffer_base, std::size_t buffer_size)
+      {
+         auto base = reinterpret_cast<std::uintptr_t>(buffer_base);
+         auto end  = base + buffer_size;
+
+         auto tcb_start = align_down(end - sizeof(TaskControlBlock), alignof(TaskControlBlock));
+         tcb = reinterpret_cast<TaskControlBlock*>(tcb_start);
+
+         std::uintptr_t tls_top = tcb_start;
+         tls_size = 0;  // TODO: wire real TLS size later
+         tls_base = reinterpret_cast<void*>(tls_top);
+
+         auto stack_top = reinterpret_cast<std::uintptr_t>(tls_base);
+         stack_base = reinterpret_cast<void*>(stack_top);
+         stack_size = stack_top - base;
+
+         assert(stack_size > 64 && "Buffer too small after carving TCB/TLS");
+      }
+   };
+
+
    Thread::Thread(EntryFunction fn, void* arg, void* stack_base, std::size_t stack_size, uint8_t priority)
    {
       assert(priority < MAX_PRIORITIES);
-      tcb = new TaskControlBlock{
+
+      StackLayout stack_layout(stack_base, stack_size);
+      tcb = ::new (stack_layout.tcb) TaskControlBlock{
          .priority = priority,
-         .context = alloc_port_context(),
          .stack_base = stack_base,
          .stack_size = stack_size,
          .entry_fn = fn,
          .arg = arg,
       };
 
-      port_context_init(tcb->context, stack_base, stack_size, thread_trampoline, tcb);
+      port_context_init(tcb->context(), stack_base, stack_size, thread_trampoline, tcb);
 
       set_task_ready(tcb);
       DEBUG_DUMP_READY_QUEUE("Thread() created");
    }
 
-   Thread::~Thread() {
-      // Not handling live-thread destruction yet
+   Thread::~Thread()
+   {
       if (!tcb) return;
-      free_port_context(tcb->context);
-      delete tcb;
+      port_context_destroy(tcb->context());
+      tcb->~TaskControlBlock();
+      tcb = nullptr;
+   }
+
+   std::size_t Thread::reserved_stack_size()
+   {
+      auto tcb_size = align_up(sizeof(TaskControlBlock), alignof(TaskControlBlock));
+      auto tls_size = 0; // TODO
+      return tcb_size + tls_size;
    }
 
    extern "C" void rtk_on_tick(void)

@@ -19,6 +19,7 @@ uint32_t port_tick_now(void);           /* monotonic tick */
 void port_context_init(port_context_t* ctx,
                        void* stack_base, size_t stack_size,
                        port_entry_t entry, void* arg);
+void port_context_destroy(port_context_t* ctx);
 
 // Can't apply '__attribute__((noreturn))' because Boost.Context port actually does return from this
 void port_start_first(port_context_t* first);
@@ -36,9 +37,9 @@ void port_preempt_enable(void);
 void   port_irq_disable(void);
 void   port_irq_enable(void);
 
-size_t port_context_size(void);               /* sizeof(port_context_t) */
-size_t port_context_align(void);
-size_t port_stack_align(void);                /* e.g., 16 on x86-64 */
+/* TLS integration */
+void port_set_thread_pointer(void* tp);
+void* port_get_thread_pointer(void);
 
 /* What the port wants to do during the idle thread. I.e. power saving */
 void port_idle(void);

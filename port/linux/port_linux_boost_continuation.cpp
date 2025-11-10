@@ -45,16 +45,15 @@ static_assert(RTK_ALIGNOF_PORT_CONTEXT_T == alignof(port_context_t));
 // "Current" context for this OS thread (our sim is single core, single OS thread)
 static thread_local port_context* tls_current = nullptr;
 
-size_t port_context_size(void) { return sizeof(port_context); }
-size_t port_context_align(void) { return alignof(port_context); }
-
 void port_context_init(port_context_t* context, void* stack_base, size_t stack_size, port_entry_t entry, void* arg)
 {
-   context->stack_top  = static_cast<uint8_t*>(stack_base) + stack_size;
-   context->stack_size = stack_size;
-   context->entry      = entry;
-   context->arg        = arg;
-   context->started    = false;
+   ::new (context) port_context{
+      .stack_top  = static_cast<uint8_t*>(stack_base) + stack_size,
+      .stack_size = stack_size,
+      .entry      = entry,
+      .arg        = arg,
+      .started    = false,
+   };
 
    // Allocate a stack internally via Boost allocator (ignores stack_base for now).
    // This is fine for Linux simulation; we'll switch to preallocated later.
@@ -77,6 +76,16 @@ void port_context_init(port_context_t* context, void* stack_base, size_t stack_s
       }
    );
 }
+
+void port_context_destroy(port_context_t* ctx)
+{
+  ctx->~port_context();
+}
+
+static thread_local void* thread_pointer = nullptr;
+
+void port_set_thread_pointer(void* tp) { thread_pointer = tp; }
+void* port_get_thread_pointer(void)    { return thread_pointer; }
 
 void port_switch(port_context_t** /*from (unused)*/, port_context_t* to)
 {
