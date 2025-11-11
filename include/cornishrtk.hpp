@@ -101,7 +101,7 @@ namespace rtk
       // Future deadline: wraps naturally
       friend constexpr Tick operator+(Tick tick, Delta delta) noexcept
       {
-         return Tick(uint32_t(tick.t + delta));
+         return Tick(tick.t + delta);
       }
       friend constexpr Tick operator+(Delta delta, Tick tick) noexcept
       {
@@ -115,7 +115,7 @@ namespace rtk
       // Elapsed ticks between two instants (mod 2^32)
       friend constexpr Delta operator-(Tick lhs, Tick rhs) noexcept
       {
-         return uint32_t(lhs.t - rhs.t);
+         return lhs.t - rhs.t;
       }
 
       // ---- Comparators vs uint32_t/Tick deadlines (wrap-safe '>=' and '<') ----

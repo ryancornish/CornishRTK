@@ -14,12 +14,6 @@ extern "C" {
 #include <port.h>
 }
 
-// ---- kernel hooks (weak stubs; kernel provides real ones) ----
-extern "C" void rtk_on_tick() __attribute__((weak));
-extern "C" void rtk_on_tick() {}
-extern "C" void rtk_request_reschedule() __attribute__((weak));
-extern "C" void rtk_request_reschedule() {}
-
 static std::atomic<uint32_t> g_tick{0};
 uint32_t port_tick_now() { return g_tick.load(std::memory_order_relaxed); }
 

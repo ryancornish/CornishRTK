@@ -1,0 +1,64 @@
+---
+Checks:
+  # Enabled checks
+  - -*
+  - bugprone-*
+  - cert-*
+  - clang-diagnostic-*
+  - clang-analyzer-*
+  - cppcoreguidelines-*
+  - google-*
+  - misc-*
+  - modernize-*
+  - performance-*
+  - readability-*
+
+  # Disabled checks
+  - -bugprone-easily-swappable-parameters
+  - -bugprone-reserved-identifier
+  - -bugprone-stringview-nullptr
+  - -cert-dcl16-c
+  - -cert-dcl21-cpp
+  - -cert-dcl37*
+  - -cert-dcl51*
+  - -clang-analyzer-optin.performance.Padding
+  - -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+  - -clang-diagnostic-ignored-attributes
+  - -cppcoreguidelines-avoid-do-while # I argue that do-while's ARE useful. And that the cppcoreguidelines do not provide a strong enough reason to disuade its usage
+  - -cppcoreguidelines-avoid-magic-numbers
+  - -cppcoreguidelines-avoid-non-const-global-variables
+  - -cppcoreguidelines-init-variables
+  - -cppcoreguidelines-macro-usage
+  - -cppcoreguidelines-owning-memory
+  - -cppcoreguidelines-pro-bounds-array-to-pointer-decay
+  - -cppcoreguidelines-pro-bounds-constant-array-index
+  - -cppcoreguidelines-pro-type-reinterpret-cast
+  - -cppcoreguidelines-pro-type-vararg
+  - -google-upgrade-googletest-case
+  - -misc-non-private-member-variables-in-classes
+  - -misc-unused-using-decls
+  - -misc-use-anonymous-namespace
+  - -modernize-redundant-void-arg
+  - -modernize-use-trailing-return-type
+  - -modernize-use-std-print
+  - -performance-enum-size
+  - -performance-no-int-to-ptr
+  - -readability-avoid-return-with-void-value
+  - -readability-braces-around-statements
+  - -readability-implicit-bool-conversion
+  - -readability-isolate-declaration
+  - -readability-named-parameter
+  - -readability-uppercase-literal-suffix
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+FormatStyle:     none
+CheckOptions:
+  - key:            readability-identifier-length.IgnoredLoopCounterNames
+    value:          '^[ijkln]$'
+  - key:            readability-identifier-length.IgnoredParameterNames
+    value:          '^(a|b|i|j|k|l|n|ms|mo|fn)$'
+  - key:            readability-identifier-length.IgnoredVariableNames
+    value:          '^(a|b|i|j|k|l|n|ms|mo|fn)$'
+
+...

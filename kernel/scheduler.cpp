@@ -24,8 +24,8 @@ namespace rtk
    static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
    static constexpr uint32_t IDLE_PRIORITY = MAX_PRIORITIES - 1;
 
-   static constexpr std::size_t align_down(std::size_t sz, std::size_t al) { return sz & ~(al - 1); }
-   static constexpr std::size_t align_up(std::size_t sz, std::size_t al)   { return (sz + (al - 1)) & ~(al - 1); }
+   static constexpr std::size_t align_down(std::size_t size, std::size_t align) { return size & ~(align - 1); }
+   static constexpr std::size_t align_up(std::size_t size, std::size_t align)   { return (size + (align - 1)) & ~(align - 1); }
 
    struct TaskControlBlock
    {
@@ -35,7 +35,7 @@ namespace rtk
 
       void*  stack_base{nullptr};
       size_t stack_size{0};
-      Thread::EntryFunction entry_fn;
+      Thread::EntryFunction entry_fn{nullptr};
       void*  arg{nullptr};
 
       // Intrusive queue/array links
@@ -117,7 +117,7 @@ namespace rtk
       }
       [[nodiscard]] std::bitset<UINT32_BITS> bitmap_view() const noexcept
       {
-         return std::bitset<UINT32_BITS>(bitmap);
+         return {bitmap};
       }
 
       void enqueue_task(TaskControlBlock* tcb) noexcept
@@ -133,7 +133,7 @@ namespace rtk
          if (matrix[priority].empty()) bitmap &= ~(1u << priority);
          return tcb;
       }
-      TaskControlBlock* peek_highest_task() const noexcept
+      [[nodiscard]] TaskControlBlock* peek_highest_task() const noexcept
       {
          if (bitmap == 0) return nullptr;
          auto const priority = std::countr_zero(bitmap);
@@ -169,22 +169,21 @@ namespace rtk
       void sift_up(uint16_t i) noexcept
       {
          while (i > 0) {
-            uint16_t p = parent(i);
-            if (!earlier(heap_buffer[i], heap_buffer[p])) break;
-            swap_nodes(i, p);
-            i = p;
+            uint16_t pnt = parent(i);
+            if (!earlier(heap_buffer[i], heap_buffer[pnt])) break;
+            swap_nodes(i, pnt);
+            i = pnt;
          }
       }
       void sift_down(uint16_t i) noexcept
       {
-         uint16_t l, r, m;
          while (true) {
-            uint16_t l = left(i), r = right(i), m = i;
-            if (l < size_count && earlier(heap_buffer[l], heap_buffer[m])) m = l;
-            if (r < size_count && earlier(heap_buffer[r], heap_buffer[m])) m = r;
-            if (m == i) break;
-            swap_nodes(i, m);
-            i = m;
+            uint16_t lft = left(i), rht = right(i), mid = i;
+            if (lft < size_count && earlier(heap_buffer[lft], heap_buffer[mid])) mid = lft;
+            if (rht < size_count && earlier(heap_buffer[rht], heap_buffer[mid])) mid = rht;
+            if (mid == i) break;
+            swap_nodes(i, mid);
+            i = mid;
          }
       }
 
@@ -207,7 +206,7 @@ namespace rtk
       {
          if (!size_count) return nullptr;
          TaskControlBlock* tcb = heap_buffer[0];
-         tcb->sleep_index = 0xFFFF;
+         tcb->sleep_index = UINT16_MAX;
          --size_count;
          if (size_count) {
             heap_buffer[0] = heap_buffer[size_count];
@@ -219,8 +218,8 @@ namespace rtk
       void remove(TaskControlBlock* tcb) noexcept
       {
          uint16_t i = tcb->sleep_index;
-         if (i == 0xFFFF) return; // not in heap
-         tcb->sleep_index = 0xFFFF;
+         if (i == UINT16_MAX) return; // not in heap
+         tcb->sleep_index = UINT16_MAX;
          --size_count;
          if (i == size_count) return; // removed last
 
@@ -357,7 +356,7 @@ namespace rtk
       context_switch_to(next_task);
    }
 
-   alignas(16) static std::array<uint8_t, 1024> idle_stack{};
+   alignas(RTK_STACK_ALIGN) static std::array<uint8_t, 1024> idle_stack{}; // TODO: size stack
    static void idle_entry(void*) { while(true) port_idle(); }
 
    void Scheduler::init(uint32_t tick_hz)
@@ -371,7 +370,7 @@ namespace rtk
    void Scheduler::start()
    {
       DEBUG_DUMP_READY_QUEUE("start() entry");
-      auto first = iss.ready_matrix.pop_highest_task();
+      auto* first = iss.ready_matrix.pop_highest_task();
       assert(first != nullptr);
       DEBUG_DUMP_READY_QUEUE("start() head picked/removed");
       iss.current_task = first;
@@ -427,7 +426,7 @@ namespace rtk
 
    static void thread_trampoline(void* arg_void)
    {
-      auto tcb = static_cast<TaskControlBlock*>(arg_void);
+      auto* tcb = static_cast<TaskControlBlock*>(arg_void);
       tcb->entry_fn(tcb->arg);
       // If user function returns, park/surrender forever (could signal joiners later)
       while (true) Scheduler::yield();
