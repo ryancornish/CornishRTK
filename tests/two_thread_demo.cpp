@@ -15,8 +15,8 @@ extern "C" void rtk_request_reschedule(void) { need_reschedule.store(true, std::
 
 static port_context_t* alloc_port_context()
 {
-   size_t const size      = 1;//port_context_size();
-   size_t const alignment = 2; // port_stack_align();
+   size_t const size      = 56; // Hard coded right now
+   size_t const alignment = 8;  // ^
    size_t const allocate  = ((size + alignment - 1) / alignment) * alignment;
 
    return static_cast<port_context_t*>(std::aligned_alloc(alignment, allocate));

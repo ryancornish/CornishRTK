@@ -3,6 +3,7 @@
  */
 #include <cornishrtk.hpp>
 #include <port.h>
+#include <port_traits.h>
 
 #include <algorithm>
 #include <array>
@@ -43,7 +44,7 @@ namespace rtk
       uint16_t sleep_index{UINT16_MAX};
 
       // Opaque, in-place port context storage
-      alignas(RTK_ALIGNOF_PORT_CONTEXT_T) std::array<std::byte, RTK_SIZEOF_PORT_CONTEXT_T> context_storage{};
+      alignas(RTK_PORT_CONTEXT_ALIGN) std::array<std::byte, RTK_PORT_CONTEXT_SIZE> context_storage{};
       port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
    };
    static_assert(std::is_trivially_copyable_v<TaskControlBlock>, "TaskControlBlock must be trivially copyable for reset-in-place to work!");;

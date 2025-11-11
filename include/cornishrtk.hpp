@@ -12,15 +12,6 @@
 #include <cstddef>
 #include <type_traits>
 
-#ifndef RTK_SIZEOF_PORT_CONTEXT_T
-# error "RTK_SIZEOF_PORT_CONTEXT_T must be defined on the command line (e.g. -DRTK_SIZEOF_PORT_CONTEXT_T=64)."\
-        "Calculate this by peeking the 'sizeof(port_context_t)' evaluation within the port implementation."
-#endif
-#ifndef RTK_ALIGNOF_PORT_CONTEXT_T
-# error "RTK_ALIGNOF_PORT_CONTEXT_T must be defined on the command line (e.g. -DRTK_ALIGNOF_PORT_CONTEXT_T=8)."\
-        "Calculate this by peeking the 'alignof(port_context_t)' evaluation within the port implementation."
-#endif
-
 namespace rtk
 {
    //-------------- Config ---------------

@@ -1,18 +1,15 @@
-# tests/CMakeLists.txt
+# Simple port-only demo that uses the C port API directly (no kernel)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/two_thread_demo.cpp")
+  add_executable(two_thread_demo two_thread_demo.cpp)
+  target_link_libraries(two_thread_demo PRIVATE rtk::port)
+  target_include_directories(two_thread_demo PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_features(two_thread_demo PRIVATE cxx_std_23)
+endif()
 
-# Simple demo that uses the kernel API
-add_executable(rtk_two_thread_demo
-  rtk_two_thread_demo.cpp
-)
-target_link_libraries(rtk_two_thread_demo
-  PRIVATE cornishrtk_kernel     # brings rtk::port transitively (PUBLIC)
-)
-
-# If you want a test that calls port APIs directly, link rtk::port explicitly:
-add_executable(two_thread_demo
-  two_thread_demo.cpp
-)
-target_link_libraries(two_thread_demo
-  PRIVATE cornishrtk_kernel
-          rtk::port
-)
+# Example demo that uses the kernel (optional, if present)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rtk_two_thread_demo.cpp")
+  add_executable(rtk_two_thread_demo rtk_two_thread_demo.cpp)
+  target_link_libraries(rtk_two_thread_demo PRIVATE cornishrtk_kernel)
+  target_include_directories(rtk_two_thread_demo PRIVATE ${CMAKE_SOURCE_DIR}/include)
+  target_compile_features(rtk_two_thread_demo PRIVATE cxx_std_23)
+endif()

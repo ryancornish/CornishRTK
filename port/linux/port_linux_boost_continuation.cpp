@@ -1,3 +1,5 @@
+#include <port.h>
+#include <port_traits.h>
 #include <boost/context/continuation.hpp>
 #include <boost/context/preallocated.hpp>
 #include <boost/context/stack_context.hpp>
@@ -27,7 +29,6 @@ void port_preempt_disable() {}
 void port_preempt_enable() {}
 void port_irq_disable() {}
 void port_irq_enable() {}
-size_t port_stack_align() { return 16; }
 
 struct port_context
 {
@@ -39,8 +40,9 @@ struct port_context
    void*        arg;
    bool         started;
 };
-static_assert(RTK_SIZEOF_PORT_CONTEXT_T == sizeof(port_context_t));
-static_assert(RTK_ALIGNOF_PORT_CONTEXT_T == alignof(port_context_t));
+static_assert(RTK_PORT_CONTEXT_SIZE == sizeof(port_context_t));
+static_assert(RTK_PORT_CONTEXT_ALIGN == alignof(port_context_t));
+static_assert(RTK_STACK_ALIGN == 16);
 
 // "Current" context for this OS thread (our sim is single core, single OS thread)
 static thread_local port_context* tls_current = nullptr;
