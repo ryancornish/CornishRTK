@@ -11,37 +11,37 @@ extern "C" {
 typedef struct port_context port_context_t;
 typedef void (*port_entry_t)(void*);
 
-/* Boot & time */
-void     port_init(uint32_t tick_hz);   /* set up periodic tick (0 => default) */
-uint32_t port_tick_now(void);           /* monotonic tick */
+// Boot & time
+void     port_init(uint32_t tick_hz); // Set up periodic tick
+uint32_t port_tick_now(void);         // Monotonic tick
 
-/* Context lifecycle */
+// Context lifecycle
 void port_context_init(port_context_t* context,
                        void* stack_base, size_t stack_size,
                        port_entry_t entry, void* arg);
-void port_context_destroy(port_context_t* ctx);
+void port_context_destroy(port_context_t* context);
 
 // Can't apply '__attribute__((noreturn))' because Boost.Context port actually does return from this
 void port_start_first(port_context_t* first);
 
-void port_yield(void);                        /* thread asks to reschedule */
+void port_yield(void); // Thread asks to reschedule
 void port_switch(port_context_t* from, port_context_t* to);
 
-/* ISR/Preempt model */
+// ISR/Preempt model
 void port_isr_enter(void);
-void port_isr_exit(int request_switch);       /* nonzero => resched */
+void port_isr_exit(int request_switch); // Non-zero -> reschedule
 void port_preempt_disable(void);
 void port_preempt_enable(void);
 
-/* Optional helpers */
+// Optional helpers
 void   port_irq_disable(void);
 void   port_irq_enable(void);
 
-/* TLS integration */
+// TLS integration
 void port_set_thread_pointer(void* tp);
 void* port_get_thread_pointer(void);
 
-/* What the port wants to do during the idle thread. I.e. power saving */
+// What the port wants to do during the idle thread. I.e. power saving
 void port_idle(void);
 
 // Kernel implements these!

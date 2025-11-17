@@ -1,8 +1,7 @@
-# Linux port using Boost.Context
 find_package(Boost REQUIRED COMPONENTS context)
 
 add_library(rtk_port STATIC
-  port_linux_boost_continuation.cpp
+  port_linux_boost_context.cpp
 )
 
 # Include dirs:
