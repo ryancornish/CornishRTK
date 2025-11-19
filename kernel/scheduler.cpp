@@ -60,7 +60,7 @@ namespace rtk
       port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
 
       TaskControlBlock(uint32_t id, Thread::Priority priority, std::span<std::byte> stack, Thread::Entry entry) :
-         id(id), priority(priority.val), stack(stack), entry(entry) {}
+         id(id), priority(priority), stack(stack), entry(entry) {}
    };
 
    struct StackLayout
@@ -406,7 +406,7 @@ namespace rtk
          set_task_ready(iss.current_task);
       }
 
-      if (next_task->priority == IDLE_PRIORITY.val) {
+      if (next_task->priority == IDLE_PRIORITY) {
          iss.next_slice_tick.disarm();
       } else {
          // Serve a fresh slice
@@ -511,7 +511,7 @@ namespace rtk
 
    Thread::Thread(Entry entry, std::span<std::byte> stack, Priority priority)
    {
-      assert(priority.val < IDLE_PRIORITY.val);
+      assert(priority < IDLE_PRIORITY);
 
       auto id = iss.next_thread_id.fetch_add(1, std::memory_order_relaxed);
 

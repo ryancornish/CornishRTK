@@ -61,6 +61,7 @@ namespace rtk
       {
          std::uint8_t val;
          constexpr explicit Priority(std::uint8_t v) : val(v) {}
+         operator uint8_t() const { return val; } // Intentionally implicit
       };
 
       Thread(Entry entry, std::span<std::byte> stack, Priority priority);
@@ -79,7 +80,6 @@ namespace rtk
    class ConditionVar;
 
 
-   // TODO: The footprint of this class has grown quite big. Is it cleaner to keep in in a separate header? My assumption is 'probably not'
    class Tick
    {
       uint32_t t{0};
@@ -157,9 +157,7 @@ namespace rtk
       }
    };
    static_assert(sizeof(Tick) == sizeof(uint32_t), "It is important that Tick be as cheap as uint32_t");
-   static_assert(std::is_trivially_copyable_v<Tick>, "test");
-
-
+   static_assert(std::is_trivially_copyable_v<Tick>);
 
 } // namespace rtk
 
