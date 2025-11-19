@@ -34,21 +34,21 @@ namespace rtk
    static void DEBUG_DUMP_READY_QUEUE(const char* where);
 
    static constexpr uint32_t UINT32_BITS = std::numeric_limits<uint32_t>::digits;
-   static constexpr uint8_t  IDLE_PRIORITY = MAX_PRIORITIES - 1;
+   static constexpr uint8_t IDLE_THREAD_ID = 1; // Reserved
+   static constexpr Thread::Priority IDLE_PRIORITY(MAX_PRIORITIES - 1);
 
    static constexpr std::size_t align_down(std::size_t size, std::size_t align) { return size & ~(align - 1); }
    static constexpr std::size_t align_up(std::size_t size, std::size_t align)   { return (size + (align - 1)) & ~(align - 1); }
 
    struct TaskControlBlock
    {
-      uint32_t id{0};
+      uint32_t id;
       enum class State : uint8_t { Ready, Running, Sleeping, Blocked} state{State::Ready};
-      uint8_t priority{0};
+      uint8_t priority;
       Tick    wake_tick{0};
 
       std::span<std::byte> stack;
-      Thread::EntryFunction entry_fn{nullptr};
-      void*  arg{nullptr};
+      Thread::Entry entry;
 
       // Intrusive queue/array links
       TaskControlBlock* next{nullptr};
@@ -58,6 +58,9 @@ namespace rtk
       // Opaque, in-place port context storage
       alignas(RTK_PORT_CONTEXT_ALIGN) std::array<std::byte, RTK_PORT_CONTEXT_SIZE> context_storage{};
       port_context_t* context() noexcept { return reinterpret_cast<port_context_t*>(context_storage.data()); }
+
+      TaskControlBlock(uint32_t id, Thread::Priority priority, std::span<std::byte> stack, Thread::Entry entry) :
+         id(id), priority(priority.val), stack(stack), entry(entry) {}
    };
 
    struct StackLayout
@@ -403,7 +406,7 @@ namespace rtk
          set_task_ready(iss.current_task);
       }
 
-      if (next_task->priority == IDLE_PRIORITY) {
+      if (next_task->priority == IDLE_PRIORITY.val) {
          iss.next_slice_tick.disarm();
       } else {
          // Serve a fresh slice
@@ -416,7 +419,7 @@ namespace rtk
    static void thread_trampoline(void* arg_void)
    {
       auto* tcb = static_cast<TaskControlBlock*>(arg_void);
-      tcb->entry_fn(tcb->arg);
+      tcb->entry();
       // If user function returns, park/surrender forever (could signal joiners later)
       while (true) Scheduler::yield();
    }
@@ -429,18 +432,12 @@ namespace rtk
       port_init(tick_hz);
       // Create the idle thread
       StackLayout slayout(idle_stack, 0);
-      iss.idle_tcb = ::new (slayout.tcb) TaskControlBlock{
-         .id         = 1, // Reserved for the idle thread
-         .state      = TaskControlBlock::State::Ready,
-         .priority   = IDLE_PRIORITY,
-         .wake_tick  = Tick{0},
-         .stack      = slayout.user_stack,
-         .entry_fn   = idle_entry,
-         .arg        = nullptr,
-         .next       = nullptr,
-         .prev       = nullptr,
-         .sleep_index= UINT16_MAX,
-      };
+      iss.idle_tcb = ::new (slayout.tcb) TaskControlBlock(
+         IDLE_THREAD_ID,
+         IDLE_PRIORITY,
+         slayout.user_stack,
+         Thread::Entry(idle_entry)
+      );
 
       port_context_init(iss.idle_tcb->context(),
                         slayout.user_stack.data(),
@@ -512,24 +509,18 @@ namespace rtk
    void Scheduler::preempt_disable() { port_preempt_disable(); iss.preempt_disabled.store(true, std::memory_order_release); }
    void Scheduler::preempt_enable()  { iss.preempt_disabled.store(false, std::memory_order_release); port_preempt_enable(); }
 
-   Thread::Thread(EntryFunction fn, void* arg, std::span<std::byte> stack, Priority priority)
+   Thread::Thread(Entry entry, std::span<std::byte> stack, Priority priority)
    {
-      assert(priority.val < IDLE_PRIORITY);
+      assert(priority.val < IDLE_PRIORITY.val);
 
       auto id = iss.next_thread_id.fetch_add(1, std::memory_order_relaxed);
 
       StackLayout slayout(stack, 0);
-      tcb = ::new (slayout.tcb) TaskControlBlock{
-         .id = id,
-         .priority = priority.val,
-         .stack = slayout.user_stack,
-         .entry_fn = fn,
-         .arg = arg,
-      };
+      tcb = ::new (slayout.tcb) TaskControlBlock(id, priority, slayout.user_stack, entry);
 
       port_context_init(tcb->context(), slayout.user_stack.data(), slayout.user_stack.size(), thread_trampoline, tcb);
-
       set_task_ready(tcb);
+
       DEBUG_DUMP_READY_QUEUE("Thread() created");
    }
 

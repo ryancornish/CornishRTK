@@ -17,8 +17,10 @@ uint32_t port_tick_now(void);         // Monotonic tick
 
 // Context lifecycle
 void port_context_init(port_context_t* context,
-                       void* stack_base, size_t stack_size,
-                       port_entry_t entry, void* arg);
+                       void* stack_base,
+                       size_t stack_size,
+                       port_entry_t entry,
+                       void* arg);
 void port_context_destroy(port_context_t* context);
 
 // Can't apply '__attribute__((noreturn))' because Boost.Context port actually does return from this

@@ -21,8 +21,8 @@ int main()
    rtk::Scheduler::init(10); // Tune for testing
 
    // Equal priority -> round-robin
-   rtk::Thread t1(worker, (void*)"T1 tick", t1_stack, rtk::Thread::Priority(2));
-   rtk::Thread t2(worker, (void*)"T2 tock", t2_stack, rtk::Thread::Priority(2));
+   rtk::Thread t1(rtk::Thread::Entry(worker, (void*)"T1 tick"), t1_stack, rtk::Thread::Priority(2));
+   rtk::Thread t2(rtk::Thread::Entry(worker, (void*)"T2 tock"), t2_stack, rtk::Thread::Priority(2));
 
    // In simulation, start() returns into an internal loop and never exits main.
    // On MCU ports, start() will not return (noreturn path).

@@ -54,6 +54,7 @@ namespace rtk
          Fn fn;
          void* arg;
          explicit Entry(Fn fn, void* arg = nullptr) : fn(fn), arg(arg) {}
+         void operator()() const { fn(arg); }
       };
 
       struct Priority

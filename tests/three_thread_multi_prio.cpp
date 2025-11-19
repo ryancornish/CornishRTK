@@ -61,14 +61,11 @@ int main()
    //   fast:   prio 1 (preempts others)
    //   slow:   prio 2
    //   logger: prio 10 (only runs when others are sleeping)
-   rtk::Thread fast_thread(fast_worker,
-                           (void*)"fast_worker",
-                           fast_stack,
-                           rtk::Thread::Priority(1));
+   rtk::Thread fast_thread(rtk::Thread::Entry(fast_worker, (void*)"fast_worker"), fast_stack, rtk::Thread::Priority(1));
 
-   rtk::Thread slow_thread(slow_worker, (void*)"slow_worker", slow_stack, rtk::Thread::Priority(2));
+   rtk::Thread slow_thread(rtk::Thread::Entry(slow_worker, (void*)"slow_worker"), slow_stack, rtk::Thread::Priority(2));
 
-   rtk::Thread logger_thread(logger_worker, nullptr, logger_stack, rtk::Thread::Priority(10));
+   rtk::Thread logger_thread(rtk::Thread::Entry(logger_worker), logger_stack, rtk::Thread::Priority(10));
 
    rtk::Scheduler::start();
    return 0;
