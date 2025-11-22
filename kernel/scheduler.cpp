@@ -600,13 +600,10 @@ namespace rtk
    };
    static_assert(std::is_trivially_constructible_v<MutexImpl>, "Reinterpreting opaque block is now UB");
    static_assert(std::is_standard_layout_v<MutexImpl>, "Reinterpreting opaque block is now UB");
+   static_assert(sizeof(MutexImpl) == sizeof(Mutex::ImplStorage), "Adjust forward size declaration in header to match");
+   static_assert(alignof(MutexImpl) == alignof(Mutex::ImplStorage), "Adjust forward align declaration in header to match");
 
-   [[nodiscard]] bool Mutex::is_locked() const noexcept
-   {
-      static_assert(sizeof(decltype(self)) == sizeof(MutexImpl), "Adjust forward size declaration in header to match");
-      static_assert(alignof(decltype(self)) == alignof(MutexImpl), "Adjust forward align declaration in header to match");
-      return self->owner != nullptr;
-   }
+   [[nodiscard]] bool Mutex::is_locked() const noexcept { return self->owner != nullptr; }
 
    void Mutex::lock()
    {

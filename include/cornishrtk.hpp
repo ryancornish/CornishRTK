@@ -160,17 +160,16 @@ namespace rtk
    {
       std::byte opaque[size]{};
       constexpr OpaqueImpl() = default;
-      constexpr T& operator* () { return *reinterpret_cast<T*>(opaque); }
-      constexpr T* operator->() { return  reinterpret_cast<T*>(opaque); }
+      constexpr T& operator* ()             { return *reinterpret_cast<T*>(opaque); }
+      constexpr T* operator->()             { return  reinterpret_cast<T*>(opaque); }
       constexpr T const& operator* () const { return *reinterpret_cast<T const*>(opaque); }
       constexpr T const* operator->() const { return  reinterpret_cast<T const*>(opaque); }
    };
 
    class Mutex
    {
-      OpaqueImpl<struct MutexImpl, 24, 8> self;
-
    public:
+      using ImplStorage = OpaqueImpl<struct MutexImpl, 24, 8>;
       constexpr Mutex() = default;
       ~Mutex() = default;
       constexpr Mutex(Mutex&&)            = default;
@@ -184,6 +183,9 @@ namespace rtk
       bool try_lock_for(Tick::Delta timeout);
       bool try_lock_until(Tick deadline);
       void unlock();
+
+   private:
+      ImplStorage self;
    };
 
    class Semaphore;
