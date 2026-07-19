@@ -118,8 +118,8 @@ public:
     * position change together. The matrix keys removal on the CURRENT field
     * value, so an already-enqueued thread is removed at the old value,
     * rewritten, and re-enqueued at the new. Must run on the owning core, the
-    * caller holds the thread's pi_lock, which also holds off preemption for
-    * the matrix surgery.
+    * caller holds the thread's pi_lock, whose interrupt-masking grade makes
+    * the matrix surgery atomic against ISRs as well as thread switches.
     *
     * @return warranted when the change makes a reschedule worthwhile: a ready
     *         thread was raised above the running one, or the running one

@@ -49,6 +49,12 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb) noexcept
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
 
+   // Interrupt-masked because this is the choke point every wake funnels
+   // through, including ISR wakes: the matrix splice below must be atomic
+   // against both a cross-core reschedule IPI landing mid-splice (a latent
+   // race even in thread context) and an ISR wake re-entering it.
+   this_core::critical_guard guard;
+
    // Idempotent: a remote core might have sent us a late request to ready
    // this thread, and we have already terminated it since. No-op.
    if (tcb.state == thread_state::terminated) {
@@ -238,31 +244,39 @@ void scheduler::reschedule() noexcept
 
    drain_inbox();
 
-   auto* previous_thread = current_thread;
+   thread_control_block* previous_thread = current_thread;
+   thread_control_block* next_thread     = nullptr;
 
-   switch (previous_thread->state) {
-      case thread_state::running:
-         if (previous_thread->disposition == thread_disposition::committed) {
-            set_thread_blocked(*previous_thread);
-         } else {
-            (void)set_thread_ready(*previous_thread);
-         }
-         break;
+   {
+      // The retire-and-pick must observe and mutate the matrix atomically.
+      // A pick made stale by an ISR-triggered wake_x is repaired by the
+      // ISR's own pend tail-chaining a corrective reschedule.
+      this_core::critical_guard guard;
 
-      case thread_state::terminated:
-      case thread_state::ready:
-         break;
+      switch (previous_thread->state) {
+         case thread_state::running:
+            if (previous_thread->disposition == thread_disposition::committed) {
+               set_thread_blocked(*previous_thread);
+            } else {
+               (void)set_thread_ready(*previous_thread);
+            }
+            break;
 
-      case thread_state::blocked:
-      case thread_state::created:
-         CYROS_ASSERT1(false, previous_thread->state); // Illegal thread state
-         break;
+         case thread_state::terminated:
+         case thread_state::ready:
+            break;
+
+         case thread_state::blocked:
+         case thread_state::created:
+            CYROS_ASSERT1(false, previous_thread->state); // Illegal thread state
+            break;
+      }
+
+      next_thread = ready_matrix.pop_best_thread();
+      if (!next_thread) next_thread = idle_thread;
+
+      set_thread_running(*next_thread);
    }
-
-   auto* next_thread = ready_matrix.pop_best_thread();
-   if (!next_thread) next_thread = idle_thread;
-
-   set_thread_running(*next_thread);
 
    cyros_port_switch(previous_thread->context(), next_thread->context());
 }

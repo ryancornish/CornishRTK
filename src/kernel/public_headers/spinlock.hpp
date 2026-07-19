@@ -9,10 +9,15 @@ namespace cyros
 {
 
 /**
- * @brief Simple spinlock for short critical sections
+ * @brief Interrupt-masking spinlock for short critical sections
  *
- * Spinlocks busy-wait until acquired, so should only be held for very short
- * durations (microseconds). For longer critical sections, use a Mutex.
+ * Holding the lock is an interrupt-masking critical section on the calling
+ * core: neither a thread switch nor an ISR can interleave with the holder.
+ *
+ * The cost of the guarantee is a latency contract: the system's worst-case
+ * interrupt latency includes the longest hold plus any contention spin, so
+ * sections must stay tiny (i.e. a few dozen instructions). For longer critical
+ * sections, use a mutex.
  *
  * Usage:
  *   spinlock lock;
@@ -74,7 +79,7 @@ public:
 
 private:
    std::atomic_flag flag;
-   this_core::preemption_token token{};
+   this_core::critical_token token{};
 };
 
 /**

@@ -262,9 +262,9 @@ void recompute_thread_priority(thread_control_block& tcb, thread::id const expec
          continue;
       }
 
-      // pi_lock holds the held list and active_waits stable, and (as a
-      // spinlock) holds off preemption for the matrix surgery inside
-      // reprioritise_thread.
+      // pi_lock holds the held list and active_waits stable, and (as an
+      // interrupt-masking spinlock) makes the matrix surgery inside
+      // reprioritise_thread atomic against ISRs as well as thread switches.
       spinlock_guard pi_guard(target.tcb->pi_lock);
 
       std::uint8_t const new_effective = donated_floor(*target.tcb);
@@ -399,6 +399,16 @@ preemption_token disable_preemption() noexcept
 void enable_preemption(preemption_token token) noexcept
 {
    cyros_port_preempt_enable(token.v);
+}
+
+critical_token enter_critical() noexcept
+{
+   return { .v = cyros_port_irq_save() };
+}
+
+void exit_critical(critical_token token) noexcept
+{
+   cyros_port_irq_restore(token.v);
 }
 
 } // namespace this_core

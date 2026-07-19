@@ -8,8 +8,8 @@ asm = "gcc-15"
 
 [flags]
 common = []
-c = ["-std=gnu23", "-Wall", "-Werror", "-Wextra", "-Wpedantic"]
-cxx = ["-std=gnu++23", "-Wall", "-Werror", "-Wextra", "-Wpedantic"]
+c = ["-std=gnu23", "-Wall", "-Werror", "-Wextra", "-Wpedantic", "-fno-exceptions"]
+cxx = ["-std=gnu++23", "-Wall", "-Werror", "-Wextra", "-Wpedantic", "-fno-exceptions"]
 asm = []
 link = []
 
