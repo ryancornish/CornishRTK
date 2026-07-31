@@ -4,6 +4,7 @@
 #include <cyros/kernel/thread.hpp>
 #include <cyros/kernel/function.hpp>
 #include <cyros/kernel/spinlock.hpp>
+#include <cyros/kernel/visibility.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -78,7 +79,7 @@ namespace cyros
  * mutation is protected by a per-queue lock; the queue is safe under SMP
  * and against concurrent block()/wake() on different cores.
  * ========================================================================= */
-class waitable
+class CYROS_PUBLIC waitable
 {
 public:
    /**
@@ -222,7 +223,7 @@ private:
    /**
     * @brief Private intrusive priority-ordered list of waiting threads.
     */
-   class wait_queue
+   class CYROS_PUBLIC wait_queue
    {
    public:
       using commit_fn = function<void(thread_control_block*), 32, heap_policy::no_heap>;
@@ -264,7 +265,7 @@ private:
  * This allows wait_for_any({target, non_blocking_token});
  * patterns.
  */
-class non_blocking_token : public waitable
+class CYROS_PUBLIC non_blocking_token : public waitable
 {
 protected:
    bool wait_condition(thread&) noexcept override
@@ -305,7 +306,7 @@ protected:
  * A thread must not terminate while owning a pi_waitable ,
  * and a pi_waitable must not be destroyed while owned.
  * ========================================================================= */
-class pi_waitable : public waitable
+class CYROS_PUBLIC pi_waitable : public waitable
 {
 public:
    ~pi_waitable() override;

@@ -14,6 +14,7 @@ sources_excluded_from_archive = [
 ]
 
 public_headers = [
+  "public_headers/visibility.hpp -> cyros/kernel/visibility.hpp",
   "public_headers/kernel.hpp -> cyros/kernel/kernel.hpp",
   "public_headers/function.hpp -> cyros/kernel/function.hpp",
   "public_headers/spinlock.hpp -> cyros/kernel/spinlock.hpp",

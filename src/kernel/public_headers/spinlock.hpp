@@ -4,6 +4,7 @@
 #include <cyros/kernel/core.hpp>
 
 #include <atomic>
+#include <cyros/kernel/visibility.hpp>
 
 namespace cyros
 {
@@ -32,7 +33,7 @@ namespace cyros
  *       // ... critical section ...
  *   } // Automatically unlocked
  */
-class spinlock
+class CYROS_PUBLIC spinlock
 {
 public:
    constexpr spinlock() : flag(ATOMIC_FLAG_INIT) {}
@@ -87,7 +88,7 @@ private:
  *
  * Automatically acquires lock on construction and releases on destruction.
  */
-class spinlock_guard
+class CYROS_PUBLIC spinlock_guard
 {
 public:
    explicit spinlock_guard(spinlock& lock) : lock(lock)

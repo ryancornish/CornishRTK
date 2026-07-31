@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <cyros/kernel/visibility.hpp>
 
 namespace cyros::time
 {
@@ -115,7 +116,7 @@ struct handle
  * This frequency defines the tick units used by time_point, duration, and the
  * conversion helpers such as from_milliseconds().
  */
-void initialise(uint32_t frequency_hz);
+CYROS_PUBLIC void initialise(uint32_t frequency_hz);
 
 /**
  * @brief Finalise the active time driver.
@@ -123,14 +124,14 @@ void initialise(uint32_t frequency_hz);
  * Releases any driver-owned state and returns the time subsystem to an
  * uninitialised state.
  */
-void finalise();
+CYROS_PUBLIC void finalise();
 
 /**
  * @brief Get the current monotonic time.
  *
  * @return Current time in driver ticks.
  */
-[[nodiscard]] time_point now() noexcept;
+[[nodiscard]] CYROS_PUBLIC time_point now() noexcept;
 
 /**
  * @brief Schedule a callback to run at or after a specific time point.
@@ -143,7 +144,7 @@ void finalise();
  * The callback may execute in interrupt context on embedded targets, or in the
  * caller / simulation context depending on the active driver.
  */
-[[nodiscard]] handle schedule_at(time_point tp, callback cb, void* arg) noexcept;
+[[nodiscard]] CYROS_PUBLIC handle schedule_at(time_point tp, callback cb, void* arg) noexcept;
 
 /**
  * @brief Schedule a callback to run repeatedly at a fixed interval.
@@ -160,7 +161,7 @@ void finalise();
  * The callback may execute in interrupt context on embedded targets, or in the
  * caller / simulation context depending on the active driver.
  */
-[[nodiscard]] handle schedule_recurring(duration interval, callback cb, void* arg) noexcept;
+[[nodiscard]] CYROS_PUBLIC handle schedule_recurring(duration interval, callback cb, void* arg) noexcept;
 
 /**
  * @brief Cancel a scheduled callback.
@@ -170,35 +171,35 @@ void finalise();
  *
  * It is safe to cancel an invalid, unknown, or already-fired handle.
  */
-bool cancel(handle h) noexcept;
+CYROS_PUBLIC bool cancel(handle h) noexcept;
 
 /**
  * @brief Convert milliseconds to a driver duration.
  *
  * Conversion is rounded up so that non-zero durations do not undersleep.
  */
-[[nodiscard]] duration from_milliseconds(uint32_t ms) noexcept;
+[[nodiscard]] CYROS_PUBLIC duration from_milliseconds(uint32_t ms) noexcept;
 
 /**
  * @brief Convert microseconds to a driver duration.
  *
  * Conversion is rounded up so that non-zero durations do not undersleep.
  */
-[[nodiscard]] duration from_microseconds(uint32_t us) noexcept;
+[[nodiscard]] CYROS_PUBLIC duration from_microseconds(uint32_t us) noexcept;
 
 /**
  * @brief Convert a driver duration to milliseconds.
  *
  * Conversion is rounded to the nearest millisecond.
  */
-[[nodiscard]] uint64_t to_milliseconds(duration d) noexcept;
+[[nodiscard]] CYROS_PUBLIC uint64_t to_milliseconds(duration d) noexcept;
 
 /**
  * @brief Convert a driver duration to microseconds.
  *
  * Conversion is rounded to the nearest microsecond.
  */
-[[nodiscard]] uint64_t to_microseconds(duration d) noexcept;
+[[nodiscard]] CYROS_PUBLIC uint64_t to_microseconds(duration d) noexcept;
 
 /**
  * @brief Start the time driver.
@@ -206,14 +207,14 @@ bool cancel(handle h) noexcept;
  * Enables time progression and any required timer interrupt or background
  * mechanism for the active driver.
  */
-void start() noexcept;
+CYROS_PUBLIC void start() noexcept;
 
 /**
  * @brief Stop the time driver.
  *
  * Disables time progression mechanisms used by the active driver.
  */
-void stop() noexcept;
+CYROS_PUBLIC void stop() noexcept;
 
 } // namespace cyros::time
 

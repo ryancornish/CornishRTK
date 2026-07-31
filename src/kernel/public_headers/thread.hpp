@@ -3,6 +3,7 @@
 
 #include <cyros/port/port_traits.h>
 #include <cyros/kernel/function.hpp>
+#include <cyros/kernel/visibility.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -45,7 +46,7 @@ inline constexpr core_affinity any_core = core_affinity{0xFFFFFFFF};
  *
  * The destructor asserts the thread is terminated (i.e. no implicit detach).
  */
-class thread
+class CYROS_PUBLIC thread
 {
 public:
    using id = std::uint32_t;
@@ -116,12 +117,12 @@ namespace this_thread
 /**
    * @brief Get current thread ID
    */
-[[nodiscard]] thread::id id();
+[[nodiscard]] CYROS_PUBLIC thread::id id();
 
 /**
    * @brief Get current thread (effective) priority
    */
-[[nodiscard]] thread::priority priority();
+[[nodiscard]] CYROS_PUBLIC thread::priority priority();
 
 /**
    * @brief Exit current thread
@@ -131,11 +132,11 @@ namespace this_thread
    *
    * Note: If thread entry function returns, this is called automatically.
    */
-[[noreturn]] void thread_exit();
+[[noreturn]] CYROS_PUBLIC void thread_exit();
 
-void yield();
+CYROS_PUBLIC void yield();
 
-[[nodiscard]] std::size_t wait_on_any(std::span<waitable_ref> waitables) noexcept;
+[[nodiscard]] CYROS_PUBLIC std::size_t wait_on_any(std::span<waitable_ref> waitables) noexcept;
 
 template<typename... Waitables>
 [[nodiscard]] std::size_t wait_on_any(Waitables&... waitables)

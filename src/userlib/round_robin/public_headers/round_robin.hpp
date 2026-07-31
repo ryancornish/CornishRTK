@@ -6,6 +6,7 @@
 #define CYROS_ROUND_ROBIN_HPP
 
 #include <cyros/time/time.hpp>
+#include <cyros/kernel/visibility.hpp>
 
 namespace cyros::rr
 {
@@ -26,7 +27,7 @@ namespace cyros::rr
  * Runs until time is finalised. There is no separate disable, matching that
  * round-robin is a policy left on for the life of the system.
  */
-void enable_round_robin(time::duration slice);
+CYROS_PUBLIC void enable_round_robin(time::duration slice);
 
 } // namespace cyros::rr
 

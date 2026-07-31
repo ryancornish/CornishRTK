@@ -1,0 +1,24 @@
+# Release build of the preempt port: the only profile that can actually exercise
+# the lto_merged archive strategy. gcc-release was previously reachable only via
+# linux_boost_sim_release, and every boost profile currently fails to compile.
+[profile]
+name = "linux_preempt_release"
+toolchain = "../toolchains/gcc-release.toml"
+config_header = "../configs/sim.hpp"
+
+[layout]
+source_root = "../../src"
+output_root = "../../out"
+
+[components]
+port = "linux_preempt"
+time_driver = "simulation"
+
+[features]
+enable = [
+   "round_robin",
+   "sync",
+]
+
+[output]
+archive = "libcyros.a"

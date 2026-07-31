@@ -3,13 +3,14 @@
 
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/kernel/thread.hpp>
+#include <cyros/kernel/visibility.hpp>
 
 namespace cyros::time { struct time_point; struct duration; }
 
 namespace cyros::sync
 {
 
-class mutex : public pi_waitable
+class CYROS_PUBLIC mutex : public pi_waitable
 {
 public:
    void unlock() noexcept;

@@ -1,5 +1,0 @@
-_ZN6cortos11this_thread11thread_exitEv
-_ZN6cortos11this_thread2idEv
-_ZN6cortos11this_thread5yieldEv
-_ZN6cortos11this_thread7core_idEv
-_ZN6cortos11this_thread8priorityEv

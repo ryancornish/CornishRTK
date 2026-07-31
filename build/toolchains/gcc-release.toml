@@ -3,8 +3,12 @@ extends = "gcc-base.toml"
 
 [flags]
 common_add = ["-O2"]
-c_add   = ["-ffunction-sections", "-fdata-sections", "-flto"]
-cxx_add = ["-ffunction-sections", "-fdata-sections", "-flto"]
+# -fvisibility=hidden hides every symbol unless its declaration carries
+# CYROS_PUBLIC (see cyros/kernel/visibility.hpp). That is what gives
+# archive.localize_hidden something to act on: the merged object keeps only the
+# declared public ABI global and localizes the rest.
+c_add   = ["-ffunction-sections", "-fdata-sections", "-flto", "-fvisibility=hidden"]
+cxx_add = ["-ffunction-sections", "-fdata-sections", "-flto", "-fvisibility=hidden", "-fvisibility-inlines-hidden"]
 
 [settings]
 debug = false
@@ -12,6 +16,12 @@ optimization = "2"
 
 [archive]
 strategy = "lto_merged"
-exported_symbols_file = "../exports/public_symbols.txt"
-filter_exported_symbols = true
-preserve_lto_sections = true
+localize_hidden = true
+# MUST stay false while localize_hidden is true, and the loader enforces it.
+# preserve_lto_sections selects -flinker-output=rel, which keeps the GIMPLE IR in
+# the object; symbol resolution then comes from the LTO plugin, which ignores the
+# ELF symbol table objcopy edited. Verified: with rel, an "internal" symbol stays
+# global and a consumer referencing it links successfully, so the hiding does
+# nothing at all. nolto-rel applies LTO here and emits real machine code, where
+# localization is authoritative.
+preserve_lto_sections = false

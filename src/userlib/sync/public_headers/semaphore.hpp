@@ -3,6 +3,7 @@
 
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/kernel/thread.hpp>
+#include <cyros/kernel/visibility.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -12,7 +13,7 @@ namespace cyros::time { struct time_point; struct duration; }
 namespace cyros::sync
 {
 
-class semaphore : public waitable
+class CYROS_PUBLIC semaphore : public waitable
 {
 public:
    constexpr explicit semaphore(std::size_t n) : counter(n) {}

@@ -2,6 +2,7 @@
 #define CYROS_CORE_HPP
 
 #include <cstdint>
+#include <cyros/kernel/visibility.hpp>
 
 namespace cyros::this_core
 {
@@ -9,7 +10,7 @@ namespace cyros::this_core
 /**
    * @brief Get current CPU core ID (0-based)
    */
-[[nodiscard]] std::uint32_t id() noexcept;
+[[nodiscard]] CYROS_PUBLIC std::uint32_t id() noexcept;
 
 /**
  * @brief Request a deferred reschedule on the calling core.
@@ -18,13 +19,13 @@ namespace cyros::this_core
  * @note This may return without rescheduling. If so, the reschedule is deferred and resolved
  * at the next safe point.
  */
-void pend_reschedule() noexcept;
+CYROS_PUBLIC void pend_reschedule() noexcept;
 
 struct [[nodiscard]] preemption_token { std::uint32_t v; };
 
-preemption_token disable_preemption() noexcept;
+CYROS_PUBLIC preemption_token disable_preemption() noexcept;
 
-void enable_preemption(preemption_token token) noexcept;
+CYROS_PUBLIC void enable_preemption(preemption_token token) noexcept;
 
 struct [[nodiscard]] critical_token { std::uint32_t v; };
 
@@ -35,7 +36,7 @@ struct [[nodiscard]] critical_token { std::uint32_t v; };
  * delivered to this core until the matching exit_critical(), so the section
  * is atomic with respect to ISRs as well as thread switches.
  */
-critical_token enter_critical() noexcept;
+CYROS_PUBLIC critical_token enter_critical() noexcept;
 
 /**
  * @brief Leave an interrupt-masking critical section (nestable).
@@ -44,7 +45,7 @@ critical_token enter_critical() noexcept;
  * reschedule or interrupt that pended during the section is resolved before
  * this call returns.
  */
-void exit_critical(critical_token token) noexcept;
+CYROS_PUBLIC void exit_critical(critical_token token) noexcept;
 
 struct preemption_guard
 {
