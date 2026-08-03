@@ -61,6 +61,7 @@
 #include <sigctx/sigctx_intercept.h>
 
 #include <atomic>
+#include <cerrno>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +71,8 @@
 #include <memory>
 #include <pthread.h>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 
 
 /* ============================================================================
@@ -138,12 +141,69 @@ struct cpu_core
    uint32_t                core_id{};
    cyros_port_core_entry_t entry{};
 
-   alignas(64) std::uint8_t handler_stack[handler_stack_size];
+   // OS Guarded - layout: [ guard page (PROT_NONE) ][ handler_stack_size usable, grows down ]
+   std::uint8_t* handler_stack{nullptr};
+   std::size_t   handler_stack_bytes{0};
 
    // Captured at first signal delivery on this core. Resuming it unwinds back
    // through cyros_port_start_first() so the owning OS thread can be joined.
    sigctx_inl_t scheduler_ctx{};
+
+   ~cpu_core();
+
+   /** 
+    * @brief Map the guarded handler stack. Returns 0, or a negative errno. 
+    */
+   int allocate_handler_stack();
+
+private:
+   void*       stack_mapping{nullptr};
+   std::size_t stack_mapping_bytes{0};
 };
+
+static std::size_t guard_page_size()
+{
+   auto const page = sysconf(_SC_PAGESIZE);
+   return page > 0 ? static_cast<std::size_t>(page) : 4096u;
+}
+
+cpu_core::~cpu_core()
+{
+   if (stack_mapping != nullptr) {
+      munmap(stack_mapping, stack_mapping_bytes);
+   }
+}
+
+int cpu_core::allocate_handler_stack()
+{
+   if (handler_stack != nullptr) return 0; // already mapped
+
+   std::size_t const guard = guard_page_size();
+   stack_mapping_bytes = guard + handler_stack_size;
+
+   stack_mapping = mmap(nullptr, stack_mapping_bytes,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+   if (stack_mapping == MAP_FAILED) {
+      stack_mapping = nullptr;
+      stack_mapping_bytes = 0;
+      return -ENOMEM;
+   }
+
+   // Lowest page is the guard. sigctx derives the stack top as
+   // (handler_sp + handler_ss), so the stack grows down towards it.
+   if (mprotect(stack_mapping, guard, PROT_NONE) != 0) {
+      int const err = -errno;
+      munmap(stack_mapping, stack_mapping_bytes);
+      stack_mapping = nullptr;
+      stack_mapping_bytes = 0;
+      return err;
+   }
+
+   handler_stack       = static_cast<std::uint8_t*>(stack_mapping) + guard;
+   handler_stack_bytes = handler_stack_size;
+   return 0;
+}
 
 /**
  * @brief Dynamically-sized container for cpu_core's.
@@ -339,6 +399,9 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
  */
 static int install_interceptor(cpu_core& core)
 {
+   int const mapped = core.allocate_handler_stack();
+   if (mapped != 0) return mapped;
+
    // Keep the timer signal masked during reschedule
    sigset_t extra;
    sigemptyset(&extra);
@@ -347,7 +410,7 @@ static int install_interceptor(cpu_core& core)
    sigctx_intercept_cfg cfg{
       .signo       = preempt_signo,
       .handler_sp  = core.handler_stack,
-      .handler_ss  = sizeof(core.handler_stack),
+      .handler_ss  = core.handler_stack_bytes,
       .handler     = on_reschedule,
       .arg         = &core,
       .block_extra = &extra,
