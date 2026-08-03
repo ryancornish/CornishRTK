@@ -14,12 +14,12 @@
  * This port implements the two-operation reschedule contract from port.h:
  *
  *   cyros_port_thread_yield()    - strong guarantee, synchronous. Resumes the
- *                                   scheduler fiber immediately. Caller must be
+ *                                   scheduler context immediately. Caller must be
  *                                   in thread context at baseline priority.
  *
  *   cyros_port_pend_reschedule() - weak guarantee, deferred-safe. If invoked
- *                                   at baseline priority it resolves now (same
- *                                   fiber resume). If invoked while the core is
+ *                                   at baseline priority it resolves now (the
+ *                                   same synchronous switch). If invoked while the core is
  *                                   kernel-masked it sets a per-core
  *                                   "reschedule pending" flag instead.
  *
@@ -29,7 +29,7 @@
  *   - interrupt_disable_depth : interrupt masking (Critical Sections).
  *   - preempt_disable_depth   : preemption disabling (Preemption Control).
  * A context switch may occur only at "baseline priority": inside a thread
- * fiber with BOTH counters at zero.
+ * context with BOTH counters at zero.
  *
  * Resolving the pending flag
  * --------------------------
@@ -43,9 +43,20 @@
 
 #include <cyros/port/port.h>
 
-#include <boost/context/fiber.hpp>
-#include <boost/context/preallocated.hpp>
-#include <boost/context/stack_context.hpp>
+/* Deliberately use the 'private' header details rather than <boost/context/fiber.hpp>.
+ * Using the public fiber interface requires compiling with exceptions (for a feature
+ * we don't need). Though this is 'detail' it *shouldn't* change.
+ */
+#include <boost/context/detail/fcontext.hpp>
+namespace boost::context
+{
+
+using detail::fcontext_t;
+using detail::transfer_t;
+using detail::make_fcontext;
+using detail::jump_fcontext;
+
+}
 
 #include <algorithm>
 #include <atomic>
@@ -59,7 +70,72 @@
 #include <iostream>
 #include <pthread.h>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <utility>
 
+
+/* ============================================================================
+ * Context handles and the transfer protocol
+ * ========================================================================= */
+
+/**
+ * @brief Handle to a suspended CPU context.
+ *
+ * Wrapper around raw boost::context::fcontext_t that implements move semantics.
+ */
+class context_handle
+{
+public:
+   constexpr context_handle() = default;
+   constexpr explicit context_handle(boost::context::fcontext_t ctx) noexcept : fctx(ctx) {}
+   ~context_handle() = default;
+
+   context_handle(context_handle const&)            = delete;
+   context_handle& operator=(context_handle const&) = delete;
+
+   context_handle(context_handle&& other) noexcept : fctx(std::exchange(other.fctx, nullptr)) {}
+   context_handle& operator=(context_handle&& other) noexcept
+   {
+      fctx = std::exchange(other.fctx, nullptr);
+      return *this;
+   }
+
+   /**
+    * @brief True while this handle refers to a context that can be resumed.
+    */
+   explicit operator bool() const noexcept { return fctx != nullptr; }
+
+   /**
+    * @brief Switch to this context, consuming the handle.
+    * @param data Handed to the target as transfer_t::data, see the protocol below.
+    * @return The context control came back from, and whatever data it sent.
+    */
+   boost::context::transfer_t jump(void* data)
+   {
+      CYROS_ASSERT(fctx); // Bug: switching to an empty or already-spent context
+      return boost::context::jump_fcontext(std::exchange(fctx, nullptr), data);
+   }
+
+private:
+   boost::context::fcontext_t fctx{nullptr};
+};
+
+/**
+ * @brief transfer_t::data protocol.
+ *
+ * A make_fcontext entry point receives its argument through the data pointer of
+ * the FIRST jump into it, and a finishing thread has to announce itself
+ * explicitly. boost::context signalled completion by returning an empty fiber,
+ * use a 'thread_finished_signal' as a sentinel for the same behaviour.
+ *
+ *   first entry into a thread      : the cyros_port_context*
+ *   first entry into a scheduler   : the cpu_core*
+ *   ordinary suspend, either way   : nullptr
+ *   a thread's final jump out      : thread_finished_signal
+ */
+static std::byte   thread_finished_tag;  // Address-only sentinel, never read
+static void* const thread_finished_signal = &thread_finished_tag;
 
 /* ============================================================================
  * Port Context Structure
@@ -67,11 +143,11 @@
 
 struct cyros_port_context
 {
-   boost::context::fiber thread;  // Thread fiber (owned by scheduler when idle)
-   void*                 stack_top;
-   size_t                stack_size;
+   context_handle       thread;  // Thread context (owned by scheduler when idle)
+   void*                stack_top;
+   size_t               stack_size;
    cyros_port_entry_t   entry;
-   void*                 arg;
+   void*                arg;
 };
 
 /* ============================================================================
@@ -89,8 +165,8 @@ static_assert((CYROS_PORT_STACK_ALIGN & (CYROS_PORT_STACK_ALIGN - 1)) == 0,
 /**
  * For simulating the SMP schedulers on top of linux, we
  * spawn a new pthread (AKA OS-thread) for each configured core - (Except core0 because that is the initial thread).
- * Each OS-thread encapsulates a scheduler fiber that is ther "outer-context" for each user-thread pinned to a core.
- * When the user-thread "pends reschedule", the context is switched to this outer fiber so that scheduling can happen
+ * Each OS-thread encapsulates a scheduler context that is their "outer-context" for each user-thread pinned to a core.
+ * When the user-thread "pends reschedule", the context is switched to this outer context so that scheduling can happen
  * on a separate stack and context to the threads.
  */
 struct cpu_core
@@ -98,7 +174,23 @@ struct cpu_core
    pthread_t pthread{}; // @note This is null/unused for core0
    uint32_t  core_id{}; // Index from 0... num cores
    cyros_port_core_entry_t entry{};
-   boost::context::fiber scheduler_fiber;
+   context_handle scheduler_context;
+
+   /**
+    * @brief The scheduler context's stack, owned by this core.
+    *
+    * boost::context::fiber allocated this itself, with a guard page. Raw
+    * fcontext has no allocator, so the port owns it - and keeps the guard,
+    * because a scheduler-stack overflow would otherwise scribble silently over
+    * the neighbouring cpu_core instead of faulting somewhere findable.
+    *
+    * Layout: [ guard page (PROT_NONE) ][ stack, grows down into the guard ]
+    */
+   static constexpr size_t scheduler_stack_size = 128 * 1024; // Probably size overkill
+   void*  scheduler_mapping{nullptr};
+   size_t scheduler_mapping_size{0};
+
+   ~cpu_core();
 
    /**
     * @brief Primitives to signal/communicate with other cores
@@ -187,14 +279,14 @@ struct current_core_state
 {
    cpu_core* core{nullptr};
 
-   // Non-null when we are currently executing inside a thread fiber.
+   // Non-null when we are currently executing inside a thread context.
    cyros_port_context* current_context{nullptr};
 
-   // The "caller" fiber for the currently running thread on *this OS-thread*.
-   boost::context::fiber thread_caller;
-   // The outermost fiber that returns us back out of the scheduler fibers when they are finished.
-   boost::context::fiber os_caller;
-   // Simulates pointing to fibers dedicated TLS block.
+   // The "caller" context for the currently running thread on *this OS-thread*.
+   context_handle thread_caller;
+   // The outermost context that takes us back out of the scheduler when it is finished.
+   context_handle os_caller;
+   // Simulates pointing to a context's dedicated TLS block.
    void* tls_pointer{nullptr};
 
    // Interrupt-masking nesting depth (Critical Sections). Blocks the hardware.
@@ -212,63 +304,95 @@ struct current_core_state
 };
 static thread_local constinit current_core_state current_core;
 
-// Boost requires a stubbed allocator for our pre-allocated stack memory
-struct preallocated_stack_noop
+static size_t guard_page_size()
 {
-   using traits_type = boost::context::stack_traits;
-   boost::context::stack_context allocate(size_t) { std::abort(); }
-   void deallocate(boost::context::stack_context&) noexcept {}
-};
+   auto const page = sysconf(_SC_PAGESIZE);
+   return page > 0 ? static_cast<size_t>(page) : 4096u;
+}
 
-void cpu_core::start_scheduler()
+cpu_core::~cpu_core()
 {
-   scheduler_fiber = boost::context::fiber(
-      [this](boost::context::fiber&& caller) mutable -> boost::context::fiber
-      {
-         current_core.os_caller = std::move(caller);
-
-         // Run kernel entry for this simulated core (will start first thread etc.)
-         entry();
-
-         // Cooperative pump until only idle threads remain (one idle thread per core).
-         while (global.active_contexts.load(std::memory_order_acquire) > global.cores.size()) {
-            global.reschedule_handler();
-         }
-
-         // First core to observe quiescence initiates shutdown.
-         bool expected = false;
-         if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            for (auto& c : global.cores) {
-               cyros_port_send_reschedule_ipi(c.core_id);
-            }
-         }
-
-         return std::move(current_core.os_caller);
-      }
-   );
-
-   // Enter the scheduler fiber. When it returns, this OS-thread is done.
-   scheduler_fiber = std::move(scheduler_fiber).resume();
+   if (scheduler_mapping != nullptr) {
+      munmap(scheduler_mapping, scheduler_mapping_size);
+   }
 }
 
 /**
- * @brief Perform the synchronous switch into the scheduler fiber.
+ * @brief Entry point of a core's scheduler context.
  *
- * Precondition: we are inside a thread fiber (current_context != nullptr).
- * The scheduler fiber ('thread_caller') runs the kernel reschedule and, when
+ * @note Must never return. A make_fcontext entry that returns is undefined
+ *       behaviour
+ */
+[[gnu::noreturn]]
+static void scheduler_trampoline(boost::context::transfer_t entry_transfer)
+{
+   auto* core = static_cast<cpu_core*>(entry_transfer.data);
+   current_core.os_caller = context_handle(entry_transfer.fctx);
+
+   // Run kernel entry for this simulated core (will start first thread etc.)
+   core->entry();
+
+   // Cooperative pump until only idle threads remain (one idle thread per core).
+   while (global.active_contexts.load(std::memory_order_acquire) > global.cores.size()) {
+      global.reschedule_handler();
+   }
+
+   // First core to observe quiescence initiates shutdown.
+   bool expected = false;
+   if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      for (auto& c : global.cores) {
+         cyros_port_send_reschedule_ipi(c.core_id);
+      }
+   }
+
+   current_core.os_caller.jump(nullptr);
+   __builtin_unreachable();
+}
+
+void cpu_core::start_scheduler()
+{
+   size_t const guard = guard_page_size();
+   scheduler_mapping_size = guard + scheduler_stack_size;
+
+   scheduler_mapping = mmap(nullptr, scheduler_mapping_size,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+   CYROS_ASSERT(scheduler_mapping != MAP_FAILED); // Out of memory for a scheduler stack
+
+   // Lowest page is the guard: the stack grows down towards it.
+   int const guarded = mprotect(scheduler_mapping, guard, PROT_NONE);
+   CYROS_ASSERT(guarded == 0); // Could not arm the scheduler stack guard page
+   (void)guarded;
+
+   auto* const stack_top = static_cast<uint8_t*>(scheduler_mapping) + scheduler_mapping_size;
+
+   scheduler_context = context_handle(
+      boost::context::make_fcontext(stack_top, scheduler_stack_size, &scheduler_trampoline)
+   );
+
+   // Enter the scheduler context. It jumps back here when this core is done,
+   // and jump() has already emptied the handle by then.
+   scheduler_context.jump(this);
+}
+
+/**
+ * @brief Perform the synchronous switch into the scheduler context.
+ *
+ * Precondition: we are inside a thread context (current_context != nullptr).
+ * The scheduler context ('thread_caller') runs the kernel reschedule and, when
  * this thread is later selected again, control returns here.
  */
-static void switch_to_scheduler_fiber()
+static void switch_to_scheduler_context()
 {
-   CYROS_ASSERT(current_core.current_context); // not inside a thread fiber
-   CYROS_ASSERT(current_core.thread_caller);   // no scheduler fiber to resume
-   current_core.thread_caller = std::move(current_core.thread_caller).resume();
+   CYROS_ASSERT(current_core.current_context); // Not inside a thread context
+   CYROS_ASSERT(current_core.thread_caller);   // No scheduler context to resume
+   current_core.thread_caller = context_handle(current_core.thread_caller.jump(nullptr).fctx);
 }
 
 /**
  * @brief Drain a deferred reschedule if the core is now at baseline priority.
  *
- * Baseline = inside a thread fiber, interrupt depth 0, preempt depth 0.
+ * Baseline = inside a thread context, interrupt depth 0, preempt depth 0.
  * Called whenever either depth counter returns to zero.
  */
 static void resolve_pending_reschedule_if_baseline()
@@ -278,11 +402,11 @@ static void resolve_pending_reschedule_if_baseline()
    // Baseline requires BOTH counters at zero...
    if (current_core.interrupt_disable_depth != 0) return;
    if (current_core.preempt_disable_depth   != 0) return;
-   // ...and that we are inside a thread fiber to switch away from.
+   // ...and that we are inside a thread context to switch away from.
    if (!current_core.current_context) return;
 
    current_core.reschedule_pending = false;
-   switch_to_scheduler_fiber();
+   switch_to_scheduler_context();
 }
 
 /**
@@ -370,7 +494,7 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
             auto* init = static_cast<cpu_core*>(arg);
             current_core.core = init;
 
-            // Enter the scheduler-fiber
+            // Enter the scheduler context
             init->start_scheduler();
 
             // On exit, we finish this OS-thread instance and core0's OS-thread can join with us
@@ -384,10 +508,10 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
    auto& core0 = global.cores[0];
    current_core.core = &core0;
 
-   // Enter the scheduler-fiber for core0
+   // Enter the scheduler context for core0
    core0.start_scheduler();
 
-   // When core0's scheduler-fiber returns, join to any other active Core OS-thread
+   // When core0's scheduler context returns, join to any other active Core OS-thread
    for (auto& core : global.cores) {
       if (core.core_id == 0) continue;
       pthread_join(core.pthread, nullptr);
@@ -410,7 +534,7 @@ void cyros_port_send_reschedule_ipi(uint32_t core_id)
    pthread_mutex_unlock(&core_poke.mutex);
 
    if (core_id == current_core.core->core_id && current_core.current_context) {
-      // Targeting our own core from within a thread fiber: an IPI is a weak,
+      // Targeting our own core from within a thread context: an IPI is a weak,
       // deferred-safe request - route through pend_reschedule(), not a forced
       // synchronous yield.
       cyros_port_pend_reschedule();
@@ -481,6 +605,28 @@ void cyros_port_preempt_enable(cyros_mask_token_t token)
  * Context Management & Switching
  * ------------------------------------------------------------------------- */
 
+/**
+ * @brief Entry point of a user thread's context.
+ */
+[[gnu::noreturn]]
+static void thread_trampoline(boost::context::transfer_t entry_transfer)
+{
+   auto* context = static_cast<cyros_port_context*>(entry_transfer.data);
+
+   current_core.thread_caller   = context_handle(entry_transfer.fctx);
+   current_core.current_context = context;
+
+   context->entry(context->arg); // Enter user code
+
+   current_core.current_context = nullptr;
+
+   // Final hand-back. The sentinel tells cyros_port_switch that this stack is
+   // finished, so it stores an empty handle rather than one pointing at a dead
+   // context. boost::context conveyed the same thing by returning an empty fiber.
+   current_core.thread_caller.jump(thread_finished_signal);
+   __builtin_unreachable();
+}
+
 void cyros_port_context_init(cyros_port_context_t* context,
                              void* stack_base,
                              size_t stack_size,
@@ -498,45 +644,17 @@ void cyros_port_context_init(cyros_port_context_t* context,
       .arg        = arg,
    };
 
-   // Build a fiber bound to the user-provided stack
-   boost::context::stack_context boost_stack_context{
-      .size = context->stack_size,
-      .sp   = context->stack_top,
-   };
-
-   boost::context::preallocated boost_prealloc(
-      boost_stack_context.sp,
-      boost_stack_context.size,
-      boost_stack_context
-   );
-
-   preallocated_stack_noop stack_allocator;
-
-   context->thread = boost::context::fiber(
-      std::allocator_arg,
-      boost_prealloc,
-      stack_allocator,
-      [context](boost::context::fiber&& caller) mutable -> boost::context::fiber
-      {
-         current_core.thread_caller     = std::move(caller);
-         current_core.current_context = context;
-
-         try {
-            context->entry(context->arg); // Enter user code
-         } catch (boost::context::detail::forced_unwind const&) {
-            current_core.current_context = nullptr;
-            throw;
-         }
-         current_core.current_context = nullptr;
-
-         return std::move(current_core.thread_caller);
-      }
+   // make_fcontext takes caller-owned memory directly, which is why the old
+   // preallocated/stubbed-allocator dance is gone. stack_top is the high address:
+   // stacks grow down.
+   context->thread = context_handle(
+      boost::context::make_fcontext(context->stack_top, context->stack_size, &thread_trampoline)
    );
 }
 
 void cyros_port_context_destroy(cyros_port_context_t* context)
 {
-   // Verify fiber has completed
+   // Verify the thread context has run to completion
    CYROS_ASSERT(!context->thread); // Bug: destroying a live thread
 
    context->~cyros_port_context();
@@ -547,7 +665,14 @@ void cyros_port_switch(cyros_port_context_t* /*from*/, cyros_port_context_t* to)
    CYROS_ASSERT(to->thread); // No context to switch to
 
    current_core.current_context = to;
-   to->thread = std::move(to->thread).resume();
+
+   // The first entry consumes `to` as the trampoline's argument; later resumes
+   // land inside the thread's own jump() and ignore it.
+   auto const back = to->thread.jump(to);
+
+   to->thread = (back.data == thread_finished_signal) ? context_handle{}
+                                                      : context_handle(back.fctx);
+
    current_core.current_context = nullptr;
 }
 
@@ -571,7 +696,7 @@ void cyros_port_thread_yield(void)
    CYROS_ASSERT(current_core.interrupt_disable_depth == 0); // interrupts unmasked
    CYROS_ASSERT(current_core.preempt_disable_depth   == 0); // preemption enabled
 
-   switch_to_scheduler_fiber();
+   switch_to_scheduler_context();
 }
 
 
@@ -579,7 +704,7 @@ void cyros_port_pend_reschedule(void)
 {
    // Weak-guarantee, deferred-safe. Callable from any context.
 
-   // Not inside a thread fiber (e.g. called from scheduler/idle context with
+   // Not inside a thread context (e.g. called from scheduler/idle context with
    // no current thread): nothing to switch away from. The cooperative pump in
    // start_scheduler() drives progress in that case.
    if (!current_core.current_context) return;
@@ -591,7 +716,7 @@ void cyros_port_pend_reschedule(void)
       // The next safe point is now - resolve immediately. Clear any stale
       // pending flag; we are servicing it here.
       current_core.reschedule_pending = false;
-      switch_to_scheduler_fiber();
+      switch_to_scheduler_context();
    } else {
       // Kernel-masked: defer. The flag is drained at the next safe point -
       // whichever of irq_restore() / preempt_enable() leaves both depths at 0.
