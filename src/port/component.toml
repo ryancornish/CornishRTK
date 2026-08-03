@@ -7,6 +7,6 @@ public_headers = [
 ]
 
 variants = [
-  "linux_boost",
+  "linux_coop",
   "linux_preempt",
 ]

@@ -1,6 +1,4 @@
-# Release build of the preempt port: the only profile that can actually exercise
-# the lto_merged archive strategy. gcc-release was previously reachable only via
-# linux_boost_sim_release, and every boost profile currently fails to compile.
+# Release build of the preempt port
 [profile]
 name = "linux_preempt_release"
 toolchain = "../toolchains/gcc-release.toml"

@@ -2,7 +2,7 @@
  * @file test_time_driver_periodic_preempt.cpp
  * @brief Periodic driver over the REAL linux_preempt timer.
  *
- * The boost-backed periodic test pumps the ISR by hand and is fully
+ * The coop-backed periodic test pumps the ISR by hand and is fully
  * deterministic. This suite is the complement: it runs the periodic driver on
  * linux_preempt, where the timer is a genuine POSIX timer delivering a signal
  * asynchronously. It exercises the parts the pumped test cannot: timer_create,

@@ -2,7 +2,7 @@
  * @file port_time_linux_preempt.cpp
  * @brief Linux timer-driver port for the preemptive (sigctx) backend.
  *
- * Unlike the boost time port, which is a passive counter that tests pump by
+ * Unlike the coop time port, which is a passive counter that tests pump by
  * hand, this one is a real asynchronous interrupt source. Each core owns a POSIX
  * timer that fires a dedicated signal at that core's own thread, and the signal
  * handler invokes the ISR the time driver registered. That is what lets a timer
@@ -45,7 +45,7 @@
  *
  * now() is backed by CLOCK_MONOTONIC, so time advances on its own. The
  * deterministic cyros_port_time_advance() hook the periodic and tickless driver
- * tests rely on is therefore unsupported here. Those suites stay on the boost
+ * tests rely on is therefore unsupported here. Those suites stay on the coop
  * port.
  */
 
@@ -79,7 +79,7 @@ const int timer_signo = SIGRTMIN;
  */
 const int reschedule_signo = SIGURG;
 
-/** 1 tick == 1 microsecond, matching the boost port's convention. */
+/** 1 tick == 1 microsecond, matching the coop port's convention. */
 constexpr uint64_t tick_freq_hz = 1'000'000;
 
 /**
@@ -320,7 +320,7 @@ void cyros_port_time_disarm(void)
 
 // Linux-only test hook. The preempt port is backed by a real monotonic clock,
 // so deterministic advance is unsupported. Pumped, deterministic time-driver
-// tests should use the boost port.
+// tests should use the coop port.
 extern void cyros_port_time_advance(uint64_t delta)
 {
    (void)delta;

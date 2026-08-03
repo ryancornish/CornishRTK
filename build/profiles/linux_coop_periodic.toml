@@ -1,5 +1,5 @@
 [profile]
-name = "linux_boost_sim"
+name = "linux_coop_periodic"
 toolchain = "../toolchains/gcc-debug.toml"
 config_header = "../configs/sim.hpp"
 
@@ -8,8 +8,8 @@ source_root = "../../src"
 output_root = "../../out"
 
 [components]
-port = "linux_boost"
-time_driver = "simulation"
+port = "linux_coop"
+time_driver = "periodic"
 
 [features]
 enable = []

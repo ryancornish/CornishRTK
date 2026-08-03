@@ -1,5 +1,5 @@
 /**
- * @file test_linux_boost_port.cpp
+ * @file test_linux_coop_port.cpp
  * @brief Unit tests for port layer (boost.context backend)
  */
 
@@ -74,7 +74,7 @@ struct PortHarness
       if (!next) return;
 
       // In these unit tests we always resume threads from the test's OS fiber.
-      // That means the "caller" captured by Boost for each thread is the test thread,
+      // That means the "caller" context captured for each thread is the test thread,
       // and cyros_port_pend_reschedule() returns control back here.
       if (!current) {
          current = next;
@@ -262,7 +262,7 @@ TEST_F(PortTest, GivenTlsPointer_WhenSetThenGet_ThenValueRoundTrips)
 
 TEST_F(PortTest, GivenGetCoreId_WhenNotStartedCores_ThenIsZero)
 {
-   // In the Linux boost port, core_id defaults to 0 on the calling thread unless start_cores sets it.
+   // In the Linux coop port, core_id defaults to 0 on the calling thread unless start_cores sets it.
    EXPECT_EQ(cyros_port_get_core_id(), 0u);
 }
 

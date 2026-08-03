@@ -2,7 +2,7 @@
  * @file test_singlecore_preemption.cpp
  * @brief Single-core preemption tests for the linux_preempt port.
  *
- * These exercise the property the cooperative boost port structurally cannot
+ * These exercise the property the cooperative (linux_coop) port structurally cannot
  * reach: an asynchronous signal interrupting a running thread mid-loop and
  * forcing a context switch. Two equal-priority threads are pinned to core0 and
  * neither yields. On a cooperative port the first would run to completion before

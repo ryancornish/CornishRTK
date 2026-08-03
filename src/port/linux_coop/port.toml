@@ -1,8 +1,8 @@
-name = "linux_boost"
+name = "linux_coop"
 
 sources = [
-  "port_linux_boost.cpp",
-  "port_time_linux_boost.cpp",
+  "port_linux_coop.cpp",
+  "port_time_linux_coop.cpp",
 ]
 
 public_headers = [

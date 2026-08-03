@@ -1,5 +1,5 @@
 [profile]
-name = "linux_boost_tickless"
+name = "linux_coop_tickless"
 toolchain = "../toolchains/gcc-debug.toml"
 config_header = "../configs/sim.hpp"
 
@@ -8,7 +8,7 @@ source_root = "../../src"
 output_root = "../../out"
 
 [components]
-port = "linux_boost"
+port = "linux_coop"
 time_driver = "tickless"
 
 [features]

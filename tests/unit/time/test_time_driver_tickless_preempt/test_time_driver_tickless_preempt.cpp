@@ -2,7 +2,7 @@
  * @file test_time_driver_tickless_preempt.cpp
  * @brief Tickless driver over the REAL linux_preempt timer.
  *
- * Complement to the boost-backed, hand-pumped tickless test. Here the tickless
+ * Complement to the coop-backed, hand-pumped tickless test. Here the tickless
  * driver runs on linux_preempt, arming a genuine POSIX one-shot per deadline and
  * re-arming it from the ISR. This exercises the real arm / disarm / re-arm cycle
  * and signal delivery that the deterministic pump cannot.

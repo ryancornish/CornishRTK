@@ -210,7 +210,7 @@ int cpu_core::allocate_handler_stack()
  *
  * A std::vector is impossible because cpu_core is non-copyable in practice
  * (large embedded arrays), so this wraps a unique_ptr array the same way the
- * boost port does.
+ * coop port does.
  */
 class cpu_core_array
 {

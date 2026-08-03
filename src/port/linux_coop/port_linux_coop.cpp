@@ -1,8 +1,7 @@
 /**
- * @file port_linux_boost.cpp
- * @brief Linux simulation port using Boost.Context
+ * @file port_linux_coop.cpp
+ * @brief Linux simulation port, cooperative switching
  *
- * This port uses Boost.Context for fast cooperative context switching.
  * It simulates embedded behavior (stack-based context switching) while
  * running on Linux for development and testing.
  *

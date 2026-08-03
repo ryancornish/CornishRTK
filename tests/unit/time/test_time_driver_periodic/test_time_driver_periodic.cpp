@@ -34,7 +34,7 @@
 
 using namespace cyros;
 
-// Linux-only deterministic test hook, implemented in the linux_boost port.
+// Linux-only deterministic test hook, implemented in the linux_coop port.
 extern void cyros_port_time_advance(uint64_t delta);
 extern void cyros_port_time_fire_isr(void);
 

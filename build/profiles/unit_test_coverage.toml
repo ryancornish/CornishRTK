@@ -9,7 +9,7 @@ source_root = "../../src"
 output_root = "../../out"
 
 [components]
-port = "linux_boost"
+port = "linux_coop"
 # time_driver intentionally omitted. Each test supplies its own via
 # test.toml [components].time_driver (if it needs one).
 

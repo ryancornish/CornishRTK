@@ -1,10 +1,10 @@
 [test]
-name   = "test_linux_boost_port"
-source = "test_linux_boost_port.cpp"
-config = "test_linux_boost_port_config.hpp"
+name   = "test_linux_coop_port"
+source = "test_linux_coop_port.cpp"
+config = "test_linux_coop_port_config.hpp"
 
 [components]
-port = "linux_boost"
+port = "linux_coop"
 
 [link]
 system_libraries = ["boost_context", "gtest", "gtest_main"]

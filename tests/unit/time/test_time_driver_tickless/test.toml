@@ -4,8 +4,8 @@ source = "test_time_driver_tickless.cpp"
 config = "test_time_driver_tickless_config.hpp"
 
 [components]
-# Locked to linux_boost: this driver test is not yet designed for other ports.
-port = "linux_boost"
+# Locked to linux_coop: this driver test is not yet designed for other ports.
+port = "linux_coop"
 time_driver = "tickless"
 
 [link]

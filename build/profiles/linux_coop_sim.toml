@@ -1,6 +1,6 @@
 [profile]
-name = "linux_boost_sim_release"
-toolchain = "../toolchains/gcc-release.toml"
+name = "linux_coop_sim"
+toolchain = "../toolchains/gcc-debug.toml"
 config_header = "../configs/sim.hpp"
 
 [layout]
@@ -8,7 +8,7 @@ source_root = "../../src"
 output_root = "../../out"
 
 [components]
-port = "linux_boost"
+port = "linux_coop"
 time_driver = "simulation"
 
 [features]
