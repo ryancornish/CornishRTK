@@ -1,0 +1,10 @@
+[test]
+name   = "test_linux_preempt_port"
+source = "test_linux_preempt_port.cpp"
+config = "test_linux_preempt_port_config.hpp"
+
+[components]
+port = "linux_preempt"
+
+[link]
+system_libraries = ["gtest", "gtest_main"]

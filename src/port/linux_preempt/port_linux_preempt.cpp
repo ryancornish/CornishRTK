@@ -458,11 +458,12 @@ static cyros_mask_token_t deliverable_token()
 static void assert_mask_matches_depths()
 {
 #if CYROS_PORT_DEBUG_MODE
-   // A failure reports through cyros_port_system_error(), which parks in
-   // cyros_port_wait_for_debugger(), which takes a critical section and lands
-   // straight back here. Without this guard the first failure recurses until the
-   // stack dies, and the SEGV buries the diagnostic that would have named it.
-   // Never cleared on the failing path: we are on our way out.
+   // Guards the debugger path in cyros_port_system_error(). With
+   // cyros_port_wait_for_debugger() enabled, a failure here reports through it,
+   // it takes a critical section, and control lands straight back in this check.
+   // The first failure would then recurse until the stack dies, and the SEGV
+   // would bury the diagnostic that named it, precisely when someone is trying to
+   // debug. Never cleared on the failing path: we are on our way out.
    if (current_core.mask_check_active) return;
    current_core.mask_check_active = true;
 
@@ -1057,7 +1058,10 @@ void cyros_port_system_error(uintptr_t auxilary1, uintptr_t auxilary2, char cons
    std::printf("KERNEL PANIC at %s:%d\n", file_optional, line_optional);
    print_formatted_context(file_optional, line_optional);
    std::printf("└ AUX1: 0x%lX, AUX2: 0x%lX\n", auxilary1, auxilary2);
-   cyros_port_wait_for_debugger();
+
+   // Uncomment to park the faulting core so gdb can attach and inspect a live crash
+   //cyros_port_wait_for_debugger();
+
    std::terminate();
 }
 
