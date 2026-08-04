@@ -62,6 +62,10 @@ extern "C" {
 # error "Port must define CYROS_PORT_CAPTURE_LOCATION"
 #endif
 
+#ifndef CYROS_PORT_DEBUG_MODE
+# error "Port must define CYROS_PORT_DEBUG_MODE"
+#endif
+
 #if (CYROS_PORT_CONTEXT_SIZE) <= 0
 # error "CYROS_PORT_CONTEXT_SIZE must be > 0"
 #endif
@@ -96,6 +100,10 @@ extern "C" {
 
 #if (CYROS_PORT_CAPTURE_LOCATION != 0) &&  (CYROS_PORT_CAPTURE_LOCATION != 1)
 # error "CYROS_PORT_CAPTURE_LOCATION must be '0' (false) or '1' (true)"
+#endif
+
+#if (CYROS_PORT_DEBUG_MODE != 0) &&  (CYROS_PORT_DEBUG_MODE != 1)
+# error "CYROS_PORT_DEBUG_MODE must be '0' (false) or '1' (true)"
 #endif
 
 
@@ -515,6 +523,16 @@ void cyros_port_system_error(uintptr_t auxilary1, uintptr_t auxilary2, char cons
 #define CYROS_ASSERT(condition)              CYROS_ASSERT2(condition, 0, 0)
 #define CYROS_ASSERT_OP(lhs, op, rhs)        CYROS_ASSERT2((lhs) op (rhs), lhs, rhs)
 #define CYROS_ASSERT_NULL(pointer)           CYROS_ASSERT2(!(pointer), pointer, 0);
+
+/**
+ * @def CYROS_PORT_UNREACHABLE
+ * @brief Mark a path the kernel guarantees is never taken.
+ */
+#if CYROS_PORT_DEBUG_MODE
+ #define CYROS_PORT_UNREACHABLE() cyros_port_system_error(0, 0, CYROS_PORT_CAPTURE_FILE, CYROS_PORT_CAPTURE_LINE)
+#else
+ #define CYROS_PORT_UNREACHABLE() __builtin_trap()
+#endif
 
 /**
  * @brief hold the current core until GDB is attached

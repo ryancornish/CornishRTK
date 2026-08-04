@@ -345,7 +345,8 @@ static void scheduler_trampoline(boost::context::transfer_t entry_transfer)
    }
 
    current_core.os_caller.jump(nullptr);
-   __builtin_unreachable();
+
+   CYROS_PORT_UNREACHABLE(); // the jump above does not come back
 }
 
 void cpu_core::start_scheduler()
@@ -623,7 +624,7 @@ static void thread_trampoline(boost::context::transfer_t entry_transfer)
    // finished, so it stores an empty handle rather than one pointing at a dead
    // context. boost::context conveyed the same thing by returning an empty fiber.
    current_core.thread_caller.jump(thread_finished_signal);
-   __builtin_unreachable();
+   CYROS_PORT_UNREACHABLE(); // a finished stack is never resumed
 }
 
 void cyros_port_context_init(cyros_port_context_t* context,

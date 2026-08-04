@@ -429,7 +429,7 @@ namespace this_thread
 [[noreturn]] void thread_exit()
 {
    // todo
-   __builtin_unreachable();
+   CYROS_PORT_UNREACHABLE();
 }
 
 void yield()

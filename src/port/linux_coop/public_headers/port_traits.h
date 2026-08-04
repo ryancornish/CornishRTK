@@ -59,4 +59,10 @@
  */
 #define CYROS_PORT_CAPTURE_LOCATION 1
 
+/**
+ * @def CYROS_PORT_DEBUG_MODE
+ * @brief Turn statically-unreachable tails into reported system errors.
+ */
+#define CYROS_PORT_DEBUG_MODE 1
+
 #endif /* CYROS_PORT_TRAITS_H */
