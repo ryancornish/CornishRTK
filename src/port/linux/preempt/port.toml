@@ -3,12 +3,14 @@ name = "linux_preempt"
 sources = [
    "port_linux_preempt.cpp",
    "port_time_linux_preempt.cpp",
-   "../../../external/sigctx/src/sigctx.c",
-   "../../../external/sigctx/src/sigctx_intercept.c",
+   "../common/port_linux_common.cpp",
+   "../../../../external/sigctx/src/sigctx.c",
+   "../../../../external/sigctx/src/sigctx_intercept.c",
 ]
 
 private_includes = [
-   "../../../external/sigctx/include",
+   "../common",
+   "../../../../external/sigctx/include",
 ]
 
 public_headers = [

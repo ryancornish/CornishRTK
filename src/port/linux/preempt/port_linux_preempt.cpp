@@ -57,7 +57,7 @@
 
 #include <cyros/port/port.h>
 
-#include "port_linux_preempt_internal.h"
+#include "port_linux_preempt_internal.hpp"
 
 #include <sigctx/sigctx.h>
 #include <sigctx/sigctx_intercept.h>
@@ -312,8 +312,6 @@ struct current_core_state
    // simulated interrupt still flows.
    std::uint32_t       preempt_disable_depth{0};
 
-   void*               tls_pointer{nullptr};
-
    // Re-entrancy guard for assert_mask_matches_depths(). See its comment.
    bool                mask_check_active{false};
 };
@@ -453,7 +451,7 @@ static cyros_mask_token_t deliverable_token()
  * covers every transition it performs. A handler's two boundaries are outside the
  * domain by construction: at both, the mask is installed by the signal machinery
  * and not by us, and no disable/enable can run in either window. See
- * cyros_port_isr_region.
+ * cyros::port::isr_region.
  */
 static void assert_mask_matches_depths()
 {
@@ -530,16 +528,21 @@ static void leave_dormant_region()
  * assert_mask_matches_depths().
  * ------------------------------------------------------------------------- */
 
-void cyros_port_isr_region_enter()
+namespace cyros::port
+{
+
+void isr_region_enter()
 {
    current_core.interrupt_disable_depth++;
 }
 
-void cyros_port_isr_region_leave()
+void isr_region_leave()
 {
    CYROS_ASSERT(current_core.interrupt_disable_depth > 0); // handler region underflowed
    current_core.interrupt_disable_depth--;
 }
+
+} // namespace cyros::port
 
 
 /* ----------------------------------------------------------------------------
@@ -553,7 +556,7 @@ void cyros_port_isr_region_leave()
  *
  * Guaranteed to be entered at baseline: the reschedule signal is only ever
  * delivered when both depth counters are zero. The handler body then runs as an
- * interrupt-disabled region, see cyros_port_isr_region.
+ * interrupt-disabled region, see cyros::port::isr_region.
  */
 static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
 {
@@ -561,7 +564,7 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
 
    // Covers every return path below, so the depth is balanced whichever branch
    // chooses the context to resume.
-   cyros_port_isr_region const in_handler;
+   cyros::port::isr_region const in_handler;
 
    auto& core = *static_cast<cpu_core*>(arg);
 
@@ -628,38 +631,6 @@ static int install_interceptor(cpu_core& core)
 /* ----------------------------------------------------------------------------
  * Diagnostics formatting
  * ------------------------------------------------------------------------- */
-
-/**
- * @brief Print the surrounding source lines for a panic location.
- */
-static void print_formatted_context(char const* file, int target_line, int range = 2)
-{
-   static constexpr auto CLR_RESET  = "\033[0m";
-   static constexpr auto CLR_RED    = "\033[1;31m";
-   static constexpr auto CLR_ORANGE = "\033[38;5;208m";
-
-   std::ifstream fs(file);
-   if (!fs.is_open()) return;
-
-   std::string text;
-   int current = 0;
-   int start = (target_line - range > 0) ? target_line - range : 1;
-   int end   = target_line + range;
-
-   while (std::getline(fs, text)) {
-      current++;
-      if (current >= start && current <= end) {
-         std::printf("├ ");
-         std::printf("%s%4d%s  ", CLR_ORANGE, current, CLR_RESET);
-         if (current == target_line) {
-            std::printf("%s>> %s%s\n", CLR_RED, text.c_str(), CLR_RESET);
-         } else {
-            std::printf("   %s\n", text.c_str());
-         }
-      }
-      if (current > end) break;
-   }
-}
 
 
 /* ============================================================================
@@ -1010,32 +981,12 @@ void cyros_port_thread_exit(cyros_mask_token_t token)
 
 
 /* ----------------------------------------------------------------------------
- * Thread-Local Storage
+ * Idle
+ *
+ * cyros_port_cpu_relax() and the TLS accessors are in
+ * ../common/port_linux_common.cpp. Parking a core stays here, because that is
+ * exactly where the two linux ports differ.
  * ------------------------------------------------------------------------- */
-
-void cyros_port_set_tls_pointer(void* tls_base)
-{
-   current_core.tls_pointer = tls_base;
-}
-
-void* cyros_port_get_tls_pointer(void)
-{
-   return current_core.tls_pointer;
-}
-
-
-/* ----------------------------------------------------------------------------
- * CPU Hints & Idle
- * ------------------------------------------------------------------------- */
-
-void cyros_port_cpu_relax(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-   __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-   __asm__ __volatile__("yield");
-#endif
-}
 
 void cyros_port_idle(void)
 {
@@ -1053,56 +1004,5 @@ void cyros_port_idle(void)
  * Debug & Diagnostics
  * ------------------------------------------------------------------------- */
 
-void cyros_port_system_error(uintptr_t auxilary1, uintptr_t auxilary2, char const* file_optional, int line_optional)
-{
-   std::printf("KERNEL PANIC at %s:%d\n", file_optional, line_optional);
-   print_formatted_context(file_optional, line_optional);
-   std::printf("└ AUX1: 0x%lX, AUX2: 0x%lX\n", auxilary1, auxilary2);
-
-   // Uncomment to park the faulting core so gdb can attach and inspect a live crash
-   //cyros_port_wait_for_debugger();
-
-   std::terminate();
-}
-
-void cyros_port_wait_for_debugger(void)
-{
-   auto irq_mask = cyros_port_irq_save();
-
-   volatile int pause = 1;
-   printf("Attach GDB for PID: %d\n'set var pause = 0' to continue\n", getpid());
-
-   while (pause) {
-      usleep(1000);
-   }
-   cyros_port_irq_restore(irq_mask);
-}
-
-void cyros_port_breakpoint(void)
-{
-#if defined(__x86_64__) || defined(__i386__)
-   __asm__ __volatile__("int3");
-#elif defined(__aarch64__) || defined(__arm__)
-   __builtin_trap();
-#else
-   raise(SIGTRAP);
-#endif
-}
-
-void* cyros_port_get_stack_pointer(void)
-{
-   void* sp;
-#if defined(__x86_64__)
-   __asm__ __volatile__("mov %%rsp, %0" : "=r"(sp));
-#elif defined(__i386__)
-   __asm__ __volatile__("mov %%esp, %0" : "=r"(sp));
-#elif defined(__aarch64__)
-   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
-#elif defined(__arm__)
-   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
-#else
-   int dummy;
-   sp = &dummy;
-#endif
-   return sp;
-}
+// cyros_port_system_error(), cyros_port_wait_for_debugger(), cyros_port_breakpoint()
+// and cyros_port_get_stack_pointer() are in ../common/port_linux_common.cpp.

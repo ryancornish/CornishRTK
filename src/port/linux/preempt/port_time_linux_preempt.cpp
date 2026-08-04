@@ -52,7 +52,7 @@
 #include <cyros/port/port.h>
 #include <cyros/port/port_time.h>
 
-#include "port_linux_preempt_internal.h"
+#include "port_linux_preempt_internal.hpp"
 
 #include <array>
 #include <atomic>
@@ -174,7 +174,7 @@ void on_timer_signal(int, siginfo_t*, void*)
    // exactly the mask interrupt-disable calls for. Declaring the region keeps a
    // cyros_port_irq_restore() inside the ISR from reopening both signals
    // mid-handler and letting a timer nest on the altstack.
-   cyros_port_isr_region const in_isr;
+   cyros::port::isr_region const in_isr;
 
    auto handler = ts.isr.load(std::memory_order_acquire);
    if (handler) {

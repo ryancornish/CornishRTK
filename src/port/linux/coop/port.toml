@@ -3,6 +3,11 @@ name = "linux_coop"
 sources = [
   "port_linux_coop.cpp",
   "port_time_linux_coop.cpp",
+  "../common/port_linux_common.cpp",
+]
+
+private_includes = [
+  "../common",
 ]
 
 public_headers = [

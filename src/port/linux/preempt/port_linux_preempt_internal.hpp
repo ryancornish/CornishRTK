@@ -1,5 +1,5 @@
 /**
- * @file port_linux_preempt_internal.h
+ * @file port_linux_preempt_internal.hpp
  * @brief Contract between port_linux_preempt.cpp and its time driver.
  *
  * Port-internal only. Nothing here is part of the kernel-facing port API and no
@@ -7,8 +7,11 @@
  * because they touch its thread-local core state, which stays private there.
  */
 
-#ifndef CYROS_PORT_LINUX_PREEMPT_INTERNAL_H
-#define CYROS_PORT_LINUX_PREEMPT_INTERNAL_H
+#ifndef CYROS_PORT_LINUX_PREEMPT_INTERNAL_HPP
+#define CYROS_PORT_LINUX_PREEMPT_INTERNAL_HPP
+
+namespace cyros::port
+{
 
 /**
  * @brief Declare that an interrupt handler is running on this core.
@@ -20,21 +23,23 @@
  * signal the handler still needs held down. Rationale in
  * port_linux_preempt.cpp under "Interrupt-handler regions".
  *
- * Prefer cyros_port_isr_region wherever scoping allows.
+ * Prefer isr_region wherever scoping allows.
  */
-void cyros_port_isr_region_enter();
-void cyros_port_isr_region_leave();
+void isr_region_enter();
+void isr_region_leave();
 
-/** @brief Scoped form of cyros_port_isr_region_enter/leave. */
-struct cyros_port_isr_region
+/** @brief Scoped form of isr_region_enter/leave. */
+struct isr_region
 {
-   cyros_port_isr_region() { cyros_port_isr_region_enter(); }
-   ~cyros_port_isr_region() { cyros_port_isr_region_leave(); }
+   isr_region() { isr_region_enter(); }
+   ~isr_region() { isr_region_leave(); }
 
-   cyros_port_isr_region(cyros_port_isr_region const&)            = delete;
-   cyros_port_isr_region(cyros_port_isr_region&&)                 = delete;
-   cyros_port_isr_region& operator=(cyros_port_isr_region const&) = delete;
-   cyros_port_isr_region& operator=(cyros_port_isr_region&&)      = delete;
+   isr_region(isr_region const&)            = delete;
+   isr_region(isr_region&&)                 = delete;
+   isr_region& operator=(isr_region const&) = delete;
+   isr_region& operator=(isr_region&&)      = delete;
 };
 
-#endif /* CYROS_PORT_LINUX_PREEMPT_INTERNAL_H */
+} // namespace cyros::port
+
+#endif /* CYROS_PORT_LINUX_PREEMPT_INTERNAL_HPP */
