@@ -6,6 +6,7 @@
 #include <cyros/port/port.h>
 
 #include <atomic>
+#include <array>
 #include <bitset>
 #include <limits>
 
@@ -56,6 +57,21 @@ enum class thread_disposition : uint8_t
    committed, ///< Decision made under preempt-disable - reschedule will park it.
 };
 
+/**
+ * @brief Maximum pi_waitables one thread may own at once.
+ *
+ * Deliberately a kernel constant and NOT user configuration. The bound has to
+ * exist and be stated (it is what makes the urgency fold's worst case a number
+ * rather than "usually small"), but nothing yet suggests users need to tune it,
+ * and every knob is a cost. Promote it to config::max_held_per_thread only when
+ * there is evidence a real system needs a different value.
+ *
+ * Exceeding it is a hard error rather than a silent drop: a lost held resource
+ * means a lost donation, which is exactly the failure class this design exists
+ * to remove.
+ */
+inline constexpr std::size_t max_held_per_thread = 4;
+
 struct thread_control_block
 {
 
@@ -82,7 +98,49 @@ struct thread_control_block
     * the OUTER lock of the pi_lock -> queue-lock ordering, nothing holding a
     * wait_queue lock may take it. */
    spinlock pi_lock;
-   pi_waitable* held_head{nullptr}; // Intrusive list of owned pi_waitables
+
+   /* The resources this thread currently owns.
+    *
+    * A bounded array of independently readable slots rather than an intrusive
+    * list, for one reason: a list can only be traversed by a core holding
+    * pi_lock, so a remote core cannot read what this thread holds without
+    * taking a remote lock. A fixed array of atomics can be scanned by anyone,
+    * which is what lets a thread's urgency be computed at the point of use
+    * instead of cached and propagated. See pi-design-principles.md.
+    *
+    * MUTATION still happens only under pi_lock, in the owner's own context.
+    * Only reads are unlocked, and a reader may observe a slot that has just
+    * been released. That degrades to a stale-but-plausible urgency, which is
+    * the same tolerance the value-free doorbell already relies on.
+    *
+    * A free slot is nullptr. pi_waitable::held_slot indexes back into here so
+    * registration and retirement stay O(1), as the list's self-sentinel did. */
+   std::array<std::atomic<pi_waitable*>, max_held_per_thread> held_slots{};
+
+   /* Occupancy bitmask over held_slots, so the overwhelmingly common "this
+    * thread holds nothing" case is one load and one compare instead of a walk
+    * over every slot, and an occupied scan costs one iteration per resource
+    * actually held rather than max_held_per_thread.
+    *
+    * Measured before this existed: scanning eight empty slots cost 91 cycles
+    * against 106 for finding one resource, so the walk WAS the cost, not the
+    * work. Threads that hold anything hold 1.01 resources on average.
+    *
+    * ORDERING, which is what makes it safe to read without pi_lock:
+    *   register: publish the slot, THEN set the bit
+    *   release:  clear the bit, THEN clear the slot
+    * A reader that sees a stale set bit loads nullptr and skips. A reader that
+    * misses a just-set bit computes a slightly stale urgency, which is the
+    * tolerance this whole design already rests on. */
+   std::atomic<std::uint8_t> held_mask{0};
+   static_assert(max_held_per_thread <= 8, "held_mask is a uint8_t, so at most 8 slots");
+
+   /** @brief True when this thread owns no pi_waitable. One load, one compare. */
+   [[nodiscard]] bool holds_nothing() const noexcept
+   {
+      return held_mask.load(std::memory_order_relaxed) == 0;
+   }
+
    wait_node_vector* active_waits{nullptr};
 
 

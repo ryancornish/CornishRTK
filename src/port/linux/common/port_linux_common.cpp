@@ -103,6 +103,13 @@ void cyros_port_system_error(uintptr_t auxilary1, uintptr_t auxilary2, char cons
    // during an automated suite run into an indefinite hang with no output.
    // cyros_port_wait_for_debugger();
 
+   // stdio is BLOCK buffered when stdout is a file or a pipe, and abort() does
+   // not flush it. Without this a panic under `prog > log` prints nothing at all
+   // and the log ends with a bare "terminate called without an active
+   // exception", which is exactly as useless as it sounds. Flush everything
+   // before dying.
+   std::fflush(nullptr);
+
    std::terminate();
 }
 
@@ -114,6 +121,7 @@ void cyros_port_wait_for_debugger(void)
 
    volatile int pause = 1;
    std::printf("Attach GDB for PID: %d\n'set var pause = 0' to continue\n", getpid());
+   std::fflush(nullptr); // or the invitation is still in the buffer while we spin
 
    while (pause) {
       usleep(1000);

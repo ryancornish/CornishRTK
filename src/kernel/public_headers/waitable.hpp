@@ -241,6 +241,7 @@ private:
       [[nodiscard]] bool empty() const noexcept;
       [[nodiscard]] std::uint8_t top() const noexcept { return top_priority.load(std::memory_order_acquire); }
 
+
    private:
       void link  (wait_node&) noexcept;
       bool unlink(wait_node&) noexcept;
@@ -347,7 +348,11 @@ protected:
 private:
    std::atomic<thread::id> owner_id{0}; // 0 when free, otherwise owner's thread id
    std::atomic<thread_control_block*> holder{nullptr}; // The owner's TCB for donation targeting
-   pi_waitable* next_held{this}; // Intrusive link in the owner's list. Self == not-linked
+   /* Index of this resource's slot in its owner's held_slots, or not_held.
+    * Replaces the old intrusive next_held link and its self-sentinel, keeping
+    * registration, retirement and the "am I registered" test all O(1). */
+   static constexpr std::uint8_t not_held = 0xFFu;
+   std::uint8_t held_slot{not_held};
 
    void register_held(thread_control_block& tcb) noexcept;
 

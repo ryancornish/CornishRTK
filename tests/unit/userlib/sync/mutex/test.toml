@@ -2,7 +2,8 @@
 name   = "test_sync_mutex"
 source = [
    "test_sync_mutex.cpp",
-   "test_sync_mutex_pi.cpp"
+   "test_sync_mutex_pi.cpp",
+   "test_sync_mutex_pi_chain.cpp"
 ]
 config = "test_sync_mutex_config.hpp"
 

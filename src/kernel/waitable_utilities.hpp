@@ -39,12 +39,6 @@ struct waitable_access
       return w.queue.top();
    }
 
-   /// Next link in the owner's held list (protected by the owner's pi_lock).
-   [[nodiscard]] static pi_waitable* next_held(pi_waitable const& w) noexcept
-   {
-      return w.next_held;
-   }
-
    /// Re-order an armed node after its owner's priority changed.
    /// @return true when the queue's best-waiter priority changed.
    [[nodiscard]] static bool reslot(waitable& w, waitable::wait_node& node) noexcept

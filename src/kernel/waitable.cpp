@@ -276,14 +276,30 @@ void pi_waitable::register_held(thread_control_block& tcb) noexcept
    {
       spinlock_guard guard(tcb.pi_lock);
 
-      // Idempotent by the not-linked sentinel: a wait_condition re-poll after
-      // a spurious wake can land here for a resource the earlier round
-      // already registered, and must not double-link it.
-      if (next_held != this) {
+      // Idempotent: a wait_condition re-poll after a spurious wake can land
+      // here for a resource the earlier round already registered, and must not
+      // occupy a second slot.
+      if (held_slot != not_held) {
          return;
       }
-      next_held = tcb.held_head;
-      tcb.held_head = this;
+
+      std::size_t free_slot = max_held_per_thread;
+      for (std::size_t i = 0; i < max_held_per_thread; ++i) {
+         if (tcb.held_slots[i].load(std::memory_order_relaxed) == nullptr) {
+            free_slot = i;
+            break;
+         }
+      }
+      // Hard error, never a silent drop: an unrecorded held resource is a lost
+      // donation, which is the failure class this representation exists to remove.
+      CYROS_ASSERT_OP(free_slot, <, max_held_per_thread); // max_held_per_thread exceeded
+
+      held_slot = static_cast<std::uint8_t>(free_slot);
+      // Publish the slot BEFORE the bit. A reader that sees the bit must be able
+      // to see the pointer, so the bit is what makes the slot visible.
+      tcb.held_slots[free_slot].store(this, std::memory_order_release);
+      tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
+                             std::memory_order_release);
    }
 
    // Inherit from waiters that were already queued at acquisition time: the
@@ -364,13 +380,16 @@ void pi_waitable::pi_release(reschedule_policy policy) noexcept
    {
       spinlock_guard guard(tcb.pi_lock);
 
-      pi_waitable** slot = &tcb.held_head;
-      while (*slot != nullptr && *slot != this) {
-         slot = &(*slot)->next_held;
-      }
-      CYROS_ASSERT(*slot == this); // resource missing from its owner's held list
-      *slot = next_held;
-      next_held = this;
+      CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // resource not registered to its owner
+      CYROS_ASSERT(tcb.held_slots[held_slot].load(std::memory_order_relaxed) == this); // slot mismatch
+
+      // Clear the bit BEFORE the slot, the mirror of registration. A reader that
+      // still sees the bit finds a slot that is either this resource (about to
+      // be released, so a stale-but-plausible answer) or nullptr, and skips.
+      tcb.held_mask.fetch_and(static_cast<std::uint8_t>(~(1U << held_slot)),
+                              std::memory_order_release);
+      tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
+      held_slot = not_held;
    }
 
    // Hand over (or free) with the commit under the queue lock, closing the
@@ -413,9 +432,9 @@ void pi_waitable::renounce_if_assigned(thread::id const thread_id) noexcept
    // registered ownership would put two threads in one critical section, so
    // it is kept.
    //
-   // The sentinel read is safe unlocked: held-list linkage mutates only in
-   // the owner's own context, and we ARE the owner's context.
-   if (next_held != this) {
+   // The read is safe unlocked: held_slot mutates only in the owner's own
+   // context, and we ARE the owner's context.
+   if (held_slot != not_held) {
       return; // registered ownership from before the wait, the caller keeps it
    }
 

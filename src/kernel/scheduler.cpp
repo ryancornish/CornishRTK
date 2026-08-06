@@ -110,7 +110,7 @@ void scheduler::set_thread_terminated(thread_control_block& tcb) noexcept
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    CYROS_ASSERT_OP(tcb.state, ==, thread_state::running);
    CYROS_ASSERT(!tcb.is_enqueued());
-   CYROS_ASSERT(tcb.held_head == nullptr); // Thread cannot own a pi_waitable on termination
+   CYROS_ASSERT(tcb.holds_nothing()); // Thread cannot own a pi_waitable on termination
 
    tcb.state = thread_state::terminated;
    tcb.termination.terminate(); // signal joiners
