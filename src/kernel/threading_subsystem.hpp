@@ -5,6 +5,8 @@
 #include <cyros/config/config.hpp>
 #include <cyros/port/port.h>
 
+#include "relaxed_atomic.hpp"
+
 #include <atomic>
 #include <array>
 #include <bitset>
@@ -74,9 +76,8 @@ inline constexpr std::size_t max_held_per_thread = 4;
 
 struct thread_control_block
 {
-
-   thread_state state{thread_state::created};
-   thread_disposition disposition{thread_disposition::none};
+   rel_atomic<thread_state>       state{thread_state::created};
+   rel_atomic<thread_disposition> disposition{thread_disposition::none};
 
    // Intrusive 'linked-list' links for a thread_ready_queue. Pointing to self
    // represents the not-enqueued sentinel
