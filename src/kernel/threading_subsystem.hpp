@@ -76,8 +76,8 @@ inline constexpr std::size_t max_held_per_thread = 4;
 
 struct thread_control_block
 {
-   rel_atomic<thread_state>       state{thread_state::created};
-   rel_atomic<thread_disposition> disposition{thread_disposition::none};
+   relaxed_atomic<thread_state>       state{thread_state::created};
+   relaxed_atomic<thread_disposition> disposition{thread_disposition::none};
 
    // Intrusive 'linked-list' links for a thread_ready_queue. Pointing to self
    // represents the not-enqueued sentinel

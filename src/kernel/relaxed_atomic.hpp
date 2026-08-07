@@ -31,12 +31,13 @@ namespace cyros
  * relaxed semantics (`std::memory_order_relaxed`).
  */
 template <typename T>
-struct rel_atomic
+class relaxed_atomic
 {
    std::atomic<T> value;
 
-   constexpr rel_atomic() = default;
-   constexpr explicit rel_atomic(T initial) : value(initial) {}
+public:
+   constexpr relaxed_atomic() = default;
+   constexpr explicit relaxed_atomic(T initial) : value(initial) {}
 
    operator T() const noexcept // NOLINT(*-explicit-constructor): Allow implicit loads
    {
