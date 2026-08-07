@@ -64,17 +64,15 @@
 
 #include <atomic>
 #include <cerrno>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <initializer_list>
-#include <memory>
 #include <pthread.h>
-#include <string>
+#include <ranges>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 
 /* ============================================================================
@@ -130,139 +128,30 @@ static constexpr std::size_t handler_stack_size = 128 * 1024; // 128KB
 
 
 /* ============================================================================
- * Internal Types
+ * Internal State
  * ========================================================================= */
 
 /**
- * @brief Simulated core. One pthread per core, with its own handler stack and a
- *        bring-up context captured at start_first so shutdown can unwind it.
+ * @brief Simulated core. One pthread per core, holding only what another core
+ *        needs in order to reach it.
  */
 struct cpu_core
 {
    pthread_t               pthread{}; // core0 records pthread_self() here too
    uint32_t                core_id{};
    cyros_port_core_entry_t entry{};
-
-   // OS Guarded - layout: [ guard page (PROT_NONE) ][ handler_stack_size usable, grows down ]
-   std::uint8_t* handler_stack{nullptr};
-   std::size_t   handler_stack_bytes{0};
-
-   // Captured at first signal delivery on this core. Resuming it unwinds back
-   // through cyros_port_start_first() so the owning OS thread can be joined.
-   sigctx_inl_t scheduler_ctx{};
-
-   ~cpu_core();
-
-   /**
-    * @brief Map the guarded handler stack. Returns 0, or a negative errno.
-    */
-   int allocate_handler_stack();
-
-private:
-   void*       stack_mapping{nullptr};
-   std::size_t stack_mapping_bytes{0};
 };
-
-static std::size_t guard_page_size()
-{
-   auto const page = sysconf(_SC_PAGESIZE);
-   return page > 0 ? static_cast<std::size_t>(page) : 4096u;
-}
-
-cpu_core::~cpu_core()
-{
-   if (stack_mapping != nullptr) {
-      munmap(stack_mapping, stack_mapping_bytes);
-   }
-}
-
-int cpu_core::allocate_handler_stack()
-{
-   if (handler_stack != nullptr) return 0; // already mapped
-
-   std::size_t const guard = guard_page_size();
-   stack_mapping_bytes = guard + handler_stack_size;
-
-   stack_mapping = mmap(nullptr, stack_mapping_bytes,
-                        PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-   if (stack_mapping == MAP_FAILED) {
-      stack_mapping = nullptr;
-      stack_mapping_bytes = 0;
-      return -ENOMEM;
-   }
-
-   // Lowest page is the guard. sigctx derives the stack top as
-   // (handler_sp + handler_ss), so the stack grows down towards it.
-   if (mprotect(stack_mapping, guard, PROT_NONE) != 0) {
-      int const err = -errno;
-      munmap(stack_mapping, stack_mapping_bytes);
-      stack_mapping = nullptr;
-      stack_mapping_bytes = 0;
-      return err;
-   }
-
-   handler_stack       = static_cast<std::uint8_t*>(stack_mapping) + guard;
-   handler_stack_bytes = handler_stack_size;
-   return 0;
-}
-
-/**
- * @brief Dynamically-sized container for cpu_core's.
- *
- * A std::vector is impossible because cpu_core is non-copyable in practice
- * (large embedded arrays), so this wraps a unique_ptr array the same way the
- * coop port does.
- */
-class cpu_core_array
-{
-public:
-   using iterator       = cpu_core*;
-   using const_iterator = const cpu_core*;
-
-   constexpr cpu_core_array() = default;
-   explicit cpu_core_array(std::size_t count, cyros_port_core_entry_t core_entry)
-      : cores(std::make_unique<cpu_core[]>(count)), count(count)
-   {
-      for (std::uint32_t i = 0; i < count; ++i) {
-         cores[i].core_id = i;
-         cores[i].entry   = core_entry;
-      }
-   }
-   cpu_core_array(cpu_core_array&&) noexcept            = default;
-   cpu_core_array& operator=(cpu_core_array&&) noexcept = default;
-   cpu_core_array(cpu_core_array const&)            = delete;
-   cpu_core_array& operator=(cpu_core_array const&) = delete;
-
-   cpu_core&       operator[](std::size_t index)       { return cores[index]; }
-   cpu_core const& operator[](std::size_t index) const { return cores[index]; }
-
-   [[nodiscard]] std::size_t size() const { return count; }
-
-   iterator begin() { return cores.get(); }
-   iterator end()   { return cores.get() + count; }
-
-   [[nodiscard]] const_iterator begin() const { return cores.get(); }
-   [[nodiscard]] const_iterator end()   const { return cores.get() + count; }
-
-private:
-   std::unique_ptr<cpu_core[]> cores;
-   std::size_t count{0};
-};
-
-
-/* ============================================================================
- * Internal State
- * ========================================================================= */
 
 struct global_state
 {
    std::atomic<bool>       shutdown_requested{false};
    std::atomic<uint32_t>   active_contexts{0};
    cyros_port_reschedule_t reschedule_handler{nullptr};
-   cpu_core_array          cores;
+   std::vector<cpu_core> cores;
 
-   /// @brief Have any cores been launched?
+   /**
+    * @brief Have any cores been launched?
+    */
    [[nodiscard]] bool cores_launched() const { return cores.size() > 0; }
 
    void reset()
@@ -278,24 +167,39 @@ static constinit global_state global;
 /**
  * @brief Per-OS-thread (per-core) state.
  *
- * paused_uc, bootstrapping, first_ctx, and discard_outgoing are scratch shared
- * between on_reschedule() and cyros_port_switch() within a single handler
- * invocation. The depth counters back the masking model.
+ * State control is owned solely by 'this' OS-thread. It cannot be accessed
+ * by another core (enforced by thread_local). Initialised on pthread/core construction.
+ * All cross-core data/state sharing is done via global_state.cores instead.
  */
 struct current_core_state
 {
-   cpu_core*           core{nullptr};
+   // Core's scheduler stack setup for sigctx.
+   // Layout: [ guard page (PROT_NONE) ][ handler_stack_bytes usable, grows down ]
+   std::uint8_t*       handler_stack{nullptr};
+   std::size_t         handler_stack_bytes{0};
+   void*               stack_mapping{nullptr};
+   std::size_t         stack_mapping_bytes{0};
+
+   // Captured at first signal delivery. Resuming it unwinds through
+   // cyros_port_start_first() so the owning OS-thread can be joined.
+   sigctx_inl_t        scheduler_ctx{};
+
+   // This thread's core. An index into global.cores,
+   // Defaults to 0: the bootstrap thread is core 0.
+   std::uint32_t       core_id{0};
 
    // Non-null while executing inside a thread context on this core.
    cyros_port_context* current_context{nullptr};
 
-   // The live captured frame on the handler stack, set by on_reschedule() and
-   // consumed by the cyros_port_switch() it drives. Valid only for that call.
+   // The live captured (paused) frame on the handler stack, set by on_reschedule() and
+   // later consumed by the following cyros_port_switch(). The lifetime of this
+   // pointer (and the pointed-to context object) is only valid for this duration.
+   // This technique is necessary for interopt with the sigctx interceptor routine.
    sigctx_ucontext_t*  paused_uc{nullptr};
 
    // The context cyros_port_switch() chose, read back by on_reschedule() and
-   // returned to the interceptor to resume. Single-shot scratch with the same
-   // lifetime as paused_uc, but it points at durable TCB storage.
+   // returned to the sigctx interceptor to resume. When set, always points to a TCB's
+   // context frame.
    sigctx_ucontext_t*  resume_uc{nullptr};
 
    // First signal delivery on this core takes the bring-up branch.
@@ -314,6 +218,59 @@ struct current_core_state
 
    // Re-entrancy guard for assert_mask_matches_depths(). See its comment.
    bool                mask_check_active{false};
+
+   /**
+    * @brief Map the guarded handler stack.
+    * @return 0 on success, or a negative errno.
+    */
+   int allocate_handler_stack()
+   {
+      if (handler_stack != nullptr) return 0; // Already mapped (TODO: Should this be an assert?)
+
+      std::size_t const guard = guard_page_size();
+      stack_mapping_bytes = guard + handler_stack_size;
+
+      stack_mapping = mmap(nullptr, stack_mapping_bytes,
+                           PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+      if (stack_mapping == MAP_FAILED) {
+         stack_mapping       = nullptr;
+         stack_mapping_bytes = 0;
+         return -errno;
+      }
+
+      if (mprotect(stack_mapping, guard, PROT_NONE) != 0) {
+         int const err = -errno;
+         munmap(stack_mapping, stack_mapping_bytes);
+         stack_mapping       = nullptr;
+         stack_mapping_bytes = 0;
+         return err;
+      }
+
+      handler_stack       = static_cast<std::uint8_t*>(stack_mapping) + guard;
+      handler_stack_bytes = handler_stack_size;
+      return 0;
+   }
+
+   /**
+    * @brief Release handler stack memory and teardown page guard
+    */
+   void free_handler_stack()
+   {
+      if (stack_mapping == nullptr) return;
+
+      munmap(stack_mapping, stack_mapping_bytes);
+      stack_mapping       = nullptr;
+      stack_mapping_bytes = 0;
+      handler_stack       = nullptr;
+      handler_stack_bytes = 0;
+   }
+
+   static std::size_t guard_page_size()
+   {
+      auto const page = sysconf(_SC_PAGESIZE);
+      return page > 0 ? static_cast<std::size_t>(page) : 4096u;
+   }
 };
 static thread_local constinit current_core_state current_core;
 
@@ -558,7 +515,7 @@ void isr_region_leave()
  * delivered when both depth counters are zero. The handler body then runs as an
  * interrupt-disabled region, see cyros::port::isr_region.
  */
-static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
+static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void*)
 {
    if (!global.cores_launched()) return paused; // Delivery after kernel teardown, ignore
 
@@ -566,13 +523,12 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
    // chooses the context to resume.
    cyros::port::isr_region const in_handler;
 
-   auto& core = *static_cast<cpu_core*>(arg);
-
    bool const bootstrapping = current_core.bootstrapping;
 
    if (bootstrapping) {
       current_core.bootstrapping = false;
-      sigctx_copy(/*dst=*/ &core.scheduler_ctx.uc, core.scheduler_ctx.fpstate, sizeof(core.scheduler_ctx.fpstate),
+      sigctx_copy(/*dst=*/ &current_core.scheduler_ctx.uc, current_core.scheduler_ctx.fpstate,
+                  sizeof(current_core.scheduler_ctx.fpstate),
                   /*src=*/ paused);
    }
 
@@ -580,8 +536,8 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
    // Resume the bring-up point so this OS thread unwinds and
    // can be joined.
    if (global.shutdown_requested.load(std::memory_order_acquire)) {
-      sigaddset(&core.scheduler_ctx.uc.uc_sigmask, preempt_signo);
-      return &core.scheduler_ctx.uc;
+      sigaddset(&current_core.scheduler_ctx.uc.uc_sigmask, preempt_signo);
+      return &current_core.scheduler_ctx.uc;
    }
 
    if (bootstrapping) {
@@ -607,9 +563,9 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void* arg)
  * @brief Install the interceptor on the calling core. sigaltstack is per-thread,
  *        so each core's OS thread must call this once before running its entry.
  */
-static int install_interceptor(cpu_core& core)
+static int install_interceptor()
 {
-   int const mapped = core.allocate_handler_stack();
+   int const mapped = current_core.allocate_handler_stack();
    if (mapped != 0) return mapped;
 
    // Keep the timer signal masked during reschedule
@@ -619,10 +575,10 @@ static int install_interceptor(cpu_core& core)
 
    sigctx_intercept_cfg cfg{
       .signo       = preempt_signo,
-      .handler_sp  = core.handler_stack,
-      .handler_ss  = core.handler_stack_bytes,
+      .handler_sp  = current_core.handler_stack,
+      .handler_ss  = current_core.handler_stack_bytes,
       .handler     = on_reschedule,
-      .arg         = &core,
+      .arg         = nullptr, // the handler reads current_core, nothing to pass
       .block_extra = &extra,
    };
    return sigctx_intercept_install(&cfg);
@@ -658,11 +614,8 @@ void cyros_port_init(cyros_port_reschedule_t reschedule_handler)
 
 uint32_t cyros_port_get_core_id(void)
 {
-   // If no cores have been launched yet, we must be on core0.
-   if (!global.cores_launched()) return 0;
-
-   CYROS_ASSERT(current_core.core != nullptr);
-   return current_core.core->core_id;
+   // A stored per-thread fact, never inferred. See current_core_state::core_id.
+   return current_core.core_id;
 }
 
 void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
@@ -678,7 +631,11 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
    uint32_t fp_size = sigctx_fpstate_size();
    CYROS_ASSERT(fp_size <= SIGCTX_FPSTATE_CAPACITY); // raise capacity or use a dyn context
 
-   global.cores = cpu_core_array(cores_to_use, entry);
+   global.cores = std::vector<cpu_core>(cores_to_use);
+   for (auto const [index, core] : std::views::enumerate(global.cores)) {
+      core.core_id = index;
+      core.entry = entry;
+   }
 
    // core0 runs on this calling OS thread. Record its handle so a cross-core IPI
    // can target it the same way as any spawned core.
@@ -706,18 +663,22 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
          +[](void* arg) -> void*
          {
             auto* init = static_cast<cpu_core*>(arg);
-            current_core.core = init;
+            current_core.core_id = init->core_id;
 
             // pthread_create inherits the creating thread's signal mask, which
             // is the dormant mask set above, but this thread's TLS is fresh and
             // its counters start at zero. Record the state we were born into.
             enter_dormant_region();
 
-            int rc = install_interceptor(*init);
+            int rc = install_interceptor();
             CYROS_ASSERT(rc == 0); // interceptor failed to install on this core
 
             // Runs the kernel entry for this core, which starts its first thread.
             init->entry();
+
+            // Mirror of the allocation above: this thread owns the mapping, so
+            // this thread releases it, once its core entry has unwound.
+            current_core.free_handler_stack();
             return nullptr;
          },
          &core
@@ -726,12 +687,13 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
 
    // core0 on the calling thread.
    auto& core0 = global.cores[0];
-   current_core.core = &core0;
+   current_core.core_id = core0.core_id;
 
-   int rc = install_interceptor(core0);
+   int rc = install_interceptor();
    CYROS_ASSERT(rc == 0); // Interceptor failed to install on core0
 
    core0.entry();
+   current_core.free_handler_stack(); // core0's thread owns its mapping too
 
    sigset_t now;
    pthread_sigmask(SIG_BLOCK, /*set=*/nullptr, &now);
@@ -979,13 +941,20 @@ void cyros_port_thread_exit(cyros_mask_token_t token)
    CYROS_PORT_UNREACHABLE(); // the enable above must not come back
 }
 
+/* ----------------------------------------------------------------------------
+ * Thread-Local Storage
+ *
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_set_tls_pointer()
+ * - cyros_port_get_tls_pointer()
+ * ------------------------------------------------------------------------- */
+
 
 /* ----------------------------------------------------------------------------
- * Idle
+ * CPU Hints
  *
- * cyros_port_cpu_relax() and the TLS accessors are in
- * ../common/port_linux_common.cpp. Parking a core stays here, because that is
- * exactly where the two linux ports differ.
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_cpu_relax()
  * ------------------------------------------------------------------------- */
 
 void cyros_port_idle(void)
@@ -1002,7 +971,11 @@ void cyros_port_idle(void)
 
 /* ----------------------------------------------------------------------------
  * Debug & Diagnostics
+ *
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_system_error()
+ * - cyros_port_wait_for_debugger()
+ * - cyros_port_breakpoint()
+ * - cyros_port_get_stack_pointer()
  * ------------------------------------------------------------------------- */
 
-// cyros_port_system_error(), cyros_port_wait_for_debugger(), cyros_port_breakpoint()
-// and cyros_port_get_stack_pointer() are in ../common/port_linux_common.cpp.

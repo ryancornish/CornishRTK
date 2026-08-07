@@ -74,8 +74,8 @@ void* cyros_port_get_tls_pointer(void)
 /* ----------------------------------------------------------------------------
  * CPU Hints
  *
- * cyros_port_idle() is deliberately NOT here: parking a core is exactly where the
- * two ports differ (sigsuspend versus a cooperative hand-back).
+ * Absent (located in specific linux port instead):
+ * - cyros_port_idle()
  * ------------------------------------------------------------------------- */
 
 void cyros_port_cpu_relax(void)

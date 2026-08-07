@@ -2,25 +2,25 @@
  * @file port_linux_coop.cpp
  * @brief Linux simulation port, cooperative switching
  *
- * It simulates embedded behavior (stack-based context switching) while
- * running on Linux for development and testing.
- *
- * SMP support: Each pthread represents a "core". Use cyros_port_get_core_id()
- * to determine which simulated core is running.
+ * Simulates embedded behaviour (stack-based context switching) while running on
+ * Linux for development and testing. Each pthread simulates one "core", and each
+ * core owns a scheduler context that acts as the outer context for every thread
+ * pinned to it. A thread reaching a reschedule point switches to that outer
+ * context, so scheduling runs on its own stack.
  *
  * Reschedule model
  * ----------------
  * This port implements the two-operation reschedule contract from port.h:
  *
  *   cyros_port_thread_yield()    - strong guarantee, synchronous. Resumes the
- *                                   scheduler context immediately. Caller must be
- *                                   in thread context at baseline priority.
+ *                                  scheduler context immediately. Caller must be
+ *                                  in thread context at baseline priority.
  *
- *   cyros_port_pend_reschedule() - weak guarantee, deferred-safe. If invoked
- *                                   at baseline priority it resolves now (the
- *                                   same synchronous switch). If invoked while the core is
- *                                   kernel-masked it sets a per-core
- *                                   "reschedule pending" flag instead.
+ *   cyros_port_pend_reschedule() - weak guarantee, deferred-safe. At baseline
+ *                                  priority it resolves now, the same
+ *                                  synchronous switch. While the core is
+ *                                  kernel-masked it sets a per-core
+ *                                  "reschedule pending" flag instead.
  *
  * Baseline priority and the two depth counters
  * --------------------------------------------
@@ -30,18 +30,21 @@
  * A context switch may occur only at "baseline priority": inside a thread
  * context with BOTH counters at zero.
  *
+ * Unlike the preempt port there is no OS mask to keep in step with the counters,
+ * because nothing here is delivered asynchronously. The counters are the whole
+ * mechanism, not a view of one.
+ *
  * Resolving the pending flag
  * --------------------------
- * The flag is drained at whichever safe point is reached last - that is,
- * whenever a counter returns to zero and the OTHER counter is already zero:
- *   - cyros_port_irq_restore()  reaching interrupt depth 0, and
+ * The flag is drained at whichever safe point is reached last, that is, whenever
+ * a counter returns to zero and the OTHER counter is already zero:
+ *   - cyros_port_irq_restore() reaching interrupt depth 0, and
  *   - cyros_port_preempt_enable() reaching preempt depth 0.
- * Both paths funnel through resolve_pending_reschedule_if_baseline(), which
- * only acts when the full baseline condition holds.
+ * Both paths funnel through resolve_pending_reschedule_if_baseline(), which only
+ * acts when the full baseline condition holds.
  */
 
 #include <cyros/port/port.h>
-
 
 /* Deliberately use the 'private' header details rather than <boost/context/fiber.hpp>.
  * Using the public fiber interface requires compiling with exceptions (for a feature
@@ -58,31 +61,26 @@ using detail::jump_fcontext;
 
 }
 
-#include <algorithm>
 #include <atomic>
-#include <cassert>
-#include <chrono>
-#include <csignal>
+#include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <ctime>
-#include <fstream>
-#include <iostream>
+#include <memory>
 #include <pthread.h>
-#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <utility>
 
 
 /* ============================================================================
- * Context handles and the transfer protocol
+ * Context Handles And The Transfer Protocol
  * ========================================================================= */
 
 /**
  * @brief Handle to a suspended CPU context.
  *
- * Wrapper around raw boost::context::fcontext_t that implements move semantics.
+ * A raw fcontext_t is a bare pointer that a jump does not invalidate, so reusing
+ * a spent one is silent corruption. This wrapper makes that case loud: a jump
+ * empties the handle, and every jump site assigns the returned handle back.
  */
 class context_handle
 {
@@ -125,9 +123,8 @@ private:
  * @brief transfer_t::data protocol.
  *
  * A make_fcontext entry point receives its argument through the data pointer of
- * the FIRST jump into it, and a finishing thread has to announce itself
- * explicitly. boost::context signalled completion by returning an empty fiber,
- * use a 'thread_finished_signal' as a sentinel for the same behaviour.
+ * the FIRST jump into it, and a finishing thread announces itself with a
+ * sentinel so the switch that resumed it knows not to keep the handle.
  *
  *   first entry into a thread      : the cyros_port_context*
  *   first entry into a scheduler   : the cpu_core*
@@ -136,6 +133,7 @@ private:
  */
 static std::byte   thread_finished_tag;  // Address-only sentinel, never read
 static void* const thread_finished_signal = &thread_finished_tag;
+
 
 /* ============================================================================
  * Port Context Structure
@@ -161,50 +159,42 @@ static_assert((CYROS_PORT_STACK_ALIGN & (CYROS_PORT_STACK_ALIGN - 1)) == 0,
               "CYROS_PORT_STACK_ALIGN must be a power of two");
 
 
+/* ============================================================================
+ * Internal Configuration
+ * ========================================================================= */
 
 /**
- * For simulating the SMP schedulers on top of linux, we
- * spawn a new pthread (AKA OS-thread) for each configured core - (Except core0 because that is the initial thread).
- * Each OS-thread encapsulates a scheduler context that is their "outer-context" for each user-thread pinned to a core.
- * When the user-thread "pends reschedule", the context is switched to this outer context so that scheduling can happen
- * on a separate stack and context to the threads.
+ * Per-core stack on which the kernel reschedule runs, separate from every thread
+ * stack. Generously sized to hold the full reschedule call depth.
+ */
+static constexpr std::size_t scheduler_stack_size = 128 * 1024; // 128KB
+
+
+/* ============================================================================
+ * Internal State
+ * ========================================================================= */
+
+/**
+ * @brief Simulated core. One pthread per core, holding only what another core
+ *        needs in order to reach it.
  */
 struct cpu_core
 {
-   pthread_t pthread{}; // @note This is null/unused for core0
-   uint32_t  core_id{}; // Index from 0... num cores
+   pthread_t               pthread{}; // @note This is null/unused for core0
+   uint32_t                core_id{}; // Index from 0... num cores
    cyros_port_core_entry_t entry{};
-   context_handle scheduler_context;
 
    /**
-    * @brief The scheduler context's stack, owned by this core.
-    *
-    * boost::context::fiber allocated this itself, with a guard page. Raw
-    * fcontext has no allocator, so the port owns it - and keeps the guard,
-    * because a scheduler-stack overflow would otherwise scribble silently over
-    * the neighbouring cpu_core instead of faulting somewhere findable.
-    *
-    * Layout: [ guard page (PROT_NONE) ][ stack, grows down into the guard ]
-    */
-   static constexpr size_t scheduler_stack_size = 128 * 1024; // Probably size overkill
-   void*  scheduler_mapping{nullptr};
-   size_t scheduler_mapping_size{0};
-
-   ~cpu_core();
-
-   /**
-    * @brief Primitives to signal/communicate with other cores
+    * @brief Primitives to signal/communicate with other cores.
     */
    struct core_poke
    {
-      pthread_mutex_t mutex{};
-      pthread_cond_t  cond_var{};
+      pthread_mutex_t   mutex{};
+      pthread_cond_t    cond_var{};
       std::atomic<bool> pending{false}; // Can be set by any core
       core_poke()  { pthread_mutex_init(&mutex, nullptr); pthread_cond_init(&cond_var, nullptr); }
       ~core_poke() { pthread_cond_destroy(&cond_var); pthread_mutex_destroy(&mutex); }
    } core_poke;
-
-   void start_scheduler();
 };
 
 /**
@@ -215,8 +205,8 @@ struct cpu_core
 class cpu_core_array
 {
 public:
-   using iterator = cpu_core*;
-   using const_iterator = const cpu_core*;
+   using iterator       = cpu_core*;
+   using const_iterator = cpu_core const*;
 
    constexpr cpu_core_array() = default;
    explicit cpu_core_array(size_t count, cyros_port_core_entry_t core_entry)
@@ -224,7 +214,7 @@ public:
    {
       for (uint32_t i = 0; i < count; ++i) {
          cores[i].core_id = i;
-         cores[i].entry = core_entry;
+         cores[i].entry   = core_entry;
       }
    }
    cpu_core_array(cpu_core_array&&) noexcept            = default;
@@ -245,18 +235,19 @@ public:
 
 private:
    std::unique_ptr<cpu_core[]> cores;
-   size_t count{0};
+   size_t                      count{0};
 };
-
 
 struct global_state
 {
-   std::atomic<bool>        shutdown_requested{false};
-   std::atomic<uint32_t>    active_contexts{0};
+   std::atomic<bool>       shutdown_requested{false};
+   std::atomic<uint32_t>   active_contexts{0};
    cyros_port_reschedule_t reschedule_handler{nullptr};
-   cpu_core_array cores;
+   cpu_core_array          cores;
 
-   /// @brief Have any cores been started?
+   /**
+    * @brief Have any cores been launched?
+    */
    [[nodiscard]] bool cores_launched() const { return cores.size() > 0; }
 
    void reset()
@@ -270,51 +261,90 @@ struct global_state
 static constinit global_state global;
 
 /**
- * @brief Per-OS-Thread state
+ * @brief Per-OS-thread (per-core) state.
  *
- * For SMP simulation, each OS-thread has its own state tracking using
- * thread_local.
+ * State control is owned solely by 'this' OS-thread. It cannot be accessed
+ * by another core (enforced by thread_local). Initialised on pthread/core construction.
+ * All cross-core data/state sharing is done via global_state.cores instead.
  */
 struct current_core_state
 {
-   cpu_core* core{nullptr};
+   // Core's scheduler stack.
+   // Layout: [ guard page (PROT_NONE) ][ scheduler_stack_size usable, grows down ]
+   context_handle      scheduler_context;
+   void*               scheduler_mapping{nullptr};
+   std::size_t         scheduler_mapping_bytes{0};
 
-   // Non-null when we are currently executing inside a thread context.
+   // This thread's core. An index into global.cores,
+   // Defaults to 0: the bootstrap thread is core 0.
+   std::uint32_t       core_id{0};
+
+   // Non-null while executing inside a thread context on this core.
    cyros_port_context* current_context{nullptr};
 
-   // The "caller" context for the currently running thread on *this OS-thread*.
-   context_handle thread_caller;
-   // The outermost context that takes us back out of the scheduler when it is finished.
-   context_handle os_caller;
-   // Simulates pointing to a context's dedicated TLS block.
+   // The context the running thread came from, resumed to re-enter the scheduler.
+   context_handle      thread_caller;
 
-   // Interrupt-masking nesting depth (Critical Sections). Blocks the hardware.
-   uint32_t interrupt_disable_depth{0};
+   // The outermost context, resumed to leave the scheduler when this core is done.
+   context_handle      os_caller;
 
-   // Preemption-disable nesting depth (Preemption Control). Blocks the
-   // scheduler from switching while non-zero; interrupts still flow.
-   uint32_t preempt_disable_depth{0};
+   // Interrupt-masking depth (Critical Sections). Masks the hardware.
+   std::uint32_t       interrupt_disable_depth{0};
 
-   // Set by cyros_port_pend_reschedule() when it cannot resolve immediately
-   // (i.e. the core is kernel-masked). Drained at the next safe point: either
-   // irq_restore() reaching interrupt depth 0, or preempt_enable() reaching
-   // preempt depth 0 - whichever leaves BOTH counters at zero.
-   bool reschedule_pending{false};
+   // Preemption-disable depth (Preemption Control). Blocks the switch while the
+   // simulated interrupt still flows.
+   std::uint32_t       preempt_disable_depth{0};
+
+   // Set by cyros_port_pend_reschedule() when it cannot resolve immediately,
+   // that is, while the core is kernel-masked. Drained at the next safe point,
+   // whichever of irq_restore() / preempt_enable() leaves BOTH depths at zero.
+   bool                reschedule_pending{false};
+
+   /**
+    * @brief Map the guarded scheduler stack.
+    */
+   void allocate_scheduler_stack()
+   {
+      std::size_t const guard = guard_page_size();
+      scheduler_mapping_bytes = guard + scheduler_stack_size;
+
+      scheduler_mapping = mmap(nullptr, scheduler_mapping_bytes,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+      CYROS_ASSERT(scheduler_mapping != MAP_FAILED); // Out of memory for a scheduler stack
+
+      int const guarded = mprotect(scheduler_mapping, guard, PROT_NONE);
+      CYROS_ASSERT(guarded == 0); // Could not guard the scheduler stack
+   }
+
+   /**
+    * @brief Release scheduler stack memory and teardown page guard
+    */
+   void free_scheduler_stack()
+   {
+      if (scheduler_mapping == nullptr) return;
+
+      munmap(scheduler_mapping, scheduler_mapping_bytes);
+      scheduler_mapping       = nullptr;
+      scheduler_mapping_bytes = 0;
+   }
+
+   static std::size_t guard_page_size()
+   {
+      auto const page = sysconf(_SC_PAGESIZE);
+      return page > 0 ? static_cast<std::size_t>(page) : 4096u;
+   }
 };
 static thread_local constinit current_core_state current_core;
 
-static size_t guard_page_size()
-{
-   auto const page = sysconf(_SC_PAGESIZE);
-   return page > 0 ? static_cast<size_t>(page) : 4096u;
-}
 
-cpu_core::~cpu_core()
-{
-   if (scheduler_mapping != nullptr) {
-      munmap(scheduler_mapping, scheduler_mapping_size);
-   }
-}
+/* ============================================================================
+ * Internal Helpers
+ * ========================================================================= */
+
+/* ----------------------------------------------------------------------------
+ * Scheduler context (the outer context of every thread on this core)
+ * ------------------------------------------------------------------------- */
 
 /**
  * @brief Entry point of a core's scheduler context.
@@ -345,34 +375,29 @@ static void scheduler_trampoline(boost::context::transfer_t entry_transfer)
    }
 
    current_core.os_caller.jump(nullptr);
-
    CYROS_PORT_UNREACHABLE(); // the jump above does not come back
 }
 
-void cpu_core::start_scheduler()
+/**
+ * @brief Enter this core's scheduler context. Returns when the core is done.
+ */
+static void start_scheduler()
 {
-   size_t const guard = guard_page_size();
-   scheduler_mapping_size = guard + scheduler_stack_size;
+   current_core.allocate_scheduler_stack();
 
-   scheduler_mapping = mmap(nullptr, scheduler_mapping_size,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
-   CYROS_ASSERT(scheduler_mapping != MAP_FAILED); // Out of memory for a scheduler stack
+   auto* const stack_top = static_cast<uint8_t*>(current_core.scheduler_mapping)
+                         + current_core.scheduler_mapping_bytes;
 
-   // Lowest page is the guard: the stack grows down towards it.
-   int const guarded = mprotect(scheduler_mapping, guard, PROT_NONE);
-   CYROS_ASSERT(guarded == 0); // Could not arm the scheduler stack guard page
-   (void)guarded;
-
-   auto* const stack_top = static_cast<uint8_t*>(scheduler_mapping) + scheduler_mapping_size;
-
-   scheduler_context = context_handle(
+   current_core.scheduler_context = context_handle(
       boost::context::make_fcontext(stack_top, scheduler_stack_size, &scheduler_trampoline)
    );
 
    // Enter the scheduler context. It jumps back here when this core is done,
    // and jump() has already emptied the handle by then.
-   scheduler_context.jump(this);
+   current_core.scheduler_context.jump(&global.cores[current_core.core_id]);
+
+   // This thread owns the mapping, so this thread releases it.
+   current_core.free_scheduler_stack();
 }
 
 /**
@@ -388,6 +413,10 @@ static void switch_to_scheduler_context()
    CYROS_ASSERT(current_core.thread_caller);   // No scheduler context to resume
    current_core.thread_caller = context_handle(current_core.thread_caller.jump(nullptr).fctx);
 }
+
+/* ----------------------------------------------------------------------------
+ * Deferred reschedule
+ * ------------------------------------------------------------------------- */
 
 /**
  * @brief Drain a deferred reschedule if the core is now at baseline priority.
@@ -435,34 +464,35 @@ void cyros_port_init(cyros_port_reschedule_t reschedule_handler)
 
 uint32_t cyros_port_get_core_id(void)
 {
-   // If no cores have been explicitly launched yet, then we must be on core0
-   if (!global.cores_launched()) return 0;
-
-   CYROS_ASSERT(current_core.core != nullptr);
-   return current_core.core->core_id;
+   // A stored per-thread fact, never inferred. See current_core_state::core_id.
+   return current_core.core_id;
 }
-void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
 
+void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
 {
    CYROS_ASSERT(cores_to_use > 0); // Invoking with 0 cores_to_use is invalid
    CYROS_ASSERT(cores_to_use <= CYROS_PORT_CORE_COUNT);
 
    global.cores = cpu_core_array(cores_to_use, entry);
 
+   // core0's OS thread is the caller and its TLS survives across kernel runs, so
+   // reset it rather than leaving each field to be individually un-staled.
+   current_core = current_core_state{};
+
    for (auto& core : global.cores) {
-      // No need to spawn the first core/thread as that is assigned to this current calling core/thread
+      // core0 is the calling thread, so it is not spawned here.
       if (core.core_id == 0) continue;
 
       pthread_create(
          &core.pthread,
          nullptr,
-         +[](void* arg)-> void*
+         +[](void* arg) -> void*
          {
             auto* init = static_cast<cpu_core*>(arg);
-            current_core.core = init;
+            current_core.core_id = init->core_id;
 
-            // Enter the scheduler context
-            init->start_scheduler();
+            // Runs the kernel entry for this core, which starts its first thread.
+            start_scheduler();
 
             // On exit, we finish this OS-thread instance and core0's OS-thread can join with us
             return nullptr;
@@ -471,18 +501,19 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
       );
    }
 
-   // core0 runs on calling thread
+   // core0 on the calling thread.
    auto& core0 = global.cores[0];
-   current_core.core = &core0;
+   current_core.core_id = core0.core_id;
 
-   // Enter the scheduler context for core0
-   core0.start_scheduler();
+   start_scheduler();
 
-   // When core0's scheduler context returns, join to any other active Core OS-thread
+   // core0's scheduler context returns only at shutdown. Join the other cores,
+   // which unwind the same way.
    for (auto& core : global.cores) {
       if (core.core_id == 0) continue;
       pthread_join(core.pthread, nullptr);
    }
+
    global.reset();
 }
 
@@ -500,7 +531,7 @@ void cyros_port_send_reschedule_ipi(uint32_t core_id)
    pthread_cond_signal(&core_poke.cond_var);
    pthread_mutex_unlock(&core_poke.mutex);
 
-   if (core_id == current_core.core->core_id && current_core.current_context) {
+   if (core_id == current_core.core_id && current_core.current_context) {
       // Targeting our own core from within a thread context: an IPI is a weak,
       // deferred-safe request - route through pend_reschedule(), not a forced
       // synchronous yield.
@@ -529,7 +560,8 @@ cyros_mask_token_t cyros_port_irq_save(void)
 
 void cyros_port_irq_restore(cyros_mask_token_t token)
 {
-   (void)token;
+   (void)token; // inert on this port, there is no mask to restore
+
    // Unwind one nesting level
    if (current_core.interrupt_disable_depth > 0) {
       current_core.interrupt_disable_depth--;
@@ -558,8 +590,9 @@ cyros_mask_token_t cyros_port_preempt_disable(void)
 
 void cyros_port_preempt_enable(cyros_mask_token_t token)
 {
-   (void)token;
+   (void)token; // inert on this port, there is no mask to restore
    CYROS_ASSERT(current_core.preempt_disable_depth > 0); // unbalanced enable
+
    current_core.preempt_disable_depth--;
 
    // Preempt depth reaching 0 is one of the contract's safe points: if a
@@ -568,12 +601,16 @@ void cyros_port_preempt_enable(cyros_mask_token_t token)
    resolve_pending_reschedule_if_baseline();
 }
 
+
 /* ----------------------------------------------------------------------------
  * Context Management & Switching
  * ------------------------------------------------------------------------- */
 
 /**
  * @brief Entry point of a user thread's context.
+ *
+ * @note Must never return. A make_fcontext entry that returns is undefined
+ *       behaviour
  */
 [[gnu::noreturn]]
 static void thread_trampoline(boost::context::transfer_t entry_transfer)
@@ -589,7 +626,7 @@ static void thread_trampoline(boost::context::transfer_t entry_transfer)
 
    // Final hand-back. The sentinel tells cyros_port_switch that this stack is
    // finished, so it stores an empty handle rather than one pointing at a dead
-   // context. boost::context conveyed the same thing by returning an empty fiber.
+   // context.
    current_core.thread_caller.jump(thread_finished_signal);
    CYROS_PORT_UNREACHABLE(); // a finished stack is never resumed
 }
@@ -602,7 +639,6 @@ void cyros_port_context_init(cyros_port_context_t* context,
 {
    global.active_contexts.fetch_add(1, std::memory_order_seq_cst);
 
-   // Construct cyros_port_context_t in place
    ::new (context) cyros_port_context{
       .thread     = {},
       .stack_top  = static_cast<uint8_t*>(stack_base) + stack_size,
@@ -611,9 +647,8 @@ void cyros_port_context_init(cyros_port_context_t* context,
       .arg        = arg,
    };
 
-   // make_fcontext takes caller-owned memory directly, which is why the old
-   // preallocated/stubbed-allocator dance is gone. stack_top is the high address:
-   // stacks grow down.
+   // make_fcontext takes caller-owned memory directly. stack_top is the high
+   // address: stacks grow down.
    context->thread = context_handle(
       boost::context::make_fcontext(context->stack_top, context->stack_size, &thread_trampoline)
    );
@@ -643,7 +678,6 @@ void cyros_port_switch(cyros_port_context_t* /*from*/, cyros_port_context_t* to)
    current_core.current_context = nullptr;
 }
 
-
 void cyros_port_start_first(cyros_port_context_t* first)
 {
    // Nothing special to be done on the first switch
@@ -659,33 +693,30 @@ void cyros_port_thread_yield(void)
 {
    // Strong-guarantee, synchronous. Contract precondition: thread context at
    // baseline priority. Assert it - this port can observe all conditions.
-   CYROS_ASSERT(current_core.current_context);            // must be a thread
+   CYROS_ASSERT(current_core.current_context);              // must be a thread
    CYROS_ASSERT(current_core.interrupt_disable_depth == 0); // interrupts unmasked
    CYROS_ASSERT(current_core.preempt_disable_depth   == 0); // preemption enabled
 
    switch_to_scheduler_context();
 }
 
-
 void cyros_port_pend_reschedule(void)
 {
-   // Weak-guarantee, deferred-safe. Callable from any context.
-
-   // Not inside a thread context (e.g. called from scheduler/idle context with
-   // no current thread): nothing to switch away from. The cooperative pump in
-   // start_scheduler() drives progress in that case.
+   // Weak-guarantee, deferred-safe. No thread context means nothing to switch
+   // away from, and the cooperative pump in scheduler_trampoline() drives
+   // progress in that case.
    if (!current_core.current_context) return;
 
-   const bool baseline = (current_core.interrupt_disable_depth == 0) &&
+   bool const baseline = (current_core.interrupt_disable_depth == 0) &&
                          (current_core.preempt_disable_depth   == 0);
 
    if (baseline) {
-      // The next safe point is now - resolve immediately. Clear any stale
-      // pending flag; we are servicing it here.
+      // The next safe point is now, so resolve immediately. Clear any stale
+      // pending flag, we are servicing it here.
       current_core.reschedule_pending = false;
       switch_to_scheduler_context();
    } else {
-      // Kernel-masked: defer. The flag is drained at the next safe point -
+      // Kernel-masked: defer. The flag is drained at the next safe point,
       // whichever of irq_restore() / preempt_enable() leaves both depths at 0.
       current_core.reschedule_pending = true;
    }
@@ -693,26 +724,39 @@ void cyros_port_pend_reschedule(void)
 
 void cyros_port_thread_exit(cyros_mask_token_t token)
 {
-   CYROS_ASSERT(current_core.preempt_disable_depth > 0); // coop port doesnt care if this is disabled, but it is asserting a kernel contract
+   CYROS_ASSERT(current_core.preempt_disable_depth > 0); // thread_exit routine must be uninterruptible!
    CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
+
    global.active_contexts.fetch_sub(1, std::memory_order_seq_cst);
 
+   // Unlike the preempt port this returns, unwinding thread_trampoline() so its
+   // final hand-back retires the context.
    cyros_port_preempt_enable(token);
 }
 
 
 /* ----------------------------------------------------------------------------
- * Idle
+ * Thread-Local Storage
  *
- * cyros_port_cpu_relax() and the TLS accessors are in
- * ../common/port_linux_common.cpp. Parking a core stays here, because that is
- * exactly where the two linux ports differ.
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_set_tls_pointer()
+ * - cyros_port_get_tls_pointer()
+ * ------------------------------------------------------------------------- */
+
+
+/* ----------------------------------------------------------------------------
+ * CPU Hints
+ *
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_cpu_relax()
+ *
+ * Parking a core stays here, because that is exactly where the two linux ports
+ * differ: no signal can arrive, so a core waits on its own condition variable.
  * ------------------------------------------------------------------------- */
 
 void cyros_port_idle(void)
 {
-   // std::printf("(CORE %d) cyros_port_idle()\n", current_core.core->core_id);
-   auto& core_poke = global.cores[current_core.core->core_id].core_poke;
+   auto& core_poke = global.cores[current_core.core_id].core_poke;
 
    // Fast path: don't sleep if already pending.
    if (core_poke.pending.exchange(false, std::memory_order_acq_rel)) {
@@ -732,7 +776,10 @@ void cyros_port_idle(void)
 
 /* ----------------------------------------------------------------------------
  * Debug & Diagnostics
+ *
+ * Absent (located in ../common/port_linux_common.cpp instead):
+ * - cyros_port_system_error()
+ * - cyros_port_wait_for_debugger()
+ * - cyros_port_breakpoint()
+ * - cyros_port_get_stack_pointer()
  * ------------------------------------------------------------------------- */
-
-// cyros_port_system_error(), cyros_port_wait_for_debugger(), cyros_port_breakpoint()
-// and cyros_port_get_stack_pointer() are in ../common/port_linux_common.cpp.
