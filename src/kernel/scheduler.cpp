@@ -175,6 +175,10 @@ void scheduler::drain_inbox() noexcept
 
    cross_core_request request;
    while (inbox.pop(request)) {
+      // Release BEFORE servicing, so a request raised while we are servicing
+      // this one queues fresh instead of folding into work already done.
+      request.tcb->release_request(request.claim_bit());
+
       switch (request.type) {
          case cross_core_request::set_thread_ready:
             request.tcb->disposition = thread_disposition::none;
@@ -197,8 +201,20 @@ void scheduler::drain_inbox() noexcept
 // Cross-core safe posting API
 bool scheduler::post_to_inbox(cross_core_request request) noexcept
 {
-   // Many-producer safe
-   if (!inbox.push(request)) return false; // Full
+   // Many-producer safe.
+   //
+   // Fold into an entry that is already queued and not yet serviced, rather
+   // than queueing a second one saying the same thing. Claiming BEFORE the push
+   // is what makes a set bit mean "a service is still coming".
+   if (!request.tcb->claim_request(request.claim_bit())) return true;
+
+   if (!inbox.push(request)) {
+      // Nothing was queued, so the claim must not survive. Leaving it set would
+      // fold every later request into an entry that does not exist, turning a
+      // transient full into permanent silence for this target.
+      request.tcb->release_request(request.claim_bit());
+      return false; // Full
+   }
 
    bool expected = false;
    if (inbox_poke_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -290,6 +306,8 @@ void scheduler::reset()
    // to a thread that is still live and blocked.
    cross_core_request request;
    while (inbox.pop(request)) {
+      // A claim never outlives the entry that holds it, on this path too.
+      request.tcb->release_request(request.claim_bit());
       CYROS_ASSERT_OP(request.tcb->state, ==, thread_state::terminated);
    }
    CYROS_ASSERT(ready_matrix.empty()); // Cannot reset whilst threads still in the queue

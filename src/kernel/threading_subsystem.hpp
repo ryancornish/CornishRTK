@@ -136,11 +136,20 @@ struct thread_control_block
    std::atomic<std::uint8_t> held_mask{0};
    static_assert(max_held_per_thread <= 8, "held_mask is a uint8_t, so at most 8 slots");
 
-   /** @brief True when this thread owns no pi_waitable. One load, one compare. */
-   [[nodiscard]] bool holds_nothing() const noexcept
-   {
-      return held_mask.load(std::memory_order_relaxed) == 0;
-   }
+   /* Coalescing claims for cross-core requests, one bit per request type.
+    *
+    * A producer that finds a bit clear owns the right to queue that request. A
+    * producer that finds it set knows an unserviced entry already exists, and
+    * since these requests carry truth rather than values, that entry discharges
+    * its intent too. This bounds the queue by threads rather than by wake
+    * volume.
+    *
+    * ORDERING:
+    *   producer: claim the bit, THEN queue
+    *   consumer: release the bit, THEN service
+    * A set bit therefore guarantees a service strictly in the observer's future.
+    */
+   std::atomic<std::uint8_t> pending_requests{0};
 
    wait_node_vector* active_waits{nullptr};
 
@@ -179,6 +188,30 @@ struct thread_control_block
    constexpr void set_priority(uint8_t p)
    {
       effective_priority.store(p, std::memory_order_relaxed);
+   }
+
+   /**
+    * @brief True when this thread owns no pi_waitable. One load, one compare.
+    */
+   [[nodiscard]] constexpr bool holds_nothing() const noexcept
+   {
+      return held_mask.load(std::memory_order_relaxed) == 0;
+   }
+
+   /**
+    * @brief Claim the right to queue @p bit. True when the caller must queue.
+    */
+   [[nodiscard]] bool claim_request(std::uint8_t bit) noexcept
+   {
+      return (pending_requests.fetch_or(bit, std::memory_order_acq_rel) & bit) == 0;
+   }
+
+   /**
+    * @brief Release a claim. Call BEFORE servicing, or before abandoning a claim.
+    */
+   void release_request(std::uint8_t bit) noexcept
+   {
+      pending_requests.fetch_and(static_cast<std::uint8_t>(~bit), std::memory_order_release);
    }
 
    thread_control_block(thread::priority priority,

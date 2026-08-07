@@ -36,6 +36,18 @@ struct cross_core_request
 
    request_type type{};
    thread_control_block* tcb{nullptr};
+
+   /**
+    * @brief This request's coalescing bit in thread_control_block::pending_requests.
+    *
+    * Both request types are value-free doorbells against one TCB, so two of the
+    * same kind for the same target are one obligation and fold into one entry.
+    * A type that ever carried a value could not use this.
+    */
+   [[nodiscard]] constexpr std::uint8_t claim_bit() const noexcept
+   {
+      return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(type));
+   }
    // For recompute_priority: the thread id the requester believed tcb had.
    // Recompute is idempotent against every staleness EXCEPT the TCB memory
    // being recycled by a new thread, which this id check filters, ids are
