@@ -41,7 +41,7 @@ struct waitable_access
 
    /// Re-order an armed node after its owner's priority changed.
    /// @return true when the queue's best-waiter priority changed.
-   [[nodiscard]] static bool reslot(waitable& w, waitable::wait_node& node) noexcept
+   [[nodiscard]] static bool reslot(waitable& w, wait_queue::wait_node& node) noexcept
    {
       return w.queue.reslot(node);
    }
@@ -57,7 +57,7 @@ struct waitable_access
 class wait_node_vector
 {
 private:
-   using wait_node = waitable::wait_node;
+   using wait_node = wait_queue::wait_node;
 
    std::array<wait_node, config::max_wait_nodes> store{};
    std::size_t count = 0;

@@ -100,11 +100,25 @@ public:
    void join() noexcept;
 
 private:
-   static constexpr std::size_t  tcb_size = 256;
-   static constexpr std::size_t min_frame = 4096;
    struct thread_control_block* tcb{nullptr};
 
 public:
+   /**
+    * @brief Budget for the kernel-private part of the TCB, everything except
+    *        the port context.
+    *
+    * This is a rough overestimation. The actual size cannot be a compile-time constant
+    * because it varies by port, and on one port it can still vary with the hardware,
+    * (so not expressible via port_traits). Instead this catches if tcb grows past the estimation.
+    * A generous fixed budget plus a static_assert is the working compromise.
+    */
+   static constexpr std::size_t tcb_size = 256; // Bump if sizeof(thread_control_block) grows
+
+   /**
+    * @brief Headroom reserved for the first call frame on a fresh stack.
+    */
+   static constexpr std::size_t min_frame = 4096;
+
    /**
     * @brief Minimal size (bytes) a stack must be for a thread to execute on
     */

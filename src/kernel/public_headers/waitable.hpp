@@ -13,6 +13,104 @@
 namespace cyros
 {
 
+class waitable;
+class pi_waitable;
+class waitable_arm_guard;
+class wait_node_vector;
+struct waitable_access;
+
+/**
+ * @brief Caller's instruction for whether signalling should trigger a
+ *        reschedule on the *local* core.
+ *
+ * Namespace scope rather than nested in waitable, because the objects that
+ * signal are no longer all waitables.
+ */
+enum class reschedule_policy
+{
+   automatic, ///< Conditionally trigger a local reschedule if a better thread is made ready (preferred)
+   never,     ///< Never trigger a local reschedule
+   always,    ///< Always trigger a local reschedule
+};
+
+/**
+ * @brief Intrusive priority-ordered list of waiting threads.
+ *
+ * Owns park-list mechanics and the commit-under-lock discipline that makes a
+ * barge-free handoff possible. Owns nothing about what is being waited FOR, so
+ * both waitable and the mutex compose one rather than sharing a base.
+ *
+ * NOT API, despite appearing in a public header. A kernel that does not
+ * allocate needs by-value members, and a by-value member needs a complete type
+ * where its owner is declared, so the name has to be here. Being usable is a
+ * separate question, and the answer is no: every member including the
+ * constructor is private, and friendship is granted only to the kernel types
+ * that own a queue. Outside those, the name can be written and nothing else.
+ * The compiler enforces that, not a comment.
+ *
+ * The alternative, opaque std::byte storage, would hide the name at the cost of
+ * placement-new in every owner's constructor, which costs waitable and
+ * semaphore their constexpr constructors and moves them out of .bss.
+ */
+class CYROS_PUBLIC wait_queue
+{
+   /**
+    * @brief Per-thread parking record (one per TCB, reused).
+    *
+    * Threaded into one or more queues while the thread is parked. Nested so it
+    * is unreachable to anything that cannot already drive a queue.
+    */
+   struct wait_node
+   {
+      thread_control_block* owner{nullptr};
+      wait_node*            next {nullptr};
+      waitable*             source{nullptr};
+
+      // For wait_on_any: which waitable does this slot in the call's source
+      // array correspond to. Unused (and zero) in single-wait blocks.
+      uint8_t source_index{0};
+   };
+
+   using transfer_fn = function<void(uint32_t), 32, heap_policy::no_heap>;
+   using commit_fn   = function<void(thread_control_block*), 32, heap_policy::no_heap>;
+   static constexpr std::uint8_t no_waiter = 0xFF;
+
+   constexpr wait_queue() noexcept = default;
+
+   wait_queue(wait_queue&&)                 = delete;
+   wait_queue(wait_queue const&)            = delete;
+   wait_queue& operator=(wait_queue&&)      = delete;
+   wait_queue& operator=(wait_queue const&) = delete;
+
+   void arm   (wait_node& n) noexcept;
+   bool disarm(wait_node& n) noexcept;
+   bool reslot(wait_node& n) noexcept;
+
+   void wake_one(reschedule_policy) noexcept;
+   void wake_all(reschedule_policy) noexcept;
+   bool wake_one_and_transfer(transfer_fn const&, reschedule_policy) noexcept;
+   bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept;
+
+   [[nodiscard]] bool empty() const noexcept;
+   [[nodiscard]] std::uint8_t top() const noexcept { return top_priority.load(std::memory_order_acquire); }
+
+   void link  (wait_node&) noexcept;
+   bool unlink(wait_node&) noexcept;
+   void refresh_top()      noexcept;
+
+   spinlock   lock;
+   wait_node* head{nullptr}; // priority-ordered, best at head
+   std::atomic<std::uint8_t> top_priority{no_waiter};
+
+   // The only types that may drive a queue.
+   friend class waitable;
+   friend class pi_waitable; // replaced by the kernel mutex
+   friend class waitable_arm_guard;
+   friend class wait_node_vector;
+   friend struct waitable_access;
+   friend std::size_t this_thread::wait_on_any(std::span<waitable_ref>) noexcept;
+};
+
 /* ============================================================================
  * waitable - kernel base class for blockable objects
  *
@@ -82,17 +180,6 @@ namespace cyros
 class CYROS_PUBLIC waitable
 {
 public:
-   /**
-    * @brief Caller's instruction for whether signalling should trigger a
-    *        reschedule on the *local* core.
-    */
-   enum class reschedule_policy
-   {
-      automatic, ///< Conditionally trigger a local reschedule if a better thread is made ready (preferred)
-      never,     ///< Never trigger a local reschedule
-      always,    ///< Always trigger a local reschedule
-   };
-
    virtual ~waitable();
 
    waitable(waitable&&) = delete;
@@ -101,7 +188,7 @@ public:
    waitable& operator=(waitable const&) = delete;
 
 protected:
-   using transfer_fn = function<void(uint32_t), 32, heap_policy::no_heap>;
+   using transfer_fn = wait_queue::transfer_fn;
 
    waitable() noexcept = default;
 
@@ -202,57 +289,11 @@ protected:
    }
 
 private:
-   /**
-    * @brief Per-thread parking record (one per TCB, reused).
-    *
-    * Lives in the TCB, threaded into one or more waitable::wait_queue
-    * instances when the thread is parked.
-    */
-   struct wait_node
-   {
-      thread_control_block* owner{nullptr};
-      wait_node*            next {nullptr};
-      waitable*             source{nullptr};
-
-      // For wait_on_any: which waitable does this slot in the call's source
-      // array correspond to. Unused (and zero) in single-wait blocks.
-      uint8_t source_index{0};
-   };
-   friend class wait_node_vector;
-
-   /**
-    * @brief Private intrusive priority-ordered list of waiting threads.
-    */
-   class CYROS_PUBLIC wait_queue
-   {
-   public:
-      using commit_fn = function<void(thread_control_block*), 32, heap_policy::no_heap>;
-      static constexpr std::uint8_t no_waiter = 0xFF;
-
-      void arm   (wait_node& n) noexcept;
-      bool disarm(wait_node& n) noexcept;
-      bool reslot(wait_node& n) noexcept;
-
-      void wake_one(reschedule_policy) noexcept;
-      void wake_all(reschedule_policy) noexcept;
-      bool wake_one_and_transfer(transfer_fn const&, reschedule_policy) noexcept;
-      bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept;
-
-      [[nodiscard]] bool empty() const noexcept;
-      [[nodiscard]] std::uint8_t top() const noexcept { return top_priority.load(std::memory_order_acquire); }
-
-
-   private:
-      void link  (wait_node&) noexcept;
-      bool unlink(wait_node&) noexcept;
-      void refresh_top()      noexcept;
-
-      spinlock   lock;
-      wait_node* head{nullptr}; // priority-ordered, best at head
-      std::atomic<std::uint8_t> top_priority{no_waiter};
-   };
+   /// Composed, not inherited. See wait_queue above for why the type is
+   /// nameable here and still unusable.
    wait_queue queue;
 
+   friend class wait_node_vector;
    friend class pi_waitable;
    friend class waitable_arm_guard;
    friend struct waitable_access;
@@ -346,8 +387,9 @@ protected:
    void renounce_if_assigned(thread::id thread_id) noexcept override;
 
 private:
-   std::atomic<thread::id> owner_id{0}; // 0 when free, otherwise owner's thread id
-   std::atomic<thread_control_block*> holder{nullptr}; // The owner's TCB for donation targeting
+   /* One word, not two. The CAS take, the transferred-recognition test and the
+    * donation target all read it, so there is no pair to keep ordered. */
+   std::atomic<thread_control_block*> owner{nullptr}; // nullptr when free
    /* Index of this resource's slot in its owner's held_slots, or not_held.
     * Replaces the old intrusive next_held link and its self-sentinel, keeping
     * registration, retirement and the "am I registered" test all O(1). */

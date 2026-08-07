@@ -16,6 +16,12 @@ using namespace cyros;
 
 static_assert(config::cores >= 4, "Test suite is designed for (at least) quad-core configuration");
 
+// A semaphore must stay constant-initialisable, so a static one lands in .bss
+// with no startup code and no initialisation-order surface. This is the reason
+// the park list is a named-but-unusable type rather than opaque storage: opaque
+// storage would need placement-new in the constructor and break this.
+constinit static sync::semaphore constant_initialised_semaphore{1};
+
 static constexpr auto STACK_SIZE = thread::min_stack_size + (16 * 1024);
 
 /* ============================================================================

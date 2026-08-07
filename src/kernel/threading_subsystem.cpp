@@ -6,8 +6,9 @@
 namespace cyros
 {
 
-static_assert(sizeof(thread_control_block) + 4096 <= thread::min_stack_size,
-              "Public constant thread::min_stack_size no longer accurately reflects the true min_stack_size");
+static_assert(sizeof(thread_control_block) <= CYROS_PORT_CONTEXT_SIZE + thread::tcb_size,
+              "thread_control_block outgrew thread::tcb_size, so thread::min_stack_size "
+              "now under-reports. Bump tcb_size.");
 
 thread::thread(entry_fn&& entry, std::span<std::byte> stack, priority priority, core_affinity affinity)
 {
