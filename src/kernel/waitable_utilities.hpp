@@ -16,7 +16,7 @@ namespace cyros
 /* ============================================================================
  * waitable_access - attorney for the priority-inheritance walk
  *
- * recompute_thread_priority needs four narrow operations on waitable and
+ * The urgency fold needs one narrow operation on pi_waitable, and
  * pi_waitable internals. Granting friendship to the function itself would
  * force its declaration into the public header (a friend FUNCTION must be
  * visibly declared to be callable, a friend STRUCT declaration is
@@ -154,18 +154,11 @@ public:
          if (!waitable.queue.disarm(nodes[i])) {
             continue;
          }
-         // Leaving a queue without acquiring (a wait_on_any that won on a
-         // different index, or a future timed wait expiring) can lower the
-         // queue's best-waiter priority, at which point the holder's
-         // inheritance is stale. Nothing else would ring it, the fail-path
-         // donation only fires when someone new parks, so the departing
-         // waiter de-boosts on its way out. On the ordinary re-arm cycle of
-         // the block loop this causes a transient dip that the next poll's
-         // donation immediately restores.
-         thread::id expected_id = 0;
-         if (auto* target = waitable.donation_target(expected_id)) {
-            thread_action::recompute_thread_priority(*target, expected_id);
-         }
+         // Leaving a queue without acquiring lowers its best-waiter priority,
+         // so the holder becomes LESS urgent. Nothing to do: urgency is folded
+         // from top() at the point of use, and observing the drop late only
+         // means the holder ran at its old urgency slightly longer, which is
+         // safe. A boost needs a prompt, a de-boost does not.
       }
    }
 

@@ -63,8 +63,7 @@ enum class thread_state : uint8_t
  */
 enum class thread_request : std::uint8_t
 {
-   make_ready,         ///< Enqueue this thread into its core's ready matrix
-   recompute_priority, ///< Re-derive its effective priority from current truth
+   make_ready, ///< Admit this thread to its core's runnable set
 };
 
 enum class thread_disposition : uint8_t
@@ -94,15 +93,23 @@ struct thread_control_block
    relaxed_atomic<thread_state>       state{thread_state::created};
    relaxed_atomic<thread_disposition> disposition{thread_disposition::none};
 
-   // Intrusive 'linked-list' links for a thread_ready_queue. Pointing to self
-   // represents the not-enqueued sentinel
+   /* Intrusive link for a thread_ready_queue. Self-pointer is the not-enqueued
+    * sentinel. Singly linked: the queue needs only push_back and pop_front now
+    * that nothing re-keys a thread's position, so a back pointer would cost 8
+    * bytes to serve no caller. */
    thread_control_block* next{this};
-   thread_control_block* prev{this};
 
 
    thread::id id{0};
+
+   /* The thread's own priority, fixed for its lifetime.
+    *
+    * There is no effective_priority field. Urgency is min(base, best waiter of
+    * every pi_waitable held) and is COMPUTED at the point of use by
+    * thread_action::urgency(), never stored. A stored copy would be a cache whose
+    * inputs live on other cores, which is what every priority-inheritance bug in
+    * this project's history has been. */
    uint8_t base_priority;
-   std::atomic<uint8_t> effective_priority; // Can change dynamically
    thread* public_thread_handle;
 
    // Core pinning
@@ -190,8 +197,12 @@ struct thread_control_block
     * scheduler::push_intake. */
    std::atomic<thread_control_block*> intake_next{nullptr};
 
-   /* Link in the owning core's list of threads that hold at least one
+   /* Link in the owning core's list of READY threads that hold at least one
     * pi_waitable. Self-pointer is the not-linked sentinel, as elsewhere.
+    *
+    * Membership is a property of being ready, not of holding: a thread joins at
+    * set_thread_ready and leaves when picked. It is never listed while running,
+    * which is why acquiring and releasing do not touch this at all.
     *
     * These are exactly the threads whose urgency can differ from their base
     * priority, so once the ready matrix is keyed on base_priority this is the
@@ -229,25 +240,6 @@ struct thread_control_block
       return next != this;
    }
 
-   [[nodiscard]] constexpr uint8_t priority() const
-   {
-      return effective_priority.load(std::memory_order_relaxed);
-   }
-
-   [[nodiscard]] bool is_higher_priority_than(thread_control_block& rhs) const noexcept
-   {
-      return priority() < rhs.priority();
-   }
-
-   [[nodiscard]] constexpr bool is_higher_priority_than(uint8_t priority_level) const noexcept
-   {
-      return priority() < priority_level;
-   }
-
-   constexpr void set_priority(uint8_t p)
-   {
-      effective_priority.store(p, std::memory_order_relaxed);
-   }
 
    /**
     * @brief True when this thread owns no pi_waitable. One load, one compare.
@@ -320,8 +312,6 @@ public:
    void push_back(thread_control_block& tcb) noexcept;
 
    thread_control_block* pop_front() noexcept;
-
-   void remove(thread_control_block& tcb) noexcept;
 };
 
 class thread_ready_matrix
@@ -345,11 +335,11 @@ public:
       return bitmap == 0;
    }
 
+   /** @brief Enqueue at the thread's BASE priority, which never changes. */
    void enqueue_thread(thread_control_block& tcb) noexcept;
 
    thread_control_block* pop_best_thread() noexcept;
 
-   void remove_thread(thread_control_block& tcb) noexcept;
 };
 
 } // namespace cyros

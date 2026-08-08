@@ -30,44 +30,13 @@ void register_thread(thread_control_block& tcb);
 schedule_hint ready_thread(thread_control_block& tcb);
 
 /**
- * @brief Recompute a thread's effective priority from truth, chasing chains.
- *
- * Effective priority is derived state: min(base_priority, best queued waiter
- * of every pi_waitable the thread holds). This walk re-derives it for the
- * seed thread and then chases any transitive donation the change uncovered,
- * a boosted thread that is itself blocked on a pi_waitable re-orders that
- * queue, and if the queue's best waiter changed, ITS holder must be
- * re-derived too.
- *
- * Requests never carry priority values, only "recompute from truth". That is
- * what makes every form of staleness benign: two donors racing converge on
- * the same queue-head read, a restore racing a late boost recomputes to the
- * same answer, and a doorbell for a released resource finds it absent from
- * the held list. The one hazard idempotence cannot absorb is the TCB memory
- * being recycled by a new thread, which expected_id filters, ids are never
- * reused within a kernel session.
- *
- * Only the owning core mutates a thread's scheduling position, so remote
- * targets are forwarded as intake doorbells and drained in their scheduler.
- * Local targets are processed inline.
- * The walk is iterative rather than recursive because it can run on the
- * shared interceptor stack via drain_intake, and a user-constructed deadlock
- * cycle terminates naturally, a hop is only queued when a queue top actually
- * changed, and around a cycle the donated priority stops changing.
- *
- * Lock ordering: takes pi_lock then queue locks (reslot), never the reverse,
- * and never two pi_locks together, chain hops are queued and processed after
- * the current target's pi_lock is released.
- */
-void recompute_thread_priority(thread_control_block& tcb, thread::id expected_id);
-
-/**
  * @brief A thread's urgency, computed from truth: min(base, best waiter of
  *        every pi_waitable it holds).
  *
- * This is the DEFINITION of effective priority, evaluated rather than read.
- * `thread_control_block::effective_priority` is a cache of the same function,
- * maintained by the walk above; this is the function itself.
+ * This is the DEFINITION of priority inheritance, evaluated rather than read.
+ * There is no stored effective priority and no walk maintaining one: a cache
+ * whose inputs live on other cores is what every priority-inheritance bug in
+ * this project's history has been.
  *
  * Callable by ANY core with no lock held. That is not incidental: held_slots is
  * a bounded array of atomics rather than an intrusive list precisely so a
@@ -84,14 +53,19 @@ void recompute_thread_priority(thread_control_block& tcb, thread::id expected_id
 [[nodiscard]] std::uint8_t urgency(thread_control_block const& tcb) noexcept;
 
 /**
- * @brief Note that @p tcb now holds its first pi_waitable, or has released its
- *        last one.
+ * @brief Ask @p tcb's core to reconsider what it is running.
  *
- * Both run in the thread's own context on its own core, which is what lets the
- * underlying list be a plain pointer chain with no synchronisation.
+ * A pure hint carrying nothing. Used when a thread's urgency has RISEN because a
+ * waiter arrived on something it holds: the new urgency is already visible in
+ * that resource's queue top, but the owning core will not notice until it picks
+ * again. Losing this costs latency, never correctness, because the next pick for
+ * any reason folds the same truth.
+ *
+ * Only boosts need it. A de-boost that is observed late merely means the holder
+ * ran at its old urgency slightly longer, which is safe.
  */
-void track_holder(thread_control_block& tcb);
-void untrack_holder(thread_control_block& tcb);
+void request_repick(thread_control_block& tcb);
+
 
 } // namespace cyros::thread_action
 

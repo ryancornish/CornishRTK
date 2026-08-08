@@ -79,53 +79,6 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
 }
 
 /**
- * @brief Post a priority-recompute doorbell to a thread's owning core.
- *
- * Value-free by design: the request tells the owning core to re-derive the
- * thread's effective priority from current truth, it never carries a
- * priority. Posting to the calling core itself is legal and used as the
- * overflow path of a deep local boost chain.
- */
-void post_priority_recompute(thread_control_block& tcb, thread::id const expected_id)
-{
-   // expected_id is deliberately not carried across: the claim lives on the TCB
-   // and thread construction is a placement new, so a recycled TCB comes back
-   // with pending_requests zeroed and cannot present a stale request.
-   (void)expected_id;
-   scheduler_for_core(tcb.pinned_core).post_intake(tcb, thread_request::recompute_priority);
-}
-
-/**
- * @brief Pending targets of a priority-inheritance chain walk.
- *
- * Bounded because the walk can run on the shared interceptor stack via
- * drain_intake: local hops beyond the capacity continue by self-posted
- * doorbell instead of growing the walk, which push() folds away from the
- * traversal.
- */
-struct priority_chain
-{
-   static constexpr auto depth = 8u;
-   struct target
-   {
-      thread_control_block* tcb;
-      thread::id expected_id;
-   };
-
-   std::array<target, depth> targets{};
-   std::size_t pending{0};
-
-   void push(thread_control_block& next, thread::id const next_expected_id) noexcept
-   {
-      if (pending < targets.size()) {
-         targets[pending++] = { .tcb = &next, .expected_id = next_expected_id };
-      } else {
-         post_priority_recompute(next, next_expected_id);
-      }
-   }
-};
-
-/**
  * @brief min(base, best waiter of every held PI resource).
  *
  * The definition of effective priority, folded from current truth.
@@ -154,31 +107,6 @@ struct priority_chain
       floor = std::min(waitable_access::queue_top(*held), floor);
    }
    return floor;
-}
-
-/**
- * @brief Re-order a blocked thread's armed nodes after its priority changed.
- *
- * The ordered position arm() gave each node is now stale. Where a re-slot
- * changes a queue's BEST waiter, the holder of that queue's resource
- * inherits differently, so it is chained for its own recompute, processed
- * after this target's pi_lock is released. Caller holds the target's
- * pi_lock, which keeps active_waits stable.
- */
-void reslot_blocked_waits(thread_control_block& target, priority_chain& chain) noexcept
-{
-   if (target.state != thread_state::blocked || target.active_waits == nullptr) {
-      return;
-   }
-   for (auto& node : *target.active_waits) {
-      if (node.source == nullptr) continue;
-      if (!waitable_access::reslot(*node.source, node)) continue;
-
-      thread::id chase_id = 0;
-      if (auto* next = waitable_access::donation_target(*node.source, chase_id)) {
-         chain.push(*next, chase_id);
-      }
-   }
 }
 
 
@@ -260,53 +188,12 @@ std::uint8_t urgency(thread_control_block const& tcb) noexcept
    return donated_floor(tcb);
 }
 
-void track_holder(thread_control_block& tcb)
+void request_repick(thread_control_block& tcb)
 {
-   scheduler_for_core(tcb.pinned_core).link_holder(tcb);
-}
-
-void untrack_holder(thread_control_block& tcb)
-{
-   scheduler_for_core(tcb.pinned_core).unlink_holder(tcb);
-}
-
-void recompute_thread_priority(thread_control_block& tcb, thread::id const expected_id)
-{
-   priority_chain chain;
-   chain.push(tcb, expected_id);
-
-   auto const this_core_id = cyros_port_get_core_id();
-   bool reschedule_warranted = false;
-
-   while (chain.pending > 0) {
-      auto const target = chain.targets[--chain.pending];
-
-      if (target.tcb->id != target.expected_id) continue;          // TCB recycled, drop
-      if (target.tcb->state == thread_state::terminated) continue; // Stale, drop
-
-      if (target.tcb->pinned_core != this_core_id) {
-         post_priority_recompute(*target.tcb, target.expected_id);
-         continue;
-      }
-
-      // pi_lock holds the held list and active_waits stable, and (as an
-      // interrupt-masking spinlock) makes the matrix surgery inside
-      // reprioritise_thread atomic against ISRs as well as thread switches.
-      spinlock_guard pi_guard(target.tcb->pi_lock);
-
-      std::uint8_t const new_effective = donated_floor(*target.tcb);
-      if (new_effective == target.tcb->priority()) continue;
-
-      auto const hint = scheduler_for_this_core().reprioritise_thread(*target.tcb, new_effective);
-      if (hint == schedule_hint::warranted) {
-         reschedule_warranted = true;
-      }
-
-      reslot_blocked_waits(*target.tcb, chain);
-   }
-
-   if (reschedule_warranted) {
+   if (tcb.pinned_core == cyros_port_get_core_id()) {
       cyros_port_pend_reschedule();
+   } else {
+      cyros_port_send_reschedule_ipi(tcb.pinned_core);
    }
 }
 
@@ -460,7 +347,7 @@ namespace this_thread
 
 [[nodiscard]] thread::priority priority()
 {
-   return scheduler_for_this_core().current_thread_priority();
+   return scheduler_for_this_core().current_thread_urgency();
 }
 
 [[noreturn]] void thread_exit()

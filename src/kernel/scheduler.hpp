@@ -67,10 +67,8 @@ public:
       return current_thread ? current_thread->id : 0;
    }
 
-   [[nodiscard]] constexpr uint8_t current_thread_priority() const noexcept
-   {
-      return current_thread ? current_thread->priority() : 0;
-   }
+   /** @brief Urgency of the running thread, folded from truth. */
+   [[nodiscard]] uint8_t current_thread_urgency() const noexcept;
 
    /** @brief Threads pinned here. Used by pin_thread_to_core to load balance. */
    [[nodiscard]] uint32_t pinned_thread_count() const noexcept
@@ -101,20 +99,13 @@ public:
    void set_thread_terminated(thread_control_block& tcb) noexcept;
 
    /**
-    * @brief Move a thread on this core to a new effective priority.
+    * @brief Choose the most urgent runnable thread on this core.
     *
-    * The one place the effective_priority field and the thread's scheduling
-    * position change together. The matrix keys removal on the CURRENT field
-    * value, so an already-enqueued thread is removed at the old value,
-    * rewritten, and re-enqueued at the new. Must run on the owning core, the
-    * caller holds the thread's pi_lock, whose interrupt-masking grade makes
-    * the matrix surgery atomic against ISRs as well as thread switches.
-    *
-    * @return warranted when the change makes a reschedule worthwhile: a ready
-    *         thread was raised above the running one, or the running one
-    *         dropped below a ready peer.
+    * Best of the matrix head (most urgent non-holder, by base priority) and the
+    * most urgent holder, whose urgency is folded from truth rather than read
+    * from a cache. Returns nullptr when nothing is runnable.
     */
-   schedule_hint reprioritise_thread(thread_control_block& tcb, uint8_t new_effective) noexcept;
+   thread_control_block* pick_next() noexcept;
 
    /**
     * @brief Push a TCB onto this core's intake stack. Any core may call.

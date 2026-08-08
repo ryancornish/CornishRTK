@@ -114,14 +114,15 @@ public:
     */
    /* Bump if sizeof(thread_control_block) grows.
     *
-    * 272 during the derived-urgency work: intake_next and holder_next cost 8
-    * bytes each and 256 was EXACTLY full, which is also why max_held_per_thread
-    * was cut from 8 to 4 earlier.
-    *
-    * EXPECTED TO RETURN TO 264 when that work completes. Deleting the walk
-    * removes reprioritise_thread, the only caller of remove_thread, after which
-    * thread_ready_queue needs only push_back and pop_front, goes singly linked,
-    * and tcb.prev's 8 bytes pay holder_next back.
+    * 256 was EXACTLY full before this work. Since then, per TCB:
+    *   + intake_next   (8)  the cross-core transport
+    *   + holder_next   (8)  the ready-holder list the pick folds over
+    *   - effective_priority the cache derived urgency replaced
+    *   - prev          (8)  the ready queue is singly linked now that nothing
+    *                        re-keys a thread's position
+    * which nets out BELOW where it started, so the budget went back down rather
+    * than up. If it ever needs raising again, note it feeds min_stack_size and
+    * therefore every user's stack.
     *
     * This is repayable. thread_ready_queue::remove is reached only from
     * reprioritise_thread, which the derived-urgency work deletes. After that the
@@ -129,7 +130,7 @@ public:
     * thread_control_block::prev dies, and its 8 bytes give this back. Migration
     * does not resurrect the need, provided it is done at the pick (pop, check
     * pinned_core, forward) rather than by removing from the middle. */
-   static constexpr std::size_t tcb_size = 272;
+   static constexpr std::size_t tcb_size = 256;
 
    /**
     * @brief Headroom reserved for the first call frame on a fresh stack.

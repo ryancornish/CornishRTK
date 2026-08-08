@@ -62,12 +62,17 @@ bool wait_queue::empty() const noexcept
 }
 
 /**
- * @brief Priority-ordered insert (best at head).
+ * @brief Priority-ordered insert (best at head), keyed on BASE priority.
+ *
+ * Base never changes, so a node's position is fixed for the life of the wait and
+ * nothing ever has to re-slot it. That is what removed the whole reslot-and-chase
+ * machinery: the old key was effective priority, which moved under the queue and
+ * had to be chased.
  */
 void wait_queue::link(wait_node& node) noexcept
 {
    wait_node** slot = &head;
-   while (*slot && (*slot)->owner->priority() <= node.owner->priority()) {
+   while (*slot && (*slot)->owner->base_priority <= node.owner->base_priority) {
       slot = &(*slot)->next;
    }
    node.next = *slot;
@@ -125,7 +130,7 @@ void wait_queue::refresh_top() noexcept
    // Requires the queue lock held. Release pairs with the acquire in top() so
    // a recompute that learns of a queue change (via a doorbell or its own
    // reslot return) observes the value that change produced.
-   top_priority.store(head != nullptr ? head->owner->priority() : no_waiter,
+   top_priority.store(head != nullptr ? head->owner->base_priority : no_waiter,
                       std::memory_order_release);
 }
 
@@ -297,23 +302,14 @@ void pi_waitable::register_held(thread_control_block& tcb) noexcept
       // Publish the slot BEFORE the bit. A reader that sees the bit must be able
       // to see the pointer, so the bit is what makes the slot visible.
       tcb.held_slots[free_slot].store(this, std::memory_order_release);
-      auto const previous = tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
-                                                   std::memory_order_release);
-
-      // First resource: this thread's urgency can now differ from its base
-      // priority, so its core's pick has to start folding it.
-      if (previous == 0) {
-         thread_action::track_holder(tcb);
-      }
+      tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
+                             std::memory_order_release);
    }
 
-   // Inherit from waiters that were already queued at acquisition time: the
-   // uncontended CAS can win while others are parked (they armed but had not
-   // polled yet), and a transferred owner can have waiters remaining behind
-   // it. Those waiters donated to the PREVIOUS holder, so the boost is
-   // re-derived here for the new one. Never nested inside the pi_lock above,
-   // the recompute takes it again itself.
-   thread_action::recompute_thread_priority(tcb, tcb.id);
+   // Nothing to propagate. Waiters already queued at acquisition time (the
+   // uncontended CAS can win while others are parked, and a transferred owner
+   // can inherit waiters) are picked up automatically, because urgency is folded
+   // from the queue tops at the point of use rather than pushed to a cache here.
 }
 
 bool pi_waitable::pi_try_acquire() noexcept
@@ -365,8 +361,14 @@ bool pi_waitable::pi_acquire_condition(thread& caller) noexcept
    // needed. It races the owner terminating, but an owner must not terminate
    // while holding a pi resource (asserted at teardown), so a live read here is
    // part of that same contract.
+   // The donation itself needs no message: we armed before polling, so this
+   // resource's top() already reflects our urgency and the holder's core folds
+   // it in at its next pick. What the holder's core does need is a REASON to
+   // pick again, since a boost that nobody re-evaluates has no effect until
+   // something else reschedules. That is a pure hint: lose it and the boost
+   // lands at the next reschedule for any cause.
    if (expected != nullptr) {
-      thread_action::recompute_thread_priority(*expected, expected->id);
+      thread_action::request_repick(*expected);
    }
    return false;
 }
@@ -394,22 +396,16 @@ void pi_waitable::pi_release(reschedule_policy policy) noexcept
                               std::memory_order_release);
       tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
       held_slot = not_held;
-
-      // Last resource: urgency collapses back to base priority, so the pick no
-      // longer needs to consider this thread.
-      if (tcb.held_mask.load(std::memory_order_relaxed) == 0) {
-         thread_action::untrack_holder(tcb);
-      }
    }
 
    // Hand over (or free) with the commit under the queue lock, closing the
    // lost-wakeup window exactly as wake_one_and_transfer documents.
    hand_over(policy);
 
-   // Restore: re-derive from base and whatever we still hold, ending any
-   // donation this resource justified. Runs on our own core, so this is the
-   // synchronous local path, no doorbell latency on the restore side.
-   thread_action::recompute_thread_priority(tcb, tcb.id);
+   // No restore step. Our urgency stops including this resource the moment it
+   // leaves held_slots, because nothing cached it. And a release that mattered
+   // had waiters, so hand_over above already woke one and applied the
+   // reschedule policy; a release with no waiters never boosted us at all.
 }
 
 void pi_waitable::hand_over(reschedule_policy policy) noexcept
