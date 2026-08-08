@@ -483,6 +483,31 @@ void* cyros_port_get_tls_pointer(void);
 
 
 /* ----------------------------------------------------------------------------
+ * Atomics: a port obligation, but not one expressed as a function here
+ *
+ * The kernel uses std::atomic freely and assumes every operation is atomic with
+ * respect to EVERY core, not merely against interrupts on the calling one. That
+ * assumption is the port's to honour.
+ *
+ * On a CPU without a lock-free read-modify-write (Cortex-M0/M0+ has no
+ * LDREX/STREX) the compiler does not emit an unsafe inline sequence. It emits a
+ * call to the __atomic_* library ABI, and the default implementation of those
+ * masks interrupts, which does nothing about another core. Such a port MUST
+ * supply its own __atomic_* definitions built on a hardware lock. The linker
+ * takes the port's definitions in preference to the library's, so the kernel
+ * needs no knowledge of it and every atomic in the kernel is fixed at once.
+ *
+ * Prior art for the obvious target: the Pico SDK's pico_atomic implements the
+ * 1/2/4/8-byte RMWs, 8-byte load and store, and atomic_flag, using locks chosen
+ * by hashing the variable's address so unrelated atomics do not serialise.
+ *
+ * Note plain aligned loads and stores up to word width are already atomic on
+ * such a CPU and are emitted inline, so only RMWs route through the library.
+ * That split is consistent: a word-sized load can only observe the value before
+ * or after a locked RMW, never a torn one.
+ * ------------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------------
  * CPU Hints & Idle
  * ------------------------------------------------------------------------- */
 

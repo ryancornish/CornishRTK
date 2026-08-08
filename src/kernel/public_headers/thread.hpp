@@ -112,7 +112,19 @@ public:
     * (so not expressible via port_traits). Instead this catches if tcb grows past the estimation.
     * A generous fixed budget plus a static_assert is the working compromise.
     */
-   static constexpr std::size_t tcb_size = 256; // Bump if sizeof(thread_control_block) grows
+   /* Bump if sizeof(thread_control_block) grows.
+    *
+    * 264 since the per-core intake stack landed: thread_control_block::intake_next
+    * costs 8 bytes and 256 was EXACTLY full, which is also why
+    * max_held_per_thread was cut from 8 to 4 earlier.
+    *
+    * This is repayable. thread_ready_queue::remove is reached only from
+    * reprioritise_thread, which the derived-urgency work deletes. After that the
+    * ready queue needs only push_back and pop_front, so it can go singly linked,
+    * thread_control_block::prev dies, and its 8 bytes give this back. Migration
+    * does not resurrect the need, provided it is done at the pick (pop, check
+    * pinned_core, forward) rather than by removing from the middle. */
+   static constexpr std::size_t tcb_size = 264;
 
    /**
     * @brief Headroom reserved for the first call frame on a fresh stack.

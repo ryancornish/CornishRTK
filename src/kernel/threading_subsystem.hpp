@@ -136,20 +136,39 @@ struct thread_control_block
    std::atomic<std::uint8_t> held_mask{0};
    static_assert(max_held_per_thread <= 8, "held_mask is a uint8_t, so at most 8 slots");
 
-   /* Coalescing claims for cross-core requests, one bit per request type.
+   /* Cross-core requests outstanding against this thread, one bit per type.
     *
-    * A producer that finds a bit clear owns the right to queue that request. A
-    * producer that finds it set knows an unserviced entry already exists, and
-    * since these requests carry truth rather than values, that entry discharges
-    * its intent too. This bounds the queue by threads rather than by wake
-    * volume.
+    * This is the request itself, not a claim on a slot elsewhere: the TCB is the
+    * message. A producer that finds the whole field zero knows this TCB is not
+    * on any core's intake and must put it there. Any non-zero value means it
+    * already is, and since these requests carry truth rather than values, the
+    * entry already queued discharges the new intent too.
     *
     * ORDERING:
-    *   producer: claim the bit, THEN queue
-    *   consumer: release the bit, THEN service
+    *   producer: set the bit, THEN push onto the intake
+    *   consumer: take the bits, THEN service
     * A set bit therefore guarantees a service strictly in the observer's future.
+    * Servicing before taking would fold a request raised mid-service into work
+    * already done, which is a lost wake.
     */
    std::atomic<std::uint8_t> pending_requests{0};
+
+   /* Link in the owning core's intake stack. The TCB IS the cross-core message,
+    * so there is no queue to overflow and no capacity to tune.
+    *
+    * A producer publishes the node's POSITION (the exchange) before its LINK
+    * (this store), so between the two the node is reachable and points nowhere.
+    * SELF-POINTER MEANS "not linked yet, wait". nullptr cannot serve as that
+    * marker, because the bottom of every chain legitimately ends in nullptr, and
+    * a consumer that read nullptr there would stop early and strand every node
+    * beneath it.
+    *
+    * The consumer's wait is bounded ONLY because the push runs with interrupts
+    * masked, so the producer cannot be preempted between the two stores. Remove
+    * that and the wait becomes unbounded rather than merely slower, which is the
+    * whole justification for using an exchange instead of a CAS loop. See
+    * scheduler::push_intake. */
+   std::atomic<thread_control_block*> intake_next{nullptr};
 
    wait_node_vector* active_waits{nullptr};
 
@@ -253,22 +272,9 @@ public:
       return !head;
    }
 
-   [[nodiscard]] constexpr bool has_peer() const noexcept
-   {
-      return head && head != tail;
-   }
-
    [[nodiscard]] constexpr thread_control_block* front() const noexcept
    {
       return head;
-   }
-
-   // This walks the linked list so isn't 'free'
-   [[nodiscard]] constexpr std::size_t size() const noexcept
-   {
-      std::size_t n = 0;
-      for (auto* tcb = head; tcb; tcb = tcb->next) ++n;
-      return n;
    }
 
    void push_back(thread_control_block& tcb) noexcept;
@@ -297,33 +303,6 @@ public:
    [[nodiscard]] constexpr bool empty() const noexcept
    {
       return bitmap == 0;
-   }
-
-   [[nodiscard]] constexpr bool empty_at(uint32_t priority) const noexcept
-   {
-      return matrix[priority].empty();
-   }
-
-   [[nodiscard]] constexpr bool has_peer(uint32_t priority) const noexcept
-   {
-      return matrix[priority].has_peer();
-   }
-
-   [[nodiscard]] constexpr std::size_t size_at(uint32_t priority) const noexcept
-   {
-      return matrix[priority].size();
-   }
-
-   [[nodiscard]] constexpr std::bitset<bitmap_bits> bitmap_view() const noexcept
-   {
-      return {bitmap};
-   }
-
-   [[nodiscard]] constexpr thread_control_block* peek_best_thread() const noexcept
-   {
-      if (bitmap == 0) return nullptr;
-      auto const priority = std::countr_zero(bitmap);
-      return matrix[priority].front();
    }
 
    void enqueue_thread(thread_control_block& tcb) noexcept;

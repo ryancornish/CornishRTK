@@ -2,6 +2,8 @@
 
 #include "thread_action.hpp"
 
+#include <cyros/kernel/core.hpp>
+
 namespace cyros
 {
 
@@ -149,7 +151,7 @@ schedule_hint scheduler::reprioritise_thread(thread_control_block& tcb, uint8_t 
                return schedule_hint::warranted;
             }
          } else {
-            // Readied but not yet admitted (in-flight inbox request, or the
+            // Readied but not yet admitted (in-flight intake request, or the
             // idle thread). The eventual enqueue reads the new value.
             tcb.set_priority(new_effective);
          }
@@ -169,58 +171,109 @@ schedule_hint scheduler::reprioritise_thread(thread_control_block& tcb, uint8_t 
    return schedule_hint::unwarranted;
 }
 
-void scheduler::drain_inbox() noexcept
+void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits) noexcept
 {
-   inbox_poke_pending.store(false, std::memory_order_release);
+   if (bits & cross_core_request::claim_bit_for(cross_core_request::set_thread_ready)) {
+      tcb.disposition = thread_disposition::none;
+      // Runs during a reschedule, so there is no hint to acknowledge.
+      (void)set_thread_ready(tcb);
+   }
 
-   cross_core_request request;
-   while (inbox.pop(request)) {
-      // Release BEFORE servicing, so a request raised while we are servicing
-      // this one queues fresh instead of folding into work already done.
-      request.tcb->release_request(request.claim_bit());
-
-      switch (request.type) {
-         case cross_core_request::set_thread_ready:
-            request.tcb->disposition = thread_disposition::none;
-            // Drain inbox happens during a reschedule. No need to acknowledge the hint
-            (void)set_thread_ready(*request.tcb);
-            break;
-
-         case cross_core_request::recompute_priority:
-            // Value-free doorbell: re-derive from current truth. The id check
-            // filters TCB recycling, every other form of staleness degrades
-            // to a redundant recompute inside the walk itself.
-            if (request.tcb->id == request.expected_thread_id) {
-               thread_action::recompute_thread_priority(*request.tcb, request.expected_thread_id);
-            }
-            break;
-      }
+   if (bits & cross_core_request::claim_bit_for(cross_core_request::recompute_priority)) {
+      // Value-free doorbell: re-derive from current truth. No recycling guard is
+      // needed here, unlike the ring, because the claim lives ON the TCB and
+      // thread construction is a placement new (threading_subsystem.cpp), so a
+      // recycled TCB comes back with pending_requests zeroed. A stale request
+      // cannot survive the identity change that would make it wrong.
+      thread_action::recompute_thread_priority(tcb, tcb.id);
    }
 }
 
-// Cross-core safe posting API
-bool scheduler::post_to_inbox(cross_core_request request) noexcept
+void scheduler::post_intake(thread_control_block& tcb, cross_core_request::request_type type) noexcept
 {
-   // Many-producer safe.
-   //
-   // Fold into an entry that is already queued and not yet serviced, rather
-   // than queueing a second one saying the same thing. Claiming BEFORE the push
-   // is what makes a set bit mean "a service is still coming".
-   if (!request.tcb->claim_request(request.claim_bit())) return true;
+   auto const bit = cross_core_request::claim_bit_for(type);
 
-   if (!inbox.push(request)) {
-      // Nothing was queued, so the claim must not survive. Leaving it set would
-      // fold every later request into an entry that does not exist, turning a
-      // transient full into permanent silence for this target.
-      request.tcb->release_request(request.claim_bit());
-      return false; // Full
-   }
+   // One atomic answers both questions. A previously-zero field means this TCB
+   // is not on the intake and we must put it there. Any non-zero value means it
+   // already is, and since these requests carry truth rather than values, the
+   // entry already queued discharges this intent too.
+   auto const old = tcb.pending_requests.fetch_or(bit, std::memory_order_acq_rel);
+   if (old != 0) return;
 
-   bool expected = false;
-   if (inbox_poke_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+   if (push_intake(tcb)) {
+      // Empty-to-non-empty, so nobody else has poked this core for this batch.
       cyros_port_send_reschedule_ipi(core_id);
    }
-   return true;
+}
+
+bool scheduler::push_intake(thread_control_block& tcb) noexcept
+{
+   // The self-pointer says "position published, link not yet". It must be in
+   // place BEFORE the exchange makes the node reachable. nullptr cannot serve as
+   // this marker: the bottom of the chain legitimately ends in nullptr, and a
+   // consumer reading it there would stop early and strand everything beneath.
+   tcb.intake_next.store(&tcb, std::memory_order_relaxed);
+
+   // Interrupts masked across the exchange and the link store. This is what
+   // bounds the consumer's wait in await_intake_link to two instructions, and
+   // it is the entire reason an exchange is acceptable here instead of a CAS
+   // retry loop. Preempt-grade would NOT do: the timer ISR would still fire and
+   // can itself wake a thread, so a same-core ISR could run a whole push while
+   // this node is still showing the sentinel.
+   //
+   // enter_critical is depth-based, so calling this from an ISR that already
+   // masked (a future chrono alarm doing wake_one) simply nests.
+   this_core::critical_guard guard;
+
+   auto* prev = intake_head.exchange(&tcb, std::memory_order_acq_rel);
+
+   tcb.intake_next.store(prev, std::memory_order_release);
+
+   // Empty-to-non-empty is decided by the same atomic that enqueued, so unlike a
+   // separate poke flag it cannot go stale against the queue it describes.
+   return prev == nullptr;
+}
+
+/**
+ * @brief Wait for a producer to publish a node's link. Bounded, see push_intake.
+ */
+static thread_control_block* await_intake_link(thread_control_block* node) noexcept
+{
+   thread_control_block* next = nullptr;
+   while ((next = node->intake_next.load(std::memory_order_acquire)) == node) {
+      cyros_port_cpu_relax();
+   }
+   return next;
+}
+
+void scheduler::drain_intake() noexcept
+{
+   auto* node = intake_head.exchange(nullptr, std::memory_order_acq_rel);
+   if (node == nullptr) return;
+
+   // The stack is LIFO and thread_ready_queue is FIFO within a priority, which
+   // round robin's fairness depends on, so restore arrival order before
+   // servicing. O(taken), same as the walk that follows.
+   thread_control_block* fifo = nullptr;
+   while (node != nullptr) {
+      auto* next = await_intake_link(node);
+      node->intake_next.store(fifo, std::memory_order_relaxed);
+      fifo = node;
+      node = next;
+   }
+
+   while (fifo != nullptr) {
+      auto* next = fifo->intake_next.load(std::memory_order_relaxed);
+      fifo->intake_next.store(nullptr, std::memory_order_relaxed);
+
+      // Release the claims BEFORE servicing, so a request raised while we are
+      // servicing this one queues fresh instead of folding into work already
+      // done. acq_rel because taking all bits at once is a read-modify-write.
+      auto const bits = fifo->pending_requests.exchange(0, std::memory_order_acq_rel);
+
+      service_intake(*fifo, bits);
+      fifo = next;
+   }
 }
 
 /**
@@ -235,7 +288,7 @@ bool scheduler::post_to_inbox(cross_core_request request) noexcept
  * becomes blocked, so the block decision has a single arbiter even though the
  * wish is raised from thread context.
  *
- * Policy: drain_inbox() runs first and is the reconciler. A wake clears its
+ * Policy: drain_intake() runs first and is the reconciler. A wake clears its
  * target's disposition as it readies it, so a wake landing on a thread that
  * already committed to blocking revokes that commit here. The wake wins and
  * the thread stays runnable rather than parking on a stale decision. A
@@ -258,7 +311,7 @@ void scheduler::reschedule() noexcept
    CYROS_ASSERT(current_thread);
    CYROS_ASSERT(!current_thread->is_enqueued());
 
-   drain_inbox();
+   drain_intake();
 
    thread_control_block* previous_thread = current_thread;
    thread_control_block* next_thread     = nullptr;
@@ -299,21 +352,27 @@ void scheduler::reschedule() noexcept
 
 void scheduler::reset()
 {
-   // At shutdown the inbox may still hold stale wake requests (e.g. a signaller
-   // can post wakes faster than the target drains them, and the target may
-   // terminate with surplus wakes still queued). But a wake to a
-   // terminated thread is a no-op. But we don't want to miss any pending work
-   // to a thread that is still live and blocked.
-   cross_core_request request;
-   while (inbox.pop(request)) {
-      // A claim never outlives the entry that holds it, on this path too.
-      request.tcb->release_request(request.claim_bit());
-      CYROS_ASSERT_OP(request.tcb->state, ==, thread_state::terminated);
+   // At shutdown the intake may still hold stale requests: a signaller can post
+   // faster than the target drains, and the target may terminate with surplus
+   // wakes outstanding. A request against a terminated thread is a no-op, but we
+   // must not leave the chain behind.
+   // The intake links live in TCBs, which are user memory that outlives the
+   // kernel run, so a leftover chain would be inherited by the next lifecycle.
+   // Construction is a placement new so a REUSED TCB comes back clean, but a
+   // TCB that is merely still alive would not. Clear both ends here.
+   auto* node = intake_head.exchange(nullptr, std::memory_order_relaxed);
+   while (node != nullptr) {
+      // No await_intake_link here: every core thread is joined before teardown,
+      // so no push can be in flight and no link can still be unpublished.
+      auto* next = node->intake_next.load(std::memory_order_relaxed);
+      node->intake_next.store(nullptr, std::memory_order_relaxed);
+      node->pending_requests.store(0, std::memory_order_relaxed);
+      CYROS_ASSERT_OP(node->state, ==, thread_state::terminated);
+      node = next;
    }
    CYROS_ASSERT(ready_matrix.empty()); // Cannot reset whilst threads still in the queue
 
    pinned_thread_counter.store(0, std::memory_order_relaxed);
-   inbox_poke_pending.store(false, std::memory_order_relaxed);
    current_thread = nullptr;
 }
 

@@ -1,7 +1,6 @@
 #ifndef CYROS_SCHEDULER_HPP
 #define CYROS_SCHEDULER_HPP
 
-#include "mpsc_ring_buffer.hpp"
 #include "threading_subsystem.hpp"
 
 #include <array>
@@ -24,6 +23,15 @@ enum class [[nodiscard]] schedule_hint
 
 void idle_task();
 
+/**
+ * @brief What a core can ask another core to do to one of its threads.
+ *
+ * There is no message object: the TCB IS the message, and this only names which
+ * bit of thread_control_block::pending_requests the request occupies. Both types
+ * are value-free doorbells against a single TCB, so two of the same kind for the
+ * same target are one obligation and fold into one bit. A type that ever carried
+ * a value could not use this, and would need somewhere on the TCB to put it.
+ */
 struct cross_core_request
 {
    enum class request_type : uint8_t
@@ -34,25 +42,10 @@ struct cross_core_request
    static constexpr auto set_thread_ready   = request_type::set_thread_ready;
    static constexpr auto recompute_priority = request_type::recompute_priority;
 
-   request_type type{};
-   thread_control_block* tcb{nullptr};
-
-   /**
-    * @brief This request's coalescing bit in thread_control_block::pending_requests.
-    *
-    * Both request types are value-free doorbells against one TCB, so two of the
-    * same kind for the same target are one obligation and fold into one entry.
-    * A type that ever carried a value could not use this.
-    */
-   [[nodiscard]] constexpr std::uint8_t claim_bit() const noexcept
+   [[nodiscard]] static constexpr std::uint8_t claim_bit_for(request_type t) noexcept
    {
-      return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(type));
+      return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(t));
    }
-   // For recompute_priority: the thread id the requester believed tcb had.
-   // Recompute is idempotent against every staleness EXCEPT the TCB memory
-   // being recycled by a new thread, which this id check filters, ids are
-   // never reused within a kernel session.
-   thread::id expected_thread_id{0};
 };
 
 class scheduler
@@ -66,9 +59,18 @@ private:
 
    thread_ready_matrix ready_matrix;
 
-   std::atomic<bool> inbox_poke_pending{false};
-   static constexpr uint32_t inbox_cap = 64; // tune later
-   mpsc_ring_buffer<cross_core_request, inbox_cap> inbox;
+   /* Head of this core's intake stack. Any core pushes, only this one takes.
+    *
+    * The TCB is the message: what a producer wants is recorded in
+    * thread_control_block::pending_requests, and this list only says WHICH TCBs
+    * to look at. So there is no capacity, nothing to overflow, and no correct-
+    * response-to-full problem, which is what the bounded ring had and could not
+    * answer.
+    *
+    * A port whose CPU has no lock-free RMW (Cortex-M0/M0+ has no LDREX/STREX)
+    * supplies its own __atomic_* implementations, which fixes every atomic in
+    * the kernel at once rather than this one. See port.h. */
+   std::atomic<thread_control_block*> intake_head{nullptr};
 
 public:
    static constexpr thread::id idle_thread_id = 0; // Reserved
@@ -91,21 +93,17 @@ public:
       return current_thread ? current_thread->priority() : 0;
    }
 
-   [[nodiscard]] constexpr thread_control_block& get_current_thread() const noexcept
-   {
-      CYROS_ASSERT(current_thread != nullptr); // Not invocable from non-thread context
-
-      return *current_thread;
-   }
-
+   /** @brief Threads pinned here. Used by pin_thread_to_core to load balance. */
    [[nodiscard]] uint32_t pinned_thread_count() const noexcept
    {
       return pinned_thread_counter.load(std::memory_order_relaxed);
    }
 
-   [[nodiscard]] bool inbox_pending() const noexcept
+   [[nodiscard]] constexpr thread_control_block& get_current_thread() const noexcept
    {
-      return inbox_poke_pending.load(std::memory_order_relaxed);
+      CYROS_ASSERT(current_thread != nullptr); // Not invocable from non-thread context
+
+      return *current_thread;
    }
 
    void pin_thread(thread_control_block& tcb);
@@ -139,10 +137,51 @@ public:
     */
    schedule_hint reprioritise_thread(thread_control_block& tcb, uint8_t new_effective) noexcept;
 
-   void drain_inbox() noexcept;
+   /**
+    * @brief Push a TCB onto this core's intake stack. Any core may call.
+    *
+    * @return true when the intake was EMPTY before this push, meaning the
+    *         caller owns sending the IPI. That decision comes from the same
+    *         atomic that enqueues, so there is no separate "is a drain already
+    *         coming" flag to go stale against it.
+    *
+    * Caller must already hold the claim in tcb.pending_requests, so a TCB is
+    * on the stack at most once.
+    */
+   [[nodiscard]] bool push_intake(thread_control_block& tcb) noexcept;
 
-   // Cross-core safe posting API
-   [[nodiscard]] bool post_to_inbox(cross_core_request request) noexcept;
+   /**
+    * @brief Ask this core to service @p type for @p tcb. Any core may call.
+    *
+    * Claims, enqueues and notifies. There is no failure mode: the TCB is the
+    * message and it always has room for itself, so nothing can overflow and
+    * there is no full-queue case needing a correct response.
+    */
+   void post_intake(thread_control_block& tcb, cross_core_request::request_type type) noexcept;
+
+   /**
+    * @brief Act on every request bit set for @p tcb. Owning core only.
+    */
+   void service_intake(thread_control_block& tcb, std::uint8_t bits) noexcept;
+
+   /**
+    * @brief Take the whole intake chain and service every request on it.
+    *
+    * Single consumer: only the owning core may call this.
+    */
+   void drain_intake() noexcept;
+
+   /**
+    * @brief True when this core has intake work outstanding. Advisory.
+    *
+    * Cheap enough for the idle loop to check before sleeping, which is what
+    * keeps a lost IPI to a scheduling round instead of a hang.
+    */
+   [[nodiscard]] bool intake_pending() const noexcept
+   {
+      // Relaxed: this only decides whether to look, never what is true.
+      return intake_head.load(std::memory_order_relaxed) != nullptr;
+   }
 
    /**
    * @brief Select the next runnable thread for this core and switch to it.

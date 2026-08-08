@@ -88,19 +88,18 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
  */
 void post_priority_recompute(thread_control_block& tcb, thread::id const expected_id)
 {
-   bool const posted = scheduler_for_core(tcb.pinned_core).post_to_inbox({
-      .type = cross_core_request::recompute_priority,
-      .tcb  = &tcb,
-      .expected_thread_id = expected_id,
-   });
-   CYROS_ASSERT(posted); // Inbox full
+   // expected_id is deliberately not carried across: the claim lives on the TCB
+   // and thread construction is a placement new, so a recycled TCB comes back
+   // with pending_requests zeroed and cannot present a stale request.
+   (void)expected_id;
+   scheduler_for_core(tcb.pinned_core).post_intake(tcb, cross_core_request::recompute_priority);
 }
 
 /**
  * @brief Pending targets of a priority-inheritance chain walk.
  *
  * Bounded because the walk can run on the shared interceptor stack via
- * drain_inbox: local hops beyond the capacity continue by self-posted
+ * drain_intake: local hops beyond the capacity continue by self-posted
  * doorbell instead of growing the walk, which push() folds away from the
  * traversal.
  */
@@ -246,11 +245,7 @@ schedule_hint ready_thread(thread_control_block& tcb)
 
    auto const this_core = cyros_port_get_core_id();
    if (this_core != tcb.pinned_core) {
-      bool const posted = scheduler.post_to_inbox({
-         .type = cross_core_request::set_thread_ready,
-         .tcb = &tcb,
-      });
-      CYROS_ASSERT(posted);
+      scheduler.post_intake(tcb, cross_core_request::set_thread_ready);
       return schedule_hint::unwarranted;
    }
 
@@ -329,12 +324,22 @@ void thread_launcher(void* tcb_ptr)
 
 void idle_task()
 {
-   // We may have received a message whilst bootstrapping (if idle_thread was first picked)
-   if (scheduler_for_this_core().inbox_pending()) {
+   // We may have received a request whilst bootstrapping (if idle_thread was first picked)
+   if (scheduler_for_this_core().intake_pending()) {
       this_thread::yield();
    }
 
    while (k.running.load(std::memory_order::relaxed)) {
+      // Re-check BEFORE sleeping. cyros_port_idle() blocks until signalled, so
+      // a notification lost between a producer's push and this point would
+      // otherwise park the core with work outstanding, which is a hang rather
+      // than a delay. The intake is the truth and the IPI only a hint, so
+      // looking again here is what makes losing the hint survivable.
+      if (scheduler_for_this_core().intake_pending()) {
+         this_thread::yield();
+         continue;
+      }
+
       cyros_port_idle();
 
       this_thread::yield();

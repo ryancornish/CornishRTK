@@ -53,7 +53,7 @@ constexpr std::uint64_t poll_budget = 20'000'000;
 // Extra spins the boosted holder burns after the exit signal before checking
 // that the medium thread never started. Dwarfs the ready-request IPI latency,
 // so the "medium was ready but could not preempt" claim is genuinely
-// exercised rather than won by racing the inbox.
+// exercised rather than won by racing the intake.
 constexpr int grace_spins = 200'000;
 
 // Lifecycle repetitions for the deterministic donation tests. Each rep is a

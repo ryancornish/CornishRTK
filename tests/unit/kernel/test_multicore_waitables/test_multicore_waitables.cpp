@@ -76,7 +76,7 @@ protected:
  * Cross-core wake: waiter on one core, signaler on another
  *
  * The most basic SMP waitable property: a wake originating on a different
- * core than the waiter must reach the waiter via the inbox + IPI path.
+ * core than the waiter must reach the waiter via the intake + IPI path.
  * Replicating this under stress builds confidence that the cross-core
  * routing is reliable across many timing windows.
  * ========================================================================= */
@@ -234,7 +234,7 @@ TEST_F(MultiCoreWaitables_Test,
  * wake_all across cores: three waiters on different cores, one signaler
  *
  * Exercises the multi-core fan-out of wake_all: the signaler's wake_all
- * posts set_thread_ready into three different schedulers' inboxes (or
+ * posts set_thread_ready into three different schedulers' intakes (or
  * directly readies its own core's waiter, depending on placement). All
  * three waiters must return.
  * ========================================================================= */
@@ -294,7 +294,7 @@ TEST_F(MultiCoreWaitables_Test,
  * This is the scenario the "case ready" scheduler tolerance was designed
  * for. The signaler on core1 calls set_and_wake_one in a loop; the waiter
  * on core0 calls wait_on in a loop. The wake may fire BEFORE the waiter
- * has finished arming and yielded - the inbox routing must serialise this
+ * has finished arming and yielded - the intake routing must serialise this
  * so the wake isn't lost.
  *
  * We can't deterministically trigger the inner-window race on a
@@ -557,7 +557,7 @@ TEST_F(MultiCoreWaitables_Test,
  * disarming N nodes per park under adversarial interleaving, the lowest-index
  * winner rule under genuine ties (several sources satisfied at once, which
  * happens constantly here because three cores set concurrently), and repeated
- * cross-core wake fan-in into one waiter's inbox. A lost wake or a botched
+ * cross-core wake fan-in into one waiter's intake. A lost wake or a botched
  * multi-node disarm shows up as a hang (the waiter parks with a set it never
  * observed) or as a per-source tally that does not reach iterations_per_rep.
  * ========================================================================= */

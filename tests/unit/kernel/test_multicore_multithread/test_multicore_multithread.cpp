@@ -135,7 +135,7 @@ TEST_F(MultiCoreMultiThread_Test,
    // THEN:
 
    EXPECT_TRUE(remote_ran)
-      << "Remote thread never ran (missing inbox poke / IPI / idle wake)";
+      << "Remote thread never ran (missing intake poke / IPI / idle wake)";
    EXPECT_EQ(remote_seen_core, 1u);
 }
 
@@ -205,7 +205,7 @@ TEST_F(MultiCoreMultiThread_Test,
    // GIVEN:
 
    // Make core1 have *no* initial threads queued pre-start by creating the core1 work post-start.
-   // core1 will start in idle unless/until it receives inbox work + IPI.
+   // core1 will start in idle unless/until it receives intake work + IPI.
    thread core0_thread(
       [&]{
          EXPECT_EQ(this_core::id(), 0u);
@@ -222,7 +222,7 @@ TEST_F(MultiCoreMultiThread_Test,
             core1
          );
 
-         // Yield to allow IPI -> idle wake -> inbox drain -> thread run.
+         // Yield to allow IPI -> idle wake -> intake drain -> thread run.
          for (int i = 0; i < 10; ++i) this_thread::yield();
       },
       s_core0,

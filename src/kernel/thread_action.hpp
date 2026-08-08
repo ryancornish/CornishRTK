@@ -48,10 +48,10 @@ schedule_hint ready_thread(thread_control_block& tcb);
  * reused within a kernel session.
  *
  * Only the owning core mutates a thread's scheduling position, so remote
- * targets are forwarded as inbox doorbells and drained in their scheduler.
+ * targets are forwarded as intake doorbells and drained in their scheduler.
  * Local targets are processed inline.
  * The walk is iterative rather than recursive because it can run on the
- * shared interceptor stack via drain_inbox, and a user-constructed deadlock
+ * shared interceptor stack via drain_intake, and a user-constructed deadlock
  * cycle terminates naturally, a hop is only queued when a queue top actually
  * changed, and around a cycle the donated priority stops changing.
  *
