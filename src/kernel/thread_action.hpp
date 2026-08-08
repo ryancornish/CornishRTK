@@ -61,6 +61,38 @@ schedule_hint ready_thread(thread_control_block& tcb);
  */
 void recompute_thread_priority(thread_control_block& tcb, thread::id expected_id);
 
+/**
+ * @brief A thread's urgency, computed from truth: min(base, best waiter of
+ *        every pi_waitable it holds).
+ *
+ * This is the DEFINITION of effective priority, evaluated rather than read.
+ * `thread_control_block::effective_priority` is a cache of the same function,
+ * maintained by the walk above; this is the function itself.
+ *
+ * Callable by ANY core with no lock held. That is not incidental: held_slots is
+ * a bounded array of atomics rather than an intrusive list precisely so a
+ * remote core can read what a thread holds without taking its pi_lock, and
+ * queue tops are maintained atomics for the same reason. A racing release
+ * yields a stale-but-plausible answer, which is the tolerance the value-free
+ * doorbell already rests on.
+ *
+ * Cost: one relaxed load and a compare when the thread holds nothing, which is
+ * 98.9 percent of picks in the only test that exercises mutexes at all and 100
+ * percent everywhere else. Otherwise one iteration per resource actually held,
+ * measured at 1.01 resources per holder.
+ */
+[[nodiscard]] std::uint8_t urgency(thread_control_block const& tcb) noexcept;
+
+/**
+ * @brief Note that @p tcb now holds its first pi_waitable, or has released its
+ *        last one.
+ *
+ * Both run in the thread's own context on its own core, which is what lets the
+ * underlying list be a plain pointer chain with no synchronisation.
+ */
+void track_holder(thread_control_block& tcb);
+void untrack_holder(thread_control_block& tcb);
+
 } // namespace cyros::thread_action
 
 #endif // CYROS_THREAD_ACTION_HPP

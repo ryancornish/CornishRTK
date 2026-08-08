@@ -52,6 +52,21 @@ enum class thread_state : uint8_t
    terminated,
 };
 
+/**
+ * @brief Work one core can ask the owning core to do to a thread.
+ *
+ * Not a message type: there is no message. Each enumerator names one bit of
+ * thread_control_block::pending_requests, which IS the request. Both are
+ * value-free, so two of the same kind against one thread are one obligation and
+ * collapse into one bit. Anything that needed to carry a value would need a home
+ * on the TCB, not an entry in a queue.
+ */
+enum class thread_request : std::uint8_t
+{
+   make_ready,         ///< Enqueue this thread into its core's ready matrix
+   recompute_priority, ///< Re-derive its effective priority from current truth
+};
+
 enum class thread_disposition : uint8_t
 {
    none,      ///< No pending wish - scheduled purely on position.
@@ -153,6 +168,11 @@ struct thread_control_block
     */
    std::atomic<std::uint8_t> pending_requests{0};
 
+   [[nodiscard]] static constexpr std::uint8_t request_bit(thread_request r) noexcept
+   {
+      return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(r));
+   }
+
    /* Link in the owning core's intake stack. The TCB IS the cross-core message,
     * so there is no queue to overflow and no capacity to tune.
     *
@@ -169,6 +189,26 @@ struct thread_control_block
     * whole justification for using an exchange instead of a CAS loop. See
     * scheduler::push_intake. */
    std::atomic<thread_control_block*> intake_next{nullptr};
+
+   /* Link in the owning core's list of threads that hold at least one
+    * pi_waitable. Self-pointer is the not-linked sentinel, as elsewhere.
+    *
+    * These are exactly the threads whose urgency can differ from their base
+    * priority, so once the ready matrix is keyed on base_priority this is the
+    * only set the pick has to fold urgency over. Holders are rare, measured at
+    * 1.09 percent of picks in the one test that exercises mutexes at all and
+    * zero everywhere else, so the list is almost always empty and the pick
+    * degenerates to the matrix head.
+    *
+    * Needs no atomics: membership changes only in register_held and pi_release,
+    * both of which run in the holder's OWN context on its OWN core, and the
+    * only reader is that core's pick. */
+   thread_control_block* holder_next{this};
+
+   [[nodiscard]] constexpr bool is_listed_holder() const noexcept
+   {
+      return holder_next != this;
+   }
 
    wait_node_vector* active_waits{nullptr};
 

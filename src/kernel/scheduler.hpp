@@ -7,7 +7,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <span>
 
 namespace cyros
 {
@@ -22,31 +21,6 @@ enum class [[nodiscard]] schedule_hint
 };
 
 void idle_task();
-
-/**
- * @brief What a core can ask another core to do to one of its threads.
- *
- * There is no message object: the TCB IS the message, and this only names which
- * bit of thread_control_block::pending_requests the request occupies. Both types
- * are value-free doorbells against a single TCB, so two of the same kind for the
- * same target are one obligation and fold into one bit. A type that ever carried
- * a value could not use this, and would need somewhere on the TCB to put it.
- */
-struct cross_core_request
-{
-   enum class request_type : uint8_t
-   {
-      set_thread_ready,   // Enqueue a TCB into this core's ready queue
-      recompute_priority, // Re-derive a TCB's effective priority from current truth
-   };
-   static constexpr auto set_thread_ready   = request_type::set_thread_ready;
-   static constexpr auto recompute_priority = request_type::recompute_priority;
-
-   [[nodiscard]] static constexpr std::uint8_t claim_bit_for(request_type t) noexcept
-   {
-      return static_cast<std::uint8_t>(1u << static_cast<std::uint8_t>(t));
-   }
-};
 
 class scheduler
 {
@@ -71,6 +45,11 @@ private:
     * supplies its own __atomic_* implementations, which fixes every atomic in
     * the kernel at once rather than this one. See port.h. */
    std::atomic<thread_control_block*> intake_head{nullptr};
+
+   /* Threads pinned here that hold at least one pi_waitable, i.e. exactly the
+    * threads whose urgency can differ from their base priority. Core-local and
+    * needs no atomics: see thread_control_block::holder_next. */
+   thread_control_block* holders_head{nullptr};
 
 public:
    static constexpr thread::id idle_thread_id = 0; // Reserved
@@ -157,7 +136,7 @@ public:
     * message and it always has room for itself, so nothing can overflow and
     * there is no full-queue case needing a correct response.
     */
-   void post_intake(thread_control_block& tcb, cross_core_request::request_type type) noexcept;
+   void post_intake(thread_control_block& tcb, thread_request request) noexcept;
 
    /**
     * @brief Act on every request bit set for @p tcb. Owning core only.
@@ -177,6 +156,12 @@ public:
     * Cheap enough for the idle loop to check before sleeping, which is what
     * keeps a lost IPI to a scheduling round instead of a hang.
     */
+   /** @brief Track a thread that has just taken its first pi_waitable. */
+   void link_holder(thread_control_block& tcb) noexcept;
+
+   /** @brief Stop tracking a thread that has just released its last one. */
+   void unlink_holder(thread_control_block& tcb) noexcept;
+
    [[nodiscard]] bool intake_pending() const noexcept
    {
       // Relaxed: this only decides whether to look, never what is true.

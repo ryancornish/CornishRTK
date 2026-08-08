@@ -92,7 +92,7 @@ void post_priority_recompute(thread_control_block& tcb, thread::id const expecte
    // and thread construction is a placement new, so a recycled TCB comes back
    // with pending_requests zeroed and cannot present a stale request.
    (void)expected_id;
-   scheduler_for_core(tcb.pinned_core).post_intake(tcb, cross_core_request::recompute_priority);
+   scheduler_for_core(tcb.pinned_core).post_intake(tcb, thread_request::recompute_priority);
 }
 
 /**
@@ -128,9 +128,12 @@ struct priority_chain
 /**
  * @brief min(base, best waiter of every held PI resource).
  *
- * The definition of effective priority, folded from current truth. Caller
- * holds the target's pi_lock, which keeps the held list stable, the queue
- * tops are lock-free reads.
+ * The definition of effective priority, folded from current truth.
+ *
+ * NO LOCK REQUIRED. held_slots is a bounded array of atomics and the queue tops
+ * are maintained atomics, both so this can be evaluated by any core at any time.
+ * The recompute walk happens to hold the target's pi_lock when it calls this,
+ * but that is the walk's business (it also mutates), not a precondition here.
  */
 [[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target) noexcept
 {
@@ -245,11 +248,26 @@ schedule_hint ready_thread(thread_control_block& tcb)
 
    auto const this_core = cyros_port_get_core_id();
    if (this_core != tcb.pinned_core) {
-      scheduler.post_intake(tcb, cross_core_request::set_thread_ready);
+      scheduler.post_intake(tcb, thread_request::make_ready);
       return schedule_hint::unwarranted;
    }
 
    return scheduler.set_thread_ready(tcb);
+}
+
+std::uint8_t urgency(thread_control_block const& tcb) noexcept
+{
+   return donated_floor(tcb);
+}
+
+void track_holder(thread_control_block& tcb)
+{
+   scheduler_for_core(tcb.pinned_core).link_holder(tcb);
+}
+
+void untrack_holder(thread_control_block& tcb)
+{
+   scheduler_for_core(tcb.pinned_core).unlink_holder(tcb);
 }
 
 void recompute_thread_priority(thread_control_block& tcb, thread::id const expected_id)

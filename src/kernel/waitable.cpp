@@ -297,8 +297,14 @@ void pi_waitable::register_held(thread_control_block& tcb) noexcept
       // Publish the slot BEFORE the bit. A reader that sees the bit must be able
       // to see the pointer, so the bit is what makes the slot visible.
       tcb.held_slots[free_slot].store(this, std::memory_order_release);
-      tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
-                             std::memory_order_release);
+      auto const previous = tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
+                                                   std::memory_order_release);
+
+      // First resource: this thread's urgency can now differ from its base
+      // priority, so its core's pick has to start folding it.
+      if (previous == 0) {
+         thread_action::track_holder(tcb);
+      }
    }
 
    // Inherit from waiters that were already queued at acquisition time: the
@@ -388,6 +394,12 @@ void pi_waitable::pi_release(reschedule_policy policy) noexcept
                               std::memory_order_release);
       tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
       held_slot = not_held;
+
+      // Last resource: urgency collapses back to base priority, so the pick no
+      // longer needs to consider this thread.
+      if (tcb.held_mask.load(std::memory_order_relaxed) == 0) {
+         thread_action::untrack_holder(tcb);
+      }
    }
 
    // Hand over (or free) with the commit under the queue lock, closing the

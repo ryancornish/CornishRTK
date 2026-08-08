@@ -173,13 +173,13 @@ schedule_hint scheduler::reprioritise_thread(thread_control_block& tcb, uint8_t 
 
 void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits) noexcept
 {
-   if (bits & cross_core_request::claim_bit_for(cross_core_request::set_thread_ready)) {
+   if (bits & thread_control_block::request_bit(thread_request::make_ready)) {
       tcb.disposition = thread_disposition::none;
       // Runs during a reschedule, so there is no hint to acknowledge.
       (void)set_thread_ready(tcb);
    }
 
-   if (bits & cross_core_request::claim_bit_for(cross_core_request::recompute_priority)) {
+   if (bits & thread_control_block::request_bit(thread_request::recompute_priority)) {
       // Value-free doorbell: re-derive from current truth. No recycling guard is
       // needed here, unlike the ring, because the claim lives ON the TCB and
       // thread construction is a placement new (threading_subsystem.cpp), so a
@@ -189,9 +189,9 @@ void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits) noe
    }
 }
 
-void scheduler::post_intake(thread_control_block& tcb, cross_core_request::request_type type) noexcept
+void scheduler::post_intake(thread_control_block& tcb, thread_request request) noexcept
 {
-   auto const bit = cross_core_request::claim_bit_for(type);
+   auto const bit = thread_control_block::request_bit(request);
 
    // One atomic answers both questions. A previously-zero field means this TCB
    // is not on the intake and we must put it there. Any non-zero value means it
@@ -204,6 +204,32 @@ void scheduler::post_intake(thread_control_block& tcb, cross_core_request::reque
       // Empty-to-non-empty, so nobody else has poked this core for this batch.
       cyros_port_send_reschedule_ipi(core_id);
    }
+}
+
+void scheduler::link_holder(thread_control_block& tcb) noexcept
+{
+   CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
+   if (tcb.is_listed_holder()) return; // already tracked
+
+   tcb.holder_next = holders_head;
+   holders_head = &tcb;
+}
+
+void scheduler::unlink_holder(thread_control_block& tcb) noexcept
+{
+   CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
+   if (!tcb.is_listed_holder()) return; // not tracked
+
+   // Singly linked and removed by search. The list is holders-on-this-core,
+   // measured at about one, so the walk is not worth a back pointer, and TCB
+   // bytes are the scarcer resource.
+   auto** slot = &holders_head;
+   while (*slot != nullptr && *slot != &tcb) {
+      slot = &(*slot)->holder_next;
+   }
+   CYROS_ASSERT(*slot == &tcb); // holder missing from its own core's list
+   *slot = tcb.holder_next;
+   tcb.holder_next = &tcb; // restore the not-linked sentinel
 }
 
 bool scheduler::push_intake(thread_control_block& tcb) noexcept
