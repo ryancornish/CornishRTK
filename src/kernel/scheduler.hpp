@@ -12,16 +12,22 @@ namespace cyros
 {
 
 /**
- * @brief TODO
+ * @brief A return-type to communicate whether the caller
+ *        ought to trigger a reschedule
  */
 enum class [[nodiscard]] schedule_hint
 {
-   unwarranted, ///< TODO
-   warranted,   ///< TODO
+   unwarranted, ///< The action did not ready any better thread that currently running
+   warranted,   ///< The action may have readied a better thread that currently running
 };
 
 void idle_task();
 
+/**
+ * @brief Per-core state controller
+ *
+ * Owns its own special thread: 'idle thread' (id: 0)
+ */
 class scheduler
 {
 private:
@@ -37,13 +43,7 @@ private:
     *
     * The TCB is the message: what a producer wants is recorded in
     * thread_control_block::pending_requests, and this list only says WHICH TCBs
-    * to look at. So there is no capacity, nothing to overflow, and no correct-
-    * response-to-full problem, which is what the bounded ring had and could not
-    * answer.
-    *
-    * A port whose CPU has no lock-free RMW (Cortex-M0/M0+ has no LDREX/STREX)
-    * supplies its own __atomic_* implementations, which fixes every atomic in
-    * the kernel at once rather than this one. See port.h. */
+    * to look at.*/
    std::atomic<thread_control_block*> intake_head{nullptr};
 
    /* Threads pinned here that hold at least one pi_waitable, i.e. exactly the
@@ -80,6 +80,8 @@ private:
     * which shortens it and shrinks the blocking time of whoever is waiting on
     * it. Same direction as the bridge-overflow over-boost in wait_queue::top.*/
    std::uint32_t tie_rotor{0};
+   static_assert(config::max_priorities <= std::numeric_limits<decltype(tie_rotor)>::digits,
+                 "tie_rotor cannot represent that many priorities!");
 
 public:
    static constexpr thread::id idle_thread_id = 0; // Reserved
@@ -92,21 +94,25 @@ public:
    scheduler& operator=(scheduler&&) = delete;
    scheduler& operator=(scheduler const&) = delete;
 
-   [[nodiscard]] constexpr thread::id current_thread_id() const noexcept
+   [[nodiscard]] constexpr thread::id current_thread_id() const
    {
       return current_thread ? current_thread->id : 0;
    }
 
-   /** @brief Urgency of the running thread, folded from truth. */
-   [[nodiscard]] uint8_t current_thread_urgency() const noexcept;
+   /**
+    * @brief Urgency of the running thread, folded from truth.
+    */
+   [[nodiscard]] uint8_t current_thread_urgency() const;
 
-   /** @brief Threads pinned here. Used by pin_thread_to_core to load balance. */
-   [[nodiscard]] uint32_t pinned_thread_count() const noexcept
+   /**
+    * @brief Threads pinned here. Used by pin_thread_to_core to load balance.
+    */
+   [[nodiscard]] uint32_t pinned_thread_count() const
    {
       return pinned_thread_counter.load(std::memory_order_relaxed);
    }
 
-   [[nodiscard]] constexpr thread_control_block& get_current_thread() const noexcept
+   [[nodiscard]] constexpr thread_control_block& get_current_thread() const
    {
       CYROS_ASSERT(current_thread != nullptr); // Not invocable from non-thread context
 
@@ -117,16 +123,15 @@ public:
 
    void init_idle_thread();
 
-   // Core-local operations (only called on owning core)
-   void start() noexcept;
+   void start();
 
-   schedule_hint set_thread_ready(thread_control_block& tcb) noexcept;
+   schedule_hint set_thread_ready(thread_control_block& tcb);
 
-   void set_thread_running(thread_control_block& tcb) noexcept;
+   void set_thread_running(thread_control_block& tcb);
 
-   void set_thread_blocked(thread_control_block& tcb) noexcept;
+   void set_thread_blocked(thread_control_block& tcb);
 
-   void set_thread_terminated(thread_control_block& tcb) noexcept;
+   void set_thread_terminated(thread_control_block& tcb);
 
    /**
     * @brief Choose the most urgent runnable thread on this core.
@@ -135,7 +140,7 @@ public:
     * most urgent holder, whose urgency is folded from truth rather than read
     * from a cache. Returns nullptr when nothing is runnable.
     */
-   thread_control_block* pick_next() noexcept;
+   thread_control_block* pick_next();
 
    /**
     * @brief Push a TCB onto this core's intake stack. Any core may call.
@@ -148,7 +153,7 @@ public:
     * Caller must already hold the claim in tcb.pending_requests, so a TCB is
     * on the stack at most once.
     */
-   [[nodiscard]] bool push_intake(thread_control_block& tcb) noexcept;
+   [[nodiscard]] bool push_intake(thread_control_block& tcb);
 
    /**
     * @brief Ask this core to service @p type for @p tcb. Any core may call.
@@ -157,19 +162,19 @@ public:
     * message and it always has room for itself, so nothing can overflow and
     * there is no full-queue case needing a correct response.
     */
-   void post_intake(thread_control_block& tcb, thread_request request) noexcept;
+   void post_intake(thread_control_block& tcb, thread_request request);
 
    /**
     * @brief Act on every request bit set for @p tcb. Owning core only.
     */
-   void service_intake(thread_control_block& tcb, std::uint8_t bits) noexcept;
+   void service_intake(thread_control_block& tcb, std::uint8_t bits);
 
    /**
     * @brief Take the whole intake chain and service every request on it.
     *
     * Single consumer: only the owning core may call this.
     */
-   void drain_intake() noexcept;
+   void drain_intake();
 
    /**
     * @brief Append a ready thread that holds something to the holder list.
@@ -177,7 +182,7 @@ public:
     * Called from set_thread_ready, not from acquisition: a thread that takes a
     * resource is running, so it joins the list at its next re-ready. Idempotent.
     */
-   void link_holder(thread_control_block& tcb) noexcept;
+   void link_holder(thread_control_block& tcb);
 
    /**
     * @brief Remove a holder from the list because the pick chose it.
@@ -185,7 +190,7 @@ public:
     * The counterpart to link_holder, and the only way out of the list. A thread
     * that releases its last resource is running, so it is already off it.
     */
-   void unlink_holder(thread_control_block& tcb) noexcept;
+   void unlink_holder(thread_control_block& tcb);
 
    /**
     * @brief True when this core has intake work outstanding. Advisory.
@@ -193,7 +198,7 @@ public:
     * Cheap enough for the idle loop to check before sleeping, which is what
     * keeps a lost IPI to a scheduling round instead of a hang.
     */
-   [[nodiscard]] bool intake_pending() const noexcept
+   [[nodiscard]] bool intake_pending() const
    {
       // Relaxed: this only decides whether to look, never what is true.
       return intake_head.load(std::memory_order_relaxed) != nullptr;
@@ -208,7 +213,7 @@ public:
    * context, driven by a yield, a wake, or a preemption IPI. See the .cpp
    * for the full transition policy.
    */
-   void reschedule() noexcept;
+   void reschedule();
 
    void reset();
 };

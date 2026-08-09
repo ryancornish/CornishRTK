@@ -24,6 +24,11 @@ namespace cyros
 namespace
 {
 
+/**
+ * @brief Global state of the kernel
+ *
+ * All globals required in the kernel layer must live within here.
+ */
 struct kernel_state
 {
    spinlock lock;
@@ -55,7 +60,11 @@ scheduler& scheduler_for_this_core()
 }
 
 /**
- * @brief Load-balancing primer for registering threads
+ * @brief Load-balancing heuristic for registering threads.
+ *
+ * If a thread's affinity includes multiple cores, the thread will
+ * be pinned to the core with the fewest threads pinned to it
+ * at the time of registration. The lowest-indexed core is chosen in a tie.
  */
 void pin_thread_to_core(thread_control_block& tcb) noexcept
 {
@@ -78,6 +87,16 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
    scheduler_for_core(best_core).pin_thread(tcb);
 }
 
+
+/* How far a transitive donation is followed before the answer is taken to be
+ * maximally urgent.
+ *
+ * Real chains are short: the deepest the suite builds is 6, and the flagship PI
+ * test is 2. The budget is not a performance knob, it is what stops a wait-for
+ * cycle (a deadlocked application) from being walked forever. Exhausting it
+ * yields 0, which over-boosts, which is the safe direction. */
+inline constexpr unsigned max_inheritance_depth = 8;
+
 /**
  * @brief min(base, best waiter of every held PI resource).
  *
@@ -88,15 +107,6 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
  * The recompute walk happens to hold the target's pi_lock when it calls this,
  * but that is the walk's business (it also mutates), not a precondition here.
  */
-/* How far a transitive donation is followed before the answer is taken to be
- * maximally urgent.
- *
- * Real chains are short: the deepest the suite builds is 6, and the flagship PI
- * test is 2. The budget is not a performance knob, it is what stops a wait-for
- * cycle (a deadlocked application) from being walked forever. Exhausting it
- * yields 0, which over-boosts, which is the safe direction. */
-inline constexpr unsigned max_inheritance_depth = 8;
-
 [[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target, unsigned const depth) noexcept
 {
    // Fast path: holds nothing, so urgency is base priority by definition. This

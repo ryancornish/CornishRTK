@@ -29,8 +29,7 @@ void scheduler::init_idle_thread()
    idle_thread->pinned_core = core_id;
 }
 
-// Core-local operations (only called on owning core)
-void scheduler::start() noexcept
+void scheduler::start()
 {
    CYROS_ASSERT(idle_thread != nullptr); // init_idle_thread() must run before start()
 
@@ -47,7 +46,7 @@ void scheduler::start() noexcept
    cyros_port_start_first(current_thread->context());
 }
 
-schedule_hint scheduler::set_thread_ready(thread_control_block& tcb) noexcept
+schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
 
@@ -95,7 +94,7 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb) noexcept
    return schedule_hint::unwarranted;
 }
 
-void scheduler::set_thread_running(thread_control_block& tcb) noexcept
+void scheduler::set_thread_running(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    CYROS_ASSERT_OP(tcb.state, ==, thread_state::ready);
@@ -104,7 +103,7 @@ void scheduler::set_thread_running(thread_control_block& tcb) noexcept
    current_thread = &tcb;
 }
 
-void scheduler::set_thread_blocked(thread_control_block& tcb) noexcept
+void scheduler::set_thread_blocked(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    CYROS_ASSERT_OP(tcb.state, ==, thread_state::running);
@@ -115,7 +114,7 @@ void scheduler::set_thread_blocked(thread_control_block& tcb) noexcept
    tcb.state = thread_state::blocked;
 }
 
-void scheduler::set_thread_terminated(thread_control_block& tcb) noexcept
+void scheduler::set_thread_terminated(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    CYROS_ASSERT_OP(tcb.state, ==, thread_state::running);
@@ -126,12 +125,12 @@ void scheduler::set_thread_terminated(thread_control_block& tcb) noexcept
    tcb.termination.terminate(); // signal joiners
 }
 
-uint8_t scheduler::current_thread_urgency() const noexcept
+uint8_t scheduler::current_thread_urgency() const
 {
    return current_thread ? thread_action::urgency(*current_thread) : 0;
 }
 
-thread_control_block* scheduler::pick_next() noexcept
+thread_control_block* scheduler::pick_next()
 {
    // The matrix is keyed on base_priority, which no boost can change, so its
    // head is the most urgent NON-holder by construction.
@@ -164,7 +163,6 @@ thread_control_block* scheduler::pick_next() noexcept
           * tie to either side outright starves the other outright: the loser is
           * re-examined on the next pick and loses identically, because being
           * passed over does not change its position. See tie_rotor. */
-         static_assert(config::max_priorities <= 32, "tie_rotor is indexed by priority");
          auto const bit = std::uint32_t{1} << base;
          tie_rotor ^= bit;
          if ((tie_rotor & bit) == 0) {
@@ -177,7 +175,7 @@ thread_control_block* scheduler::pick_next() noexcept
    return best_holder;
 }
 
-void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits) noexcept
+void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits)
 {
    if (bits & thread_control_block::request_bit(thread_request::make_ready)) {
       tcb.disposition = thread_disposition::none;
@@ -187,7 +185,7 @@ void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits) noe
 
 }
 
-void scheduler::post_intake(thread_control_block& tcb, thread_request request) noexcept
+void scheduler::post_intake(thread_control_block& tcb, thread_request request)
 {
    auto const bit = thread_control_block::request_bit(request);
 
@@ -204,7 +202,7 @@ void scheduler::post_intake(thread_control_block& tcb, thread_request request) n
    }
 }
 
-void scheduler::link_holder(thread_control_block& tcb) noexcept
+void scheduler::link_holder(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    if (tcb.is_listed_holder()) return; // already tracked
@@ -221,7 +219,7 @@ void scheduler::link_holder(thread_control_block& tcb) noexcept
    holders_tail = &tcb;
 }
 
-void scheduler::unlink_holder(thread_control_block& tcb) noexcept
+void scheduler::unlink_holder(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    if (!tcb.is_listed_holder()) return; // not tracked
@@ -250,7 +248,7 @@ void scheduler::unlink_holder(thread_control_block& tcb) noexcept
    tcb.holder_next = &tcb; // restore the not-linked sentinel
 }
 
-bool scheduler::push_intake(thread_control_block& tcb) noexcept
+bool scheduler::push_intake(thread_control_block& tcb)
 {
    // The self-pointer says "position published, link not yet". It must be in
    // place BEFORE the exchange makes the node reachable. nullptr cannot serve as
@@ -281,7 +279,7 @@ bool scheduler::push_intake(thread_control_block& tcb) noexcept
 /**
  * @brief Wait for a producer to publish a node's link. Bounded, see push_intake.
  */
-static thread_control_block* await_intake_link(thread_control_block* node) noexcept
+static thread_control_block* await_intake_link(thread_control_block* node)
 {
    thread_control_block* next = nullptr;
    while ((next = node->intake_next.load(std::memory_order_acquire)) == node) {
@@ -290,7 +288,7 @@ static thread_control_block* await_intake_link(thread_control_block* node) noexc
    return next;
 }
 
-void scheduler::drain_intake() noexcept
+void scheduler::drain_intake()
 {
    auto* node = intake_head.exchange(nullptr, std::memory_order_acq_rel);
    if (node == nullptr) return;
@@ -350,7 +348,7 @@ void scheduler::drain_intake() noexcept
  * Entry contract: called only by the owning core, current_thread non-null
  * and not enqueued. A blocked or created thread is never the running thread.
  */
-void scheduler::reschedule() noexcept
+void scheduler::reschedule()
 {
    CYROS_ASSERT(current_thread);
    CYROS_ASSERT(!current_thread->is_enqueued());

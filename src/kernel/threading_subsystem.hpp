@@ -309,10 +309,10 @@ public:
 class thread_ready_matrix
 {
 private:
-   static constexpr std::size_t bitmap_bits = std::numeric_limits<uint32_t>::digits;
    std::array<thread_ready_queue, config::max_priorities> matrix{};
-   uint32_t bitmap{0};
-   static_assert(config::max_priorities <= bitmap_bits, "bitmap cannot hold that many priorities!");
+   std::uint32_t bitmap{0};
+   static_assert(config::max_priorities <= std::numeric_limits<decltype(bitmap)>::digits,
+                 "bitmap cannot represent that many priorities!");
 
 public:
    constexpr thread_ready_matrix() = default;
