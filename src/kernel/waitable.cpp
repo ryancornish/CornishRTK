@@ -16,11 +16,11 @@
  *     state==ready and treats it as a rotation (re-enqueue, pick the next
  *     thread). No yield is "lost"; no wake is dropped.
  *
- * Block-on-any uses a SEPARATE wait_node per source, allocated on the
- * blocking thread's stack. A wait_node has exactly one 'next' pointer; it
- * cannot be in two intrusive lists at once. The TCB's embedded wait_node
- * serves single-wait blocks at zero extra cost; block_on_any pays N stack
- * nodes for N sources, with no heap and no pool.
+ * A wait_node has exactly one 'next' pointer, so it cannot be in two intrusive
+ * lists at once, which is why waiting on several sources needs one node per
+ * source. The nodes live in a wait_node_vector on the blocking thread's own
+ * stack, so there is no heap and no pool. Every wait goes through wait_on_any,
+ * including a wait on a single source.
  */
 
 #include <cyros/kernel/waitable.hpp>
@@ -156,9 +156,11 @@ void wait_queue::arm(wait_node& node) noexcept
 
 /**
  * @brief Remove an armed node, idempotent against a racing wake.
- * @return true when the queue's best-waiter priority changed, meaning a
- *         holder's inheritance is now stale and must be re-derived. The
- *         caller chases that, disarm itself takes no pi_lock.
+ * @return true when the queue's best-waiter priority changed. Nothing acts on
+ *         this today: leaving a queue can only LOWER a holder's urgency, and a
+ *         de-boost needs no prompt because urgency is folded at the point of
+ *         use. Kept because it is free and a caller that needs to know a top
+ *         moved has no other way to find out.
  */
 bool wait_queue::disarm(wait_node& node) noexcept
 {
@@ -175,22 +177,10 @@ bool wait_queue::disarm(wait_node& node) noexcept
 void wait_queue::refresh_top() noexcept
 {
    // Requires the queue lock held. Release pairs with the acquire in top() so
-   // a recompute that learns of a queue change (via a doorbell or its own
-   // reslot return) observes the value that change produced.
+   // a fold prompted by a queue change (via a doorbell, or by reaching this
+   // queue through a bridge) observes the value that change produced.
    top_priority.store(head != nullptr ? head->owner->base_priority : no_waiter,
                       std::memory_order_release);
-}
-
-bool wait_queue::reslot(wait_node& node) noexcept
-{
-   spinlock_guard guard(lock);
-
-   if (!unlink(node)) return false;
-   link(node);
-
-   std::uint8_t const old_top = top_priority.load(std::memory_order_relaxed);
-   refresh_top();
-   return top_priority.load(std::memory_order_relaxed) != old_top;
 }
 
 void wait_queue::wake_one(reschedule_policy policy) noexcept
@@ -498,18 +488,6 @@ void pi_waitable::renounce_if_assigned(thread::id const thread_id) noexcept
    // resource never contributed to our priority). Waiters parked behind the
    // assignment are honoured by the same barge-free commit as a release.
    hand_over(reschedule_policy::automatic);
-}
-
-thread_control_block* pi_waitable::donation_target(thread::id& expected_id) noexcept
-{
-   // Racy by design: the owner can change or vanish between this load and
-   // the recompute acting on it. The doorbell's id check plus the value-free
-   // recompute make a stale answer harmless.
-   auto* const owner_snapshot = owner.load(std::memory_order_acquire);
-   if (owner_snapshot != nullptr) {
-      expected_id = owner_snapshot->id;
-   }
-   return owner_snapshot;
 }
 
 } // namespace cyros

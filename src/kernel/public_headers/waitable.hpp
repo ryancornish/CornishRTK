@@ -65,11 +65,6 @@ class CYROS_PUBLIC wait_queue
    {
       thread_control_block* owner{nullptr};
       wait_node*            next {nullptr};
-      waitable*             source{nullptr};
-
-      // For wait_on_any: which waitable does this slot in the call's source
-      // array correspond to. Unused (and zero) in single-wait blocks.
-      uint8_t source_index{0};
 
       /* Was this waiter counted in its queue's bridge_count when it armed?
        *
@@ -92,7 +87,6 @@ class CYROS_PUBLIC wait_queue
 
    void arm   (wait_node& n) noexcept;
    bool disarm(wait_node& n) noexcept;
-   bool reslot(wait_node& n) noexcept;
 
    void wake_one(reschedule_policy) noexcept;
    void wake_all(reschedule_policy) noexcept;
@@ -303,25 +297,6 @@ protected:
    bool wake_one_and_transfer(transfer_fn const& transfer, reschedule_policy policy = reschedule_policy::automatic) noexcept;
 
    /**
-    * @brief Priority-inheritance chain hook.
-    *
-    * Invoked by the priority recompute when this waitable's best-waiter
-    * priority changed while a thread was re-slotted in its queue. Return the
-    * thread that inherits from this waitable's waiters (its current holder)
-    * so the walk can chase the chain, or nullptr for ownerless waitables,
-    * which is the default because a semaphore, event, or join has nobody to
-    * inherit anything.
-    *
-    * The id written through expected_id validates the returned TCB against
-    * recycling before it is acted on. Called without any pi_lock held.
-    */
-   virtual thread_control_block* donation_target(thread::id& expected_id) noexcept
-   {
-      (void)expected_id;
-      return nullptr;
-   }
-
-   /**
     * @brief Group-wait handback hook.
     *
     * A transfer can commit ownership to a thread parked in wait_on_any at any
@@ -425,13 +400,12 @@ protected:
    /**
     * @brief Release: barge-free handover to the best waiter, or free.
     *
-    * Retires the resource from the caller's held list, commits the handover
-    * (or the free) under the queue lock, then restores the caller's priority
-    * from remaining truth.
+    * Retires the resource from the caller's held slots, then commits the
+    * handover (or the free) under the queue lock. There is no restore step:
+    * nothing cached the boost, so urgency stops including this resource the
+    * moment it leaves held_slots.
     */
    void pi_release(reschedule_policy policy = reschedule_policy::automatic) noexcept;
-
-   thread_control_block* donation_target(thread::id& expected_id) noexcept override;
 
    void renounce_if_assigned(thread::id thread_id) noexcept override;
 

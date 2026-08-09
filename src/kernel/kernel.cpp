@@ -385,8 +385,6 @@ void yield()
    auto& tcb = thread_action::get_current_thread_on_this_core();
    wait_node_vector nodes(waitables.size(), tcb);
 
-   active_wait_registration const registration(tcb, &nodes);
-
    while (true) {
       tcb.disposition = thread_disposition::prepared;
       std::optional<std::size_t> chosen;

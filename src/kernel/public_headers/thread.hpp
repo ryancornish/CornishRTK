@@ -120,16 +120,26 @@ public:
     *   - effective_priority the cache derived urgency replaced
     *   - prev          (8)  the ready queue is singly linked now that nothing
     *                        re-keys a thread's position
-    * which nets out BELOW where it started, so the budget went back down rather
-    * than up. If it ever needs raising again, note it feeds min_stack_size and
-    * therefore every user's stack.
+    *   - active_waits  (8)  a pointer nobody read once the recompute that
+    *                        re-slotted armed nodes was deleted
     *
-    * This is repayable. thread_ready_queue::remove is reached only from
-    * reprioritise_thread, which the derived-urgency work deletes. After that the
-    * ready queue needs only push_back and pop_front, so it can go singly linked,
-    * thread_control_block::prev dies, and its 8 bytes give this back. Migration
-    * does not resurrect the need, provided it is done at the pick (pop, check
-    * pinned_core, forward) rather than by removing from the middle. */
+    * MEASURED 2026-08-09, do not re-derive this by counting fields. The TCB is
+    * 64-byte aligned and sizeof() lands on 3840 with the port context included,
+    * which is exactly the budget. There is NO trailing slack: adding a single
+    * byte anywhere pushes sizeof to 3904. Removing active_waits changed sizeof
+    * by nothing at all, because it sat in an interior padding hole rather than
+    * at the end, so the field count and the byte count move independently. Any
+    * future claim about headroom has to come from a probe, not arithmetic.
+    *
+    * Raising this is allowed and is a judgement call, not a wall. It feeds
+    * min_stack_size and therefore every user's stack, so the cost is real and
+    * belongs in the commit message alongside what the bytes buy. Reclaiming
+    * bytes instead means reordering members to collapse the holes, which is a
+    * separate exercise nobody has done.
+    *
+    * Migration does not resurrect the need for prev, provided it is done at the
+    * pick (pop, check pinned_core, forward) rather than by removing from the
+    * middle of a ready queue. */
    static constexpr std::size_t tcb_size = 256;
 
    /**

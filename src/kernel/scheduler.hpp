@@ -172,17 +172,27 @@ public:
    void drain_intake() noexcept;
 
    /**
+    * @brief Append a ready thread that holds something to the holder list.
+    *
+    * Called from set_thread_ready, not from acquisition: a thread that takes a
+    * resource is running, so it joins the list at its next re-ready. Idempotent.
+    */
+   void link_holder(thread_control_block& tcb) noexcept;
+
+   /**
+    * @brief Remove a holder from the list because the pick chose it.
+    *
+    * The counterpart to link_holder, and the only way out of the list. A thread
+    * that releases its last resource is running, so it is already off it.
+    */
+   void unlink_holder(thread_control_block& tcb) noexcept;
+
+   /**
     * @brief True when this core has intake work outstanding. Advisory.
     *
     * Cheap enough for the idle loop to check before sleeping, which is what
     * keeps a lost IPI to a scheduling round instead of a hang.
     */
-   /** @brief Track a thread that has just taken its first pi_waitable. */
-   void link_holder(thread_control_block& tcb) noexcept;
-
-   /** @brief Stop tracking a thread that has just released its last one. */
-   void unlink_holder(thread_control_block& tcb) noexcept;
-
    [[nodiscard]] bool intake_pending() const noexcept
    {
       // Relaxed: this only decides whether to look, never what is true.

@@ -15,7 +15,6 @@
 namespace cyros
 {
 
-class wait_node_vector;
 
 void thread_launcher(void* tcb_ptr);
 
@@ -117,9 +116,10 @@ struct thread_control_block
    core_affinity  affinity;
 
    /* Priority inheritance ---------------------------------------------------
-    * pi_lock protects the held list and the active_waits registration. It is
-    * the OUTER lock of the pi_lock -> queue-lock ordering, nothing holding a
-    * wait_queue lock may take it. */
+    * pi_lock protects mutation of held_slots and held_mask. It is the OUTER
+    * lock of the pi_lock -> queue-lock ordering, nothing holding a wait_queue
+    * lock may take it. Reads of held_slots need no lock, which is the whole
+    * point: see the ordering note on held_mask. */
    spinlock pi_lock;
 
    /* The resources this thread currently owns.
@@ -221,9 +221,6 @@ struct thread_control_block
       return holder_next != this;
    }
 
-   wait_node_vector* active_waits{nullptr};
-
-
    std::span<std::byte> stack;
    thread::entry_fn entry;
 
@@ -302,11 +299,6 @@ public:
    [[nodiscard]] constexpr bool empty() const noexcept
    {
       return !head;
-   }
-
-   [[nodiscard]] constexpr thread_control_block* front() const noexcept
-   {
-      return head;
    }
 
    void push_back(thread_control_block& tcb) noexcept;

@@ -14,7 +14,7 @@ namespace cyros
 {
 
 /* ============================================================================
- * waitable_access - attorney for the priority-inheritance walk
+ * waitable_access - attorney for the urgency fold
  *
  * The urgency fold needs one narrow operation on pi_waitable, and
  * pi_waitable internals. Granting friendship to the function itself would
@@ -40,19 +40,6 @@ struct waitable_access
       return w.queue.top(depth);
    }
 
-   /// Re-order an armed node after its owner's priority changed.
-   /// @return true when the queue's best-waiter priority changed.
-   [[nodiscard]] static bool reslot(waitable& w, wait_queue::wait_node& node) noexcept
-   {
-      return w.queue.reslot(node);
-   }
-
-   /// The thread inheriting from this waitable's waiters, nullptr for
-   /// ownerless waitables. expected_id guards against TCB recycling.
-   [[nodiscard]] static thread_control_block* donation_target(waitable& w, thread::id& expected_id) noexcept
-   {
-      return w.donation_target(expected_id);
-   }
 };
 
 class wait_node_vector
@@ -71,7 +58,6 @@ public:
          push({
             .owner = &tcb,
             .next = nullptr,
-            .source_index = static_cast<uint8_t>(i),
          });
       }
    }
@@ -142,24 +128,20 @@ public:
       : waitables(waitables), nodes(nodes)
    {
       for (std::size_t i = 0; i < waitables.size(); ++i) {
-         auto& waitable = waitables[i].get();
-         nodes[i].source = &waitable;
-         waitable.queue.arm(nodes[i]);
+         waitables[i].get().queue.arm(nodes[i]);
       }
    }
 
    ~waitable_arm_guard()
    {
       for (std::size_t i = 0; i < waitables.size(); ++i) {
-         auto& waitable = waitables[i].get();
-         if (!waitable.queue.disarm(nodes[i])) {
-            continue;
-         }
-         // Leaving a queue without acquiring lowers its best-waiter priority,
-         // so the holder becomes LESS urgent. Nothing to do: urgency is folded
-         // from top() at the point of use, and observing the drop late only
-         // means the holder ran at its old urgency slightly longer, which is
-         // safe. A boost needs a prompt, a de-boost does not.
+         // Return value deliberately ignored. Leaving a queue without acquiring
+         // lowers its best-waiter priority, so the holder becomes LESS urgent.
+         // Nothing to do: urgency is folded from top() at the point of use, and
+         // observing the drop late only means the holder ran at its old urgency
+         // slightly longer, which is safe. A boost needs a prompt, a de-boost
+         // does not.
+         (void)waitables[i].get().queue.disarm(nodes[i]);
       }
    }
 
@@ -167,35 +149,6 @@ public:
    waitable_arm_guard(waitable_arm_guard const&) = delete;
    waitable_arm_guard& operator=(waitable_arm_guard&&) = delete;
    waitable_arm_guard& operator=(waitable_arm_guard const&) = delete;
-};
-
-// Publish the nodes for priority inheritance: a recompute on this core
-// must be able to find and re-slot our armed nodes while we are blocked
-// (or preempted mid-block). Registered for the whole attempt and cleared
-// before the stack-resident vector dies. Guarded by pi_lock because a
-// recompute dereferences the vector under that lock, and destruction
-// ordering keeps the final disarm (arm_guard, constructed later inside the
-// loop, destroyed earlier) ahead of this deregistration.
-class active_wait_registration
-{
-   thread_control_block& tcb;
-
-public:
-   active_wait_registration(thread_control_block& tcb, wait_node_vector* nodes) : tcb(tcb)
-   {
-      spinlock_guard guard(tcb.pi_lock);
-      tcb.active_waits = nodes;
-   }
-   ~active_wait_registration()
-   {
-      spinlock_guard guard(tcb.pi_lock);
-      tcb.active_waits = nullptr;
-   }
-
-   active_wait_registration(active_wait_registration&&) = delete;
-   active_wait_registration(active_wait_registration const&) = delete;
-   active_wait_registration& operator=(active_wait_registration&&) = delete;
-   active_wait_registration& operator=(active_wait_registration const&) = delete;
 };
 
 } // namespace cyros
