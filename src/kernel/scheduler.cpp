@@ -154,9 +154,23 @@ thread_control_block* scheduler::pick_next() noexcept
    if (best_holder == nullptr) {
       return ready_matrix.pop_best_thread();
    }
-   // Ties go to the matrix, preserving the FIFO fairness round robin relies on.
-   if (best_base >= 0 && static_cast<std::uint8_t>(best_base) <= best_holder_urgency) {
-      return ready_matrix.pop_best_thread();
+   if (best_base >= 0) {
+      auto const base = static_cast<std::uint8_t>(best_base);
+      if (base < best_holder_urgency) {
+         return ready_matrix.pop_best_thread();
+      }
+      if (base == best_holder_urgency) {
+         /* No arrival order spans the two structures, so alternate. Giving the
+          * tie to either side outright starves the other outright: the loser is
+          * re-examined on the next pick and loses identically, because being
+          * passed over does not change its position. See tie_rotor. */
+         static_assert(config::max_priorities <= 32, "tie_rotor is indexed by priority");
+         auto const bit = std::uint32_t{1} << base;
+         tie_rotor ^= bit;
+         if ((tie_rotor & bit) == 0) {
+            return ready_matrix.pop_best_thread();
+         }
+      }
    }
 
    unlink_holder(*best_holder);
@@ -195,8 +209,16 @@ void scheduler::link_holder(thread_control_block& tcb) noexcept
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    if (tcb.is_listed_holder()) return; // already tracked
 
-   tcb.holder_next = holders_head;
-   holders_head = &tcb;
+   // Appended, not pushed. pick_next keeps the first holder at the best
+   // urgency, so head insertion would give every tie to the most recently
+   // linked, which is the thread that just ran. See scheduler::holders_head.
+   tcb.holder_next = nullptr;
+   if (holders_tail == nullptr) {
+      holders_head = &tcb;
+   } else {
+      holders_tail->holder_next = &tcb;
+   }
+   holders_tail = &tcb;
 }
 
 void scheduler::unlink_holder(thread_control_block& tcb) noexcept
@@ -205,14 +227,26 @@ void scheduler::unlink_holder(thread_control_block& tcb) noexcept
    if (!tcb.is_listed_holder()) return; // not tracked
 
    // Singly linked and removed by search. The list is holders-on-this-core,
-   // measured at about one, so the walk is not worth a back pointer, and TCB
-   // bytes are the scarcer resource.
-   auto** slot = &holders_head;
-   while (*slot != nullptr && *slot != &tcb) {
-      slot = &(*slot)->holder_next;
+   // measured at about one, so the walk is not worth a back pointer in the TCB,
+   // and TCB bytes are the scarcer resource. The predecessor is tracked here
+   // rather than through a pointer-to-pointer walk only because the tail needs
+   // repairing when the last element goes.
+   thread_control_block* previous = nullptr;
+   auto* current = holders_head;
+   while (current != nullptr && current != &tcb) {
+      previous = current;
+      current  = current->holder_next;
    }
-   CYROS_ASSERT(*slot == &tcb); // holder missing from its own core's list
-   *slot = tcb.holder_next;
+   CYROS_ASSERT(current == &tcb); // holder missing from its own core's list
+
+   if (previous == nullptr) {
+      holders_head = tcb.holder_next;
+   } else {
+      previous->holder_next = tcb.holder_next;
+   }
+   if (holders_tail == &tcb) {
+      holders_tail = previous;
+   }
    tcb.holder_next = &tcb; // restore the not-linked sentinel
 }
 
@@ -381,6 +415,17 @@ void scheduler::reset()
       node = next;
    }
    CYROS_ASSERT(ready_matrix.empty()); // Cannot reset whilst threads still in the queue
+
+   /* A holder leaves the list only by being picked, and a thread can only
+    * release its last resource or terminate while running, i.e. already off it.
+    * So an occupant here means a thread was readied as a holder and the core
+    * never ran it, which is the starvation this list's FIFO order exists to
+    * prevent. */
+   CYROS_ASSERT(holders_head == nullptr);
+   holders_tail = nullptr;
+   // Not correctness, but a lifecycle should not inherit the previous one's
+   // tie phase: these objects outlive kernel::finalise.
+   tie_rotor = 0;
 
    pinned_thread_counter.store(0, std::memory_order_relaxed);
    current_thread = nullptr;

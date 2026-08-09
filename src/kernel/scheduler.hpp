@@ -48,8 +48,38 @@ private:
 
    /* Threads pinned here that hold at least one pi_waitable, i.e. exactly the
     * threads whose urgency can differ from their base priority. Core-local and
-    * needs no atomics: see thread_control_block::holder_next. */
+    * needs no atomics: see thread_control_block::holder_next.
+    *
+    * FIFO, appended at the tail, for the same reason every matrix level is:
+    * pick_next keeps the FIRST holder at the best urgency, so head insertion
+    * would hand the tie to the most recently linked. A holder is unlinked when
+    * it is picked and re-linked when it is re-readied, so under head insertion
+    * the thread that just ran would go straight back to the front and win
+    * again, starving every other holder tied with it. */
    thread_control_block* holders_head{nullptr};
+   thread_control_block* holders_tail{nullptr};
+
+   /* Which side won the last urgency tie, one bit per priority level.
+    *
+    * A boosted holder is not in the matrix, so when its urgency exactly equals
+    * the matrix's best base there is no arrival order to compare and the winner
+    * has to be chosen by policy. Choosing a side outright starves the other
+    * outright: whichever loses is never re-examined, because the losing side's
+    * position does not change by being passed over. Alternating bounds the wait
+    * for both at two picks per tied group.
+    *
+    * PER LEVEL rather than a single bool. One shared bit lets ties at two
+    * different levels consume each other's turns, so a level whose ties always
+    * land on the same phase starves anyway, which is the bug this is meant to
+    * fix wearing a different hat.
+    *
+    * This costs proportionality: the split is even between the two GROUPS, so a
+    * lone holder takes half against n matrix threads rather than 1/(n+1). That
+    * is deliberate. Bounded delay is the property that matters at equal
+    * priority, and the surplus goes to a thread inside a critical section,
+    * which shortens it and shrinks the blocking time of whoever is waiting on
+    * it. Same direction as the bridge-overflow over-boost in wait_queue::top.*/
+   std::uint32_t tie_rotor{0};
 
 public:
    static constexpr thread::id idle_thread_id = 0; // Reserved

@@ -20,6 +20,12 @@
  *      is a silent degradation path: nothing else in the suite reaches it, and
  *      if it inverted no existing test would notice.
  *
+ *   3. Ties. A holder's urgency can land exactly on the matrix's best base
+ *      priority, and the two live in different structures with no arrival order
+ *      between them. Whichever side loses a tie is not advanced by losing, so it
+ *      loses the next one identically: a fixed policy is indefinite starvation,
+ *      not unfairness. Two tests, one per structure boundary.
+ *
  * Same discipline as the sibling files: black box through lock/unlock and
  * get_priority, bounded polls with a bail path so a failure is an assertion
  * rather than a hang, and every spin gate waits on a value set from a
@@ -301,6 +307,275 @@ TEST_F(SyncMutexPiDerived_Test,
             "bridges, it read " << s.observed.load()
          << ". Over-boosting is the safe direction here; anything else means the "
             "overflow path under-reports, which is unbounded inversion.";
+
+      kernel::finalise();
+   }
+}
+
+
+/* ============================================================================
+ * A holder tied with a ready thread: both must keep getting turns
+ *
+ * core0 holds A at base 10 and H at base 20. H takes the mutex first, then
+ * hands the core to A, which has the better base priority. H is now READY on
+ * core0's holder list at urgency 20, and A legitimately wins every pick.
+ *
+ * D at base 10 on core1 then blocks on the mutex. H's urgency becomes exactly
+ * 10, which is exactly A's key in the matrix. There is no arrival order between
+ * the holder list and a matrix level, so the pick has to choose by policy.
+ *
+ * Both threads only ever yield, so neither can be starved by the other blocking
+ * or by anything external: whoever stops making progress stopped because the
+ * pick stopped choosing it. Being passed over does not change either one's
+ * position, so a fixed tie policy does not merely skew the split, it stops one
+ * side permanently.
+ *
+ * Fails in BOTH directions. Stage 1 catches ties going to the matrix forever,
+ * which is starvation of a boosted holder, i.e. the inversion the whole
+ * mechanism exists to prevent. Stage 2 catches ties going to the holder forever,
+ * and measures A only AFTER the tie exists, since A runs freely before that and
+ * an unqualified "did A run" would pass either way.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenAHolderTiedWithAReadyThread_WhenNeitherEverBlocks_ThenBothKeepGettingTurns)
+{
+   constexpr int reps = 10;
+   constexpr unsigned progress = 5;   // turns each side must take while tied
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 4> stacks{};
+
+      struct state
+      {
+         mutex m;
+         // A must not be runnable until H owns the mutex. A has the better base
+         // priority and shares H's core, so it would otherwise win the first
+         // pick and H would never acquire at all.
+         sync::semaphore a_gate{0};
+         std::atomic<bool> h_holds{false};
+         std::atomic<unsigned> a_turns{0};
+         std::atomic<unsigned> h_turns{0};
+         std::atomic<bool> stop{false};
+         std::atomic<int>  failed_stage{0};
+      };
+      state s;
+
+      thread h(
+         [&s]{
+            s.m.lock();
+            s.h_holds.store(true, std::memory_order_release);
+
+            // Hands the core straight over: A is on this core with the better
+            // base priority, so this preempts us here. Everything below runs
+            // only if a later pick chose us, which is the property under test.
+            s.a_gate.release();
+
+            while (!s.stop.load(std::memory_order_acquire)) {
+               s.h_turns.fetch_add(1, std::memory_order_acq_rel);
+               this_thread::yield();
+            }
+            s.m.unlock();
+         },
+         stacks[0].bytes, thread::priority(20), core0);
+
+      thread a(
+         [&s]{
+            s.a_gate.acquire();
+            while (!s.stop.load(std::memory_order_acquire)) {
+               s.a_turns.fetch_add(1, std::memory_order_acq_rel);
+               this_thread::yield();
+            }
+         },
+         stacks[1].bytes, thread::priority(10), core0);
+
+      // The donor. Base 10, so it drives H's urgency onto exactly A's key.
+      thread d(
+         [&s]{
+            while (!s.h_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m.lock();
+            s.m.unlock();
+         },
+         stacks[2].bytes, thread::priority(10), core1);
+
+      thread driver(
+         [&s]{
+            if (!bounded_poll([&]{ return s.h_turns.load(std::memory_order_acquire) >= 1; })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.stop.store(true, std::memory_order_release);
+               return;
+            }
+
+            // The tie is live and has been resolved at least once. From here
+            // both sides must keep advancing.
+            auto const a_mark = s.a_turns.load(std::memory_order_acquire);
+            auto const h_mark = s.h_turns.load(std::memory_order_acquire);
+            if (!bounded_poll([&]{
+                   return s.a_turns.load(std::memory_order_acquire) >= a_mark + progress
+                       && s.h_turns.load(std::memory_order_acquire) >= h_mark + progress;
+                })) {
+               s.failed_stage.store(2, std::memory_order_release);
+            }
+            s.stop.store(true, std::memory_order_release);
+         },
+         stacks[3].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1)
+         << "a boosted holder tied with a ready thread never ran: the tie goes "
+            "to the matrix every time, so the holder is starved and whoever is "
+            "blocked on it waits without bound";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "one side stopped advancing while the tie was live (A took "
+         << s.a_turns.load() << " turns, holder took " << s.h_turns.load()
+         << "): the tie is not alternating";
+
+      kernel::finalise();
+   }
+}
+
+
+/* ============================================================================
+ * Two holders tied with each other: both must keep getting turns
+ *
+ * The same defect one structure inwards. Nothing here is in core0's matrix at
+ * all, so the matrix-versus-holder tie cannot fire and cannot mask this: the
+ * only question is which of two equally urgent holders the fold picks.
+ *
+ * H1 and H2 sit on core0 holding a mutex each, both driven to urgency 10 by a
+ * donor of their own on another core. The pick keeps the FIRST holder at the
+ * best urgency, so the list's insertion order IS the tie policy. A holder is
+ * unlinked when picked and re-linked when re-readied, so with head insertion
+ * the thread that just ran goes back to the front and wins again, forever.
+ *
+ * The two holders have different base priorities purely so their startup order
+ * is deterministic. Once both are boosted the bases are irrelevant, and that is
+ * the point: they are tied on urgency, which is the only key the fold reads.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenTwoHoldersTiedAtEqualUrgency_WhenBothStayReady_ThenBothKeepGettingTurns)
+{
+   constexpr int reps = 10;
+   constexpr unsigned progress = 5;
+   constexpr std::uint8_t donor_priority = 10;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 5> stacks{};
+
+      struct state
+      {
+         mutex m1;
+         mutex m2;
+         // Each holder parks until BOTH are boosted, so they enter the holder
+         // list already tied. Acquiring in the clear keeps the setup free of
+         // the very contention the test is about to create.
+         sync::semaphore gate1{0};
+         sync::semaphore gate2{0};
+         std::atomic<bool> h1_holds{false};
+         std::atomic<bool> h2_holds{false};
+         std::atomic<unsigned> h1_turns{0};
+         std::atomic<unsigned> h2_turns{0};
+         std::atomic<bool> stop{false};
+         std::atomic<int>  failed_stage{0};
+         thread* h1{nullptr};
+         thread* h2{nullptr};
+      };
+      state s;
+
+      thread h1(
+         [&s]{
+            s.m1.lock();
+            s.h1_holds.store(true, std::memory_order_release);
+            s.gate1.acquire();
+            while (!s.stop.load(std::memory_order_acquire)) {
+               s.h1_turns.fetch_add(1, std::memory_order_acq_rel);
+               this_thread::yield();
+            }
+            s.m1.unlock();
+         },
+         stacks[0].bytes, thread::priority(20), core0);
+
+      thread h2(
+         [&s]{
+            s.m2.lock();
+            s.h2_holds.store(true, std::memory_order_release);
+            s.gate2.acquire();
+            while (!s.stop.load(std::memory_order_acquire)) {
+               s.h2_turns.fetch_add(1, std::memory_order_acq_rel);
+               this_thread::yield();
+            }
+            s.m2.unlock();
+         },
+         stacks[1].bytes, thread::priority(21), core0);
+
+      s.h1 = &h1;
+      s.h2 = &h2;
+
+      thread d1(
+         [&s]{
+            while (!s.h1_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m1.lock();
+            s.m1.unlock();
+         },
+         stacks[2].bytes, thread::priority(donor_priority), core1);
+
+      thread d2(
+         [&s]{
+            while (!s.h2_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m2.lock();
+            s.m2.unlock();
+         },
+         stacks[3].bytes, thread::priority(donor_priority), core2);
+
+      thread driver(
+         [&s]{
+            // Both donors parked, so both holders now report the donors'
+            // priority. Only then are they tied.
+            if (!bounded_poll([&]{
+                   return s.h1->get_priority() == donor_priority
+                       && s.h2->get_priority() == donor_priority;
+                })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.gate1.release();
+               s.gate2.release();
+               return;
+            }
+
+            s.gate1.release();
+            s.gate2.release();
+
+            if (!bounded_poll([&]{
+                   return s.h1_turns.load(std::memory_order_acquire) >= progress
+                       && s.h2_turns.load(std::memory_order_acquire) >= progress;
+                })) {
+               s.failed_stage.store(2, std::memory_order_release);
+            }
+            s.stop.store(true, std::memory_order_release);
+         },
+         stacks[4].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "the two holders never both reached equal urgency";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "one of two equally urgent holders never ran (h1 took "
+         << s.h1_turns.load() << " turns, h2 took " << s.h2_turns.load()
+         << "): the holder list hands every tie to the same thread, so its peer "
+            "is starved and that peer's own waiter blocks without bound";
 
       kernel::finalise();
    }
