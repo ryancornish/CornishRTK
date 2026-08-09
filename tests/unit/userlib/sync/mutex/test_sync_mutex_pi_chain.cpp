@@ -15,10 +15,15 @@
  *    because it only ever saw flat folds. See pi-derived-urgency-proposal.md
  *    section 11b.
  *
- * MEASURED BEHAVIOUR ON THE CURRENT TREE (2026-08-06)
- * ---------------------------------------------------
- * Not what was expected when this was written, and the difference is the
- * interesting part.
+ * MEASURED 2026-08-06, AGAINST THE OLD PUSH DESIGN (HISTORICAL)
+ * -------------------------------------------------------------
+ * These numbers predate derived urgency and describe a mechanism that has since
+ * been deleted, including the transitive bug they were taken to characterise.
+ * Kept because the LATENCY shape is the interesting part and nobody has
+ * re-measured it against the fold: the cost model changed from one cross-core
+ * doorbell round trip per link to one recursive fold per pick, which should
+ * change this curve substantially. Re-running the cost curve is the obvious
+ * follow-up.
  *
  *   depth curve, 200 rounds per depth, 1000 rounds total in 3.5 seconds:
  *
@@ -51,18 +56,31 @@
  * variant that has the donor park CONCURRENTLY with a mid-chain thread blocking
  * would attack that window directly, and is the obvious next iteration.
  *
- * DISABLED BY DEFAULT
+ * ENABLED 2026-08-09
  * -------------------
- * Because one of the three is a real flake on the current tree, and because a
- * permanently red suite destroys the thing every conclusion in this
- * investigation depended on: being able to run a few hundred iterations and read
- * the result.
+ * The two assertion tests ran DISABLED for as long as the transitive chase was
+ * broken, because a permanently red suite destroys the thing every conclusion in
+ * that investigation depended on: being able to run a few hundred iterations and
+ * read the result. That bug is closed, and not by fixing the chase but by
+ * deleting it, see sync-mutex-pi-plan.md section 0. Re-enabling them was the
+ * documented completion bar.
  *
- * Run them deliberately:
- *   ./test_sync_mutex --gtest_also_run_disabled_tests --gtest_filter='*Chain*'
+ * Evidence for enabling, laptop, at the commit that closed it:
+ *   filtered to these tests   0 failures / 40 runs
+ *   full binary               0 chain failures / ~150 runs
+ * against a recorded baseline of roughly 8 runs in 40 for the repeated depth-3
+ * test alone.
  *
- * Enabling them (dropping the DISABLED_ prefix) is part of the completion bar
- * for substrate stage 3. See cross-core-substrate.md section 7.
+ * The COST CURVE test stays disabled, and not because it is flaky. It reports
+ * rather than asserts, the number being the deliverable, and 200 rounds across
+ * five depths does not belong in a suite people run in a loop. Run it
+ * deliberately:
+ *   ./test_sync_mutex --gtest_also_run_disabled_tests --gtest_filter='*CostCurve*'
+ *
+ * Be aware it has produced a genuine KERNEL PANIC once in 40 runs, a signal-mask
+ * mismatch at port_linux_preempt.cpp:430, which is a PORT defect this file
+ * merely stresses rather than anything about chaining. Worth knowing before you
+ * blame the chain code for it.
  *
  * THE SHAPE
  * ---------
@@ -100,7 +118,14 @@ namespace
 {
 
 constexpr std::size_t max_depth = 6;   // holders; +1 urgent, +1 conductor
-constexpr std::size_t max_threads = max_depth + 2;
+
+/* A chain of this many holders consults a queue that still has a bridge on it
+ * at recursion depth 0, so the fold gives up and over-boosts. Worked from
+ * max_inheritance_depth = 8: queue m[k] is reached at depth 8-k, so depth 0
+ * lands on m[8], and m[8] only has a bridge when there are 10 or more holders.
+ * At 9 the chain still resolves exactly. Capacity, not part of the sweep. */
+constexpr std::size_t over_budget_depth = 10;
+constexpr std::size_t max_threads = over_budget_depth + 2;
 
 constexpr auto CHAIN_STACK_SIZE = thread::min_stack_size + (16 * 1024);
 
@@ -116,9 +141,9 @@ struct alignas(CYROS_PORT_STACK_ALIGN) chain_stack
 
 /// @brief Spin until predicate or budget. Returns iterations used, or 0 on failure.
 template <typename Predicate>
-[[nodiscard]] std::uint64_t poll_counting(Predicate&& done) noexcept
+[[nodiscard]] std::uint64_t poll_counting(std::uint64_t const budget, Predicate&& done) noexcept
 {
-   for (std::uint64_t i = 1; i <= chain_poll_budget; ++i) {
+   for (std::uint64_t i = 1; i <= budget; ++i) {
       if (done()) return i;
       cyros_port_cpu_relax();
    }
@@ -142,7 +167,12 @@ struct chain_result
  * intermediate donation is a real change rather than a no-op. The urgent thread
  * sits at 1, so a fully propagated chain leaves EVERY holder at 1.
  */
-chain_result run_chain(std::size_t depth) noexcept
+/* The budget is a parameter because the cost of ONE check scales with depth:
+ * each get_priority() is a recursive fold that walks the chain taking a queue
+ * lock per link. A budget tuned for a depth-3 chain, spent on a depth-10 one,
+ * turns a failing assertion into a 60-second timeout, which is the failure mode
+ * this suite least wants. */
+chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll_budget) noexcept
 {
    chain_result result{};
 
@@ -152,14 +182,21 @@ chain_result run_chain(std::size_t depth) noexcept
    // free, and a failing chain is exactly what this file expects.
    struct fixtures
    {
-      std::array<mutex, max_depth>            m{};
-      std::array<sync::semaphore, max_depth>  link;      // link[i]: holder[i] owns m[i]
+      std::array<mutex, over_budget_depth>            m{};
+      std::array<sync::semaphore, over_budget_depth>  link; // link[i]: holder[i] owns m[i]
       sync::semaphore                         formed{0}; // chain is fully armed
       sync::semaphore                         release{0};// conductor says unwind
       sync::semaphore                         done{0};   // one post per holder exit
 
+      /* sync::semaphore has no default constructor, so every element has to be
+       * named. The static_assert is the guard: raise over_budget_depth without
+       * adding initialisers here and this fails to compile rather than silently
+       * leaving the tail of the array unbuilt. */
+      static_assert(over_budget_depth == 10, "add or remove link initialisers below to match");
       fixtures() : link{sync::semaphore{0}, sync::semaphore{0}, sync::semaphore{0},
-                        sync::semaphore{0}, sync::semaphore{0}, sync::semaphore{0}} {}
+                        sync::semaphore{0}, sync::semaphore{0}, sync::semaphore{0},
+                        sync::semaphore{0}, sync::semaphore{0}, sync::semaphore{0},
+                        sync::semaphore{0}} {}
    };
    static std::optional<fixtures> fx;
    fx.emplace();
@@ -167,16 +204,18 @@ chain_result run_chain(std::size_t depth) noexcept
    struct state
    {
       fixtures*                      f{nullptr};
-      std::array<thread*, max_depth> holder{};
+      std::array<thread*, over_budget_depth> holder{};
       std::size_t                    depth{0};
+      std::uint64_t                  budget{chain_poll_budget};
       chain_result*                  out{nullptr};
    };
    static state s;
 
    for (auto& h : s.holder) h = nullptr;
-   s.f     = &*fx;
-   s.depth = depth;
-   s.out   = &result;
+   s.f      = &*fx;
+   s.depth  = depth;
+   s.budget = poll_budget;
+   s.out    = &result;
 
    // holder[0] is the deepest and least urgent. Urgent is 1, conductor 0.
    auto const base_of = [depth](std::size_t i) -> std::uint8_t {
@@ -250,13 +289,17 @@ chain_result run_chain(std::size_t depth) noexcept
          // Safe to spin here and only here: every holder is blocked on a mutex
          // and the donor is blocked on the top of the chain, so this thread is
          // the only runnable one on whatever core it shares.
+         // <= rather than ==. Over-boosting is legal: past the fold's depth
+         // budget a link answers 0, which is MORE urgent than the donor and is
+         // the deliberate safe direction. An exact-match poll would spin its
+         // whole budget on a chain that is behaving correctly.
          auto const all_urgent = [depth]{
             for (std::size_t i = 0; i < depth; ++i) {
-               if (s.holder[i]->get_priority() != thread::priority(1)) return false;
+               if (s.holder[i]->get_priority() > thread::priority(1)) return false;
             }
             return true;
          };
-         r.propagate_spins = poll_counting(all_urgent);
+         r.propagate_spins = poll_counting(s.budget, all_urgent);
          r.propagated      = (r.propagate_spins != 0);
 
          // How far the chase actually got. On failure this says which link it
@@ -290,7 +333,7 @@ class SyncMutexPiChain_Test : public ::testing::Test {};
  * Correctness: one donation must reach the far end of a D-deep chain
  * ========================================================================= */
 
-TEST_F(SyncMutexPiChain_Test, DISABLED_GivenChainOfIncreasingDepth_WhenUrgentWaiterParksAtTop_ThenEveryLinkInherits)
+TEST_F(SyncMutexPiChain_Test, GivenChainOfIncreasingDepth_WhenUrgentWaiterParksAtTop_ThenEveryLinkInherits)
 {
    for (std::size_t depth = 2; depth <= max_depth; ++depth) {
       SCOPED_TRACE("chain depth " + std::to_string(depth));
@@ -308,6 +351,44 @@ TEST_F(SyncMutexPiChain_Test, DISABLED_GivenChainOfIncreasingDepth_WhenUrgentWai
 }
 
 /* ============================================================================
+ * Past the fold's depth budget, a chain must OVER-boost and never under-boost
+ *
+ * The urgency fold recurses through bridges with a budget of
+ * max_inheritance_depth (8). The budget exists for wait-for CYCLES, i.e. a
+ * deadlocked application, which must not be followed forever. A long ACYCLIC
+ * chain hits the same limit, and this test uses that because a cycle cannot be
+ * torn down: deadlocked threads never terminate, so the kernel never quiesces
+ * and the test could not finish. A 10-deep chain reaches the same code path and
+ * still unwinds cleanly.
+ *
+ * The assertion is one-directional, exactly as the bridge-snapshot overflow test
+ * in test_sync_mutex_pi_derived.cpp is. Over-boosting past the budget is the
+ * designed behaviour and costs bounded fairness. Under-boosting is unbounded
+ * priority inversion, which is what the whole subsystem exists to prevent. So
+ * this asserts only that no link is LESS urgent than the donor, and never that
+ * some link reads exactly 0.
+ *
+ * That also keeps it correct if max_inheritance_depth is later raised: the chain
+ * would then resolve exactly instead of over-boosting, and every holder would
+ * read 1, which still satisfies the assertion for the right reason.
+ * ========================================================================= */
+
+TEST_F(SyncMutexPiChain_Test, GivenChainDeeperThanTheFoldsBudget_WhenDonating_ThenNoLinkUnderBoosts)
+{
+   kernel::initialise();
+   auto const r = run_chain(over_budget_depth, 200'000);
+
+   EXPECT_TRUE(r.formed) << "chain never formed, so the rest proves nothing";
+   EXPECT_TRUE(r.propagated)
+      << "a link past the depth budget is LESS urgent than the donor. Least "
+         "urgent priority seen: " << int(r.worst_observed)
+      << ", donor is at 1. Exhausting the budget must answer 0 and over-boost, "
+         "because under-reporting here is unbounded inversion.";
+   EXPECT_TRUE(r.restored) << "chain did not unwind";
+}
+
+
+/* ============================================================================
  * Pressure: hammer the shallow-but-transitive case repeatedly
  *
  * Depth 3 is the cheapest shape that needs a genuine second hop. Repeating it
@@ -315,7 +396,7 @@ TEST_F(SyncMutexPiChain_Test, DISABLED_GivenChainOfIncreasingDepth_WhenUrgentWai
  * chase, and it is what a rarely-exercised path needs.
  * ========================================================================= */
 
-TEST_F(SyncMutexPiChain_Test, DISABLED_GivenRepeatedShallowChains_WhenDonatingManyTimes_ThenEveryRoundPropagates)
+TEST_F(SyncMutexPiChain_Test, GivenRepeatedShallowChains_WhenDonatingManyTimes_ThenEveryRoundPropagates)
 {
    constexpr int rounds = 50;
    int failures = 0;

@@ -580,3 +580,118 @@ TEST_F(SyncMutexPiDerived_Test,
       kernel::finalise();
    }
 }
+
+
+/* ============================================================================
+ * Urgency folds over EVERY held resource, and re-folds when one is given up
+ *
+ * donated_floor walks held_mask and takes the min across all of them. Every
+ * other test in the suite has holders owning exactly one contended resource, so
+ * a fold that stopped after the first occupied slot, or that latched the best
+ * value it ever saw, would pass the entire suite.
+ *
+ * H holds two mutexes with waiters of different priorities. Two phases:
+ *
+ *   1. Both held. H must report the BETTER of the two waiters, not the first
+ *      one found and not its own base.
+ *   2. H releases the mutex carrying the better waiter. H must RISE to the
+ *      remaining one, not stay at the value it had. Nothing cached the boost,
+ *      so there is nothing to un-cache, and this is the test that says so.
+ *
+ * Phase 2 is the half that catches a latch. Phase 1 alone would pass against an
+ * implementation that remembered its best-ever donation forever.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenTwoHeldMutexesWithDifferentWaiters_WhenTheBetterOneIsReleased_ThenUrgencyRisesToTheOther)
+{
+   constexpr int reps = 10;
+   constexpr std::uint8_t mild_priority = 10;
+   constexpr std::uint8_t keen_priority = 4;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 4> stacks{};
+
+      struct state
+      {
+         mutex mild;   // waiter at 10
+         mutex keen;   // waiter at 4, the better donation
+         std::atomic<bool> h_holds_both{false};
+         std::atomic<bool> drop_keen{false};
+         std::atomic<bool> drop_mild{false};
+         std::atomic<int>  failed_stage{0};
+         std::atomic<int>  observed{-1};
+         thread* h{nullptr};
+      };
+      state s;
+
+      thread h(
+         [&s]{
+            s.mild.lock();
+            s.keen.lock();
+            s.h_holds_both.store(true, std::memory_order_release);
+
+            while (!s.drop_keen.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.keen.unlock();
+
+            while (!s.drop_mild.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.mild.unlock();
+         },
+         stacks[0].bytes, thread::priority(20), core0);
+      s.h = &h;
+
+      auto const waiter = [&s](mutex& m) {
+         return [&s, &m]{
+            while (!s.h_holds_both.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            m.lock();
+            m.unlock();
+         };
+      };
+
+      thread w_mild(waiter(s.mild), stacks[1].bytes, thread::priority(mild_priority), core1);
+      thread w_keen(waiter(s.keen), stacks[2].bytes, thread::priority(keen_priority), core2);
+
+      thread driver(
+         [&s]{
+            // Phase 1: the min across BOTH held resources.
+            if (!bounded_poll([&]{ return s.h->get_priority() == keen_priority; })) {
+               s.observed.store(s.h->get_priority(), std::memory_order_release);
+               s.failed_stage.store(1, std::memory_order_release);
+               s.drop_keen.store(true, std::memory_order_release);
+               s.drop_mild.store(true, std::memory_order_release);
+               return;
+            }
+
+            // Phase 2: give up the better one, keep the other.
+            s.drop_keen.store(true, std::memory_order_release);
+            if (!bounded_poll([&]{ return s.h->get_priority() == mild_priority; })) {
+               s.observed.store(s.h->get_priority(), std::memory_order_release);
+               s.failed_stage.store(2, std::memory_order_release);
+            }
+            s.drop_mild.store(true, std::memory_order_release);
+         },
+         stacks[3].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1)
+         << "holder of two contended mutexes did not report the better waiter, it read "
+         << s.observed.load() << " (expected " << int(keen_priority)
+         << "). The fold is not covering every occupied held slot.";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "after releasing the mutex carrying the better waiter the holder read "
+         << s.observed.load() << " (expected " << int(mild_priority)
+         << "). Urgency is being latched rather than re-derived from what is still held.";
+
+      kernel::finalise();
+   }
+}
