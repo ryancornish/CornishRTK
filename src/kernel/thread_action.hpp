@@ -53,6 +53,23 @@ schedule_hint ready_thread(thread_control_block& tcb);
 [[nodiscard]] std::uint8_t urgency(thread_control_block const& tcb) noexcept;
 
 /**
+ * @brief urgency() with an explicit recursion budget.
+ *
+ * A boosted holder can itself be blocked on something it does not own, whose
+ * queue contains another holder, and so on: that chain is transitive priority
+ * inheritance. Following it needs a bound, because a wait-for CYCLE is a
+ * deadlocked application and the kernel must not walk one forever.
+ *
+ * Nothing here takes a lock at any depth. held_slots and wait_queue::bridge_slots
+ * are both bounded arrays of atomics precisely so this recursion reads a moving
+ * graph without nesting queue locks around it, which is the shape that would
+ * deadlock the kernel on the application's deadlock rather than merely observing
+ * it. A torn read yields a stale-but-plausible urgency, the same tolerance the
+ * rest of this design rests on.
+ */
+[[nodiscard]] std::uint8_t urgency_at(thread_control_block const& tcb, unsigned depth) noexcept;
+
+/**
  * @brief Ask @p tcb's core to reconsider what it is running.
  *
  * A pure hint carrying nothing. Used when a thread's urgency has RISEN because a

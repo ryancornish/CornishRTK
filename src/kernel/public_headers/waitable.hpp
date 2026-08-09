@@ -7,6 +7,7 @@
 #include <cyros/kernel/visibility.hpp>
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -69,6 +70,13 @@ class CYROS_PUBLIC wait_queue
       // For wait_on_any: which waitable does this slot in the call's source
       // array correspond to. Unused (and zero) in single-wait blocks.
       uint8_t source_index{0};
+
+      /* Was this waiter counted in its queue's bridge_count when it armed?
+       *
+       * Recorded rather than recomputed at departure, because a thread can
+       * acquire or release while armed, and a count maintained from a value that
+       * moved underneath it would drift. */
+      bool counted_as_bridge{false};
    };
 
    using transfer_fn = function<void(uint32_t), 32, heap_policy::no_heap>;
@@ -92,15 +100,56 @@ class CYROS_PUBLIC wait_queue
    bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept;
 
    [[nodiscard]] bool empty() const noexcept;
-   [[nodiscard]] std::uint8_t top() const noexcept { return top_priority.load(std::memory_order_acquire); }
+
+   /**
+    * @brief Best waiter urgency on this queue, which is what its holder inherits.
+    *
+    * Fast path is one atomic load. top_priority caches the minimum BASE priority
+    * of the waiters, and base never changes, so that cache has only immutable
+    * inputs and can never go stale. No re-slotting, ever.
+    *
+    * The slow path exists because a waiter that itself HOLDS something can be
+    * more urgent than its base: that is the transitive chain. Only such a waiter
+    * can be, so the fold runs over the bridges alone rather than the whole queue,
+    * and bridge_mask is zero in the overwhelming majority of queues.
+    *
+    * @param depth Remaining recursion budget. A wait-for cycle means the
+    *        application has deadlocked; the budget stops the kernel following it
+    *        forever and the answer is then conservative rather than wrong.
+    */
+   [[nodiscard]] std::uint8_t top(unsigned depth) const noexcept;
 
    void link  (wait_node&) noexcept;
    bool unlink(wait_node&) noexcept;
    void refresh_top()      noexcept;
 
    spinlock   lock;
-   wait_node* head{nullptr}; // priority-ordered, best at head
+   wait_node* head{nullptr}; // base-priority-ordered, best at head
    std::atomic<std::uint8_t> top_priority{no_waiter};
+
+   /* Waiters on this queue that themselves hold a pi_waitable, i.e. exactly the
+    * waiters whose urgency can be lower than their base priority. Tracking them
+    * separately keeps the transitive fold off the common path: a queue with no
+    * bridges answers from top_priority alone.
+    *
+    * Only a COUNT is kept, not the bridges themselves. Every waitable embeds a
+    * queue and every TCB embeds a waitable (its join), so anything stored per
+    * queue is paid for by every thread in the system; an array of four pointers
+    * here cost 40 bytes on each and blew the TCB budget immediately.
+    *
+    * The fold therefore snapshots the bridges under the lock, releases it, and
+    * only then recurses. That is what keeps queue locks un-nested: the recursion
+    * walks a wait-for graph, and holding a lock across it would deadlock the
+    * kernel on an application's deadlock rather than merely observing one.
+    *
+    * More bridges than the snapshot holds is NOT an error: top() then reports 0,
+    * the most urgent value, which over-boosts the holder. That costs a little
+    * fairness and never correctness, whereas under-reporting would resurrect the
+    * unbounded inversion this design exists to prevent. */
+   std::atomic<std::uint8_t> bridge_count{0};
+
+   /** @brief Undo a node's bridge contribution. Caller holds the queue lock. */
+   void drop_bridge(wait_node&) noexcept;
 
    // The only types that may drive a queue.
    friend class waitable;

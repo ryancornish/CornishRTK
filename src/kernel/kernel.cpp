@@ -88,7 +88,16 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
  * The recompute walk happens to hold the target's pi_lock when it calls this,
  * but that is the walk's business (it also mutates), not a precondition here.
  */
-[[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target) noexcept
+/* How far a transitive donation is followed before the answer is taken to be
+ * maximally urgent.
+ *
+ * Real chains are short: the deepest the suite builds is 6, and the flagship PI
+ * test is 2. The budget is not a performance knob, it is what stops a wait-for
+ * cycle (a deadlocked application) from being walked forever. Exhausting it
+ * yields 0, which over-boosts, which is the safe direction. */
+inline constexpr unsigned max_inheritance_depth = 8;
+
+[[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target, unsigned const depth) noexcept
 {
    // Fast path: holds nothing, so urgency is base priority by definition. This
    // is the overwhelming majority of calls, measured at 98.9 percent of picks in
@@ -104,7 +113,7 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
 
       auto* held = target.held_slots[slot].load(std::memory_order_acquire);
       if (held == nullptr) continue; // bit was stale, see the ordering note on held_mask
-      floor = std::min(waitable_access::queue_top(*held), floor);
+      floor = std::min(waitable_access::queue_top(*held, depth), floor);
    }
    return floor;
 }
@@ -185,7 +194,12 @@ schedule_hint ready_thread(thread_control_block& tcb)
 
 std::uint8_t urgency(thread_control_block const& tcb) noexcept
 {
-   return donated_floor(tcb);
+   return donated_floor(tcb, max_inheritance_depth);
+}
+
+std::uint8_t urgency_at(thread_control_block const& tcb, unsigned const depth) noexcept
+{
+   return donated_floor(tcb, depth);
 }
 
 void request_repick(thread_control_block& tcb)

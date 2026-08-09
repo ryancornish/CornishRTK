@@ -33,10 +33,11 @@ namespace cyros
  * ========================================================================= */
 struct waitable_access
 {
-   /// Best queued waiter's priority for a held PI resource (lock-free read).
-   [[nodiscard]] static std::uint8_t queue_top(pi_waitable const& w) noexcept
+   /// Best queued waiter's urgency for a held PI resource. Lock-free at every
+   /// depth: see thread_action::urgency_at.
+   [[nodiscard]] static std::uint8_t queue_top(pi_waitable const& w, unsigned depth) noexcept
    {
-      return w.queue.top();
+      return w.queue.top(depth);
    }
 
    /// Re-order an armed node after its owner's priority changed.

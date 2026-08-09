@@ -97,6 +97,48 @@ bool wait_queue::unlink(wait_node& node) noexcept
    return true;
 }
 
+void wait_queue::drop_bridge(wait_node& node) noexcept
+{
+   if (!node.counted_as_bridge) return;
+   node.counted_as_bridge = false;
+   bridge_count.fetch_sub(1, std::memory_order_release);
+}
+
+std::uint8_t wait_queue::top(unsigned const depth) const noexcept
+{
+   auto const cached = top_priority.load(std::memory_order_acquire);
+
+   // Fast path: no waiter here holds anything, so none can be more urgent than
+   // its base priority and the cache is exact. This is almost every queue.
+   if (bridge_count.load(std::memory_order_acquire) == 0) return cached;
+
+   // Budget exhausted means a wait-for cycle, i.e. the application has
+   // deadlocked. Answer conservatively instead of following it forever.
+   if (depth == 0) return 0;
+
+   // Snapshot under the lock, then release BEFORE recursing. Holding it across
+   // the recursion would nest queue locks around the wait-for graph.
+   static constexpr std::size_t max_snapshot = 4;
+   thread_control_block* bridges[max_snapshot];
+   std::size_t found = 0;
+   bool overflow = false;
+   {
+      spinlock_guard guard(const_cast<spinlock&>(lock));
+      for (auto* n = head; n != nullptr; n = n->next) {
+         if (!n->counted_as_bridge) continue;
+         if (found == max_snapshot) { overflow = true; break; }
+         bridges[found++] = n->owner;
+      }
+   }
+   if (overflow) return 0; // over-boost, the safe direction
+
+   std::uint8_t best = cached;
+   for (std::size_t i = 0; i < found; ++i) {
+      best = std::min(best, thread_action::urgency_at(*bridges[i], depth - 1));
+   }
+   return best;
+}
+
 void wait_queue::arm(wait_node& node) noexcept
 {
    spinlock_guard guard(lock);
@@ -105,6 +147,10 @@ void wait_queue::arm(wait_node& node) noexcept
    CYROS_ASSERT(node.next  == nullptr); // node must not already be on a list
 
    link(node);
+   node.counted_as_bridge = !node.owner->holds_nothing();
+   if (node.counted_as_bridge) {
+      bridge_count.fetch_add(1, std::memory_order_release);
+   }
    refresh_top();
 }
 
@@ -119,6 +165,7 @@ bool wait_queue::disarm(wait_node& node) noexcept
    spinlock_guard guard(lock);
 
    if (!unlink(node)) return false;
+   drop_bridge(node);
 
    std::uint8_t const old_top = top_priority.load(std::memory_order_relaxed);
    refresh_top();
@@ -157,6 +204,7 @@ void wait_queue::wake_one(reschedule_policy policy) noexcept
       chosen = node->owner;
       head = node->next;
       node->next = nullptr;
+      drop_bridge(*node);
       refresh_top();
    }
 
@@ -183,6 +231,7 @@ void wait_queue::wake_all(reschedule_policy policy) noexcept
          chosen = node->owner;
          head = node->next;
          node->next = nullptr;
+         drop_bridge(*node);
          refresh_top();
       }
       schedule_hint hint = thread_action::ready_thread(*chosen);
@@ -207,6 +256,7 @@ bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy 
          chosen = node->owner;
          head = node->next;
          node->next = nullptr;
+         drop_bridge(*node);
          refresh_top();
       }
       CYROS_ASSERT(chosen == nullptr || chosen->id != 0);
