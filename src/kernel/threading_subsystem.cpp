@@ -131,6 +131,19 @@ thread_control_block* thread_ready_queue::pop_front() noexcept
    return tcb;
 }
 
+bool thread_ready_queue::remove(thread_control_block& tcb) noexcept
+{
+   thread_control_block* prev = nullptr;
+   for (auto* cur = head; cur != nullptr; prev = cur, cur = cur->next) {
+      if (cur != &tcb) continue;
+      if (prev) prev->next = cur->next; else head = cur->next;
+      if (tail == cur) tail = prev;
+      tcb.next = &tcb; // restore the not-enqueued sentinel
+      return true;
+   }
+   return false;
+}
+
 
 void thread_ready_matrix::enqueue_thread(thread_control_block& tcb) noexcept
 {
@@ -149,6 +162,16 @@ thread_control_block* thread_ready_matrix::pop_best_thread() noexcept
    thread_control_block* tcb = matrix[priority].pop_front();
    if (matrix[priority].empty()) bitmap &= ~(1u << priority);
    return tcb;
+}
+
+void thread_ready_matrix::remove_thread(thread_control_block& tcb) noexcept
+{
+   auto const priority = tcb.base_priority;
+   CYROS_ASSERT_OP(priority, <, config::max_priorities);
+
+   bool const removed = matrix[priority].remove(tcb);
+   CYROS_ASSERT(removed); // caller vouched the thread was enqueued
+   if (matrix[priority].empty()) bitmap &= ~(1u << priority);
 }
 
 } // namespace cyros

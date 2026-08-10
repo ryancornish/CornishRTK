@@ -310,6 +310,8 @@ public:
    void push_back(thread_control_block& tcb) noexcept;
 
    thread_control_block* pop_front() noexcept;
+
+   bool remove(thread_control_block& tcb) noexcept;
 };
 
 class thread_ready_matrix
@@ -337,6 +339,9 @@ public:
    void enqueue_thread(thread_control_block& tcb) noexcept;
 
    thread_control_block* pop_best_thread() noexcept;
+
+   /** @brief Unfile an enqueued thread, keyed at its BASE priority. */
+   void remove_thread(thread_control_block& tcb) noexcept;
 
 };
 

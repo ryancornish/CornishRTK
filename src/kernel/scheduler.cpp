@@ -67,6 +67,24 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
    // is already going to run.
    if (tcb.is_enqueued() || tcb.is_listed_holder()) {
       CYROS_ASSERT(tcb.state == thread_state::ready);
+
+      // Re-route before returning. Ownership can arrive AFTER admission:
+      // hand_over files a handed-over resource into the new owner's slots from
+      // the releasing core, and a thread that was already sitting in the ready
+      // matrix at that moment is a holder filed where the urgency fold never
+      // looks, which is unbounded inversion for whoever parks behind the
+      // resource it now owns. Every such handover is followed by a redundant
+      // admission of the new owner, which is what makes this the one place the
+      // routing can be re-derived without a new message. The reverse migration
+      // cannot be needed: only a running thread can release, so a READY
+      // holder cannot stop being one.
+      if (tcb.is_enqueued() && !tcb.holds_nothing()) {
+         ready_matrix.remove_thread(tcb);
+         link_holder(tcb);
+         if (thread_action::urgency(tcb) < current_thread_urgency()) {
+            return schedule_hint::warranted;
+         }
+      }
       return schedule_hint::unwarranted;
    }
 
