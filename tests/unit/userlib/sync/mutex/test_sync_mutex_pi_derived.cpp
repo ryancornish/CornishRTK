@@ -839,3 +839,143 @@ TEST_F(SyncMutexPiDerived_Test,
       kernel::finalise();
    }
 }
+
+
+/* ============================================================================
+ * A transitive boost has to PROMPT the far core, not just be computable there
+ *
+ * Chain: A -> m2 (held by B) -> B -> m1 (held by C) -> C.
+ *
+ * The chain tests elsewhere check that every link's urgency is COMPUTED
+ * correctly, and they check it by polling get_priority from threads that yield
+ * constantly, which manufactures reschedules on every core. That hides the
+ * question this test asks: does anything actually tell C's core to look?
+ *
+ * Priorities make the two donations distinguishable:
+ *   A 1, N 2, B 3, C 5
+ * B's DIRECT donation puts C at urgency 3, which still loses to the spinner N
+ * at base 2. Only the TRANSITIVE donation from A puts C at 1, which wins. So C
+ * running again is proof the second-order boost both computed AND arrived, and
+ * N never yields, so nothing else can hand C the core.
+ *
+ * The bail path records C's REPORTED urgency, which is what makes a failure
+ * diagnostic rather than merely red: 1 means the fold is right and the prompt
+ * never arrived, anything else means the fold itself is wrong.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenATwoLinkChainAcrossCores_WhenTheUrgentWaiterParks_ThenTheFarHolderStillPreempts)
+{
+   constexpr int reps = 5;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 6> stacks{};
+
+      struct state
+      {
+         mutex m1;                              // held by C, wanted by B
+         mutex m2;                              // held by B, wanted by A
+         sync::semaphore n_gate{0};
+         std::atomic<bool> c_holds{false};      // C owns m1
+         std::atomic<bool> b_parked{false};     // witness saw B park on m1
+         std::atomic<bool> c_resumed{false};    // C got core0 back: THE PROPERTY
+         std::atomic<bool> a_done{false};       // A finally acquired m2
+         std::atomic<bool> stop_spinner{false};
+         std::atomic<int>  failed_stage{0};
+         std::atomic<int>  c_urgency{-1};
+         std::atomic<int>  b_urgency{-1};
+         thread* b{nullptr};
+         thread* c{nullptr};
+      };
+      state s;
+
+      // C, base 5 on core0: take m1, then hand the core to N and do not come
+      // back until something decides C is more urgent than N.
+      thread c(
+         [&s]{
+            s.m1.lock();
+            s.c_holds.store(true, std::memory_order_release);
+            s.n_gate.release();          // N (base 2) preempts us right here
+            s.c_resumed.store(true, std::memory_order_release);
+            s.stop_spinner.store(true, std::memory_order_release);
+            s.m1.unlock();
+         },
+         stacks[0].bytes, thread::priority(5), core0);
+      s.c = &c;
+
+      // N, base 2 on core0: never blocks. Beats C's base 5 and beats the
+      // urgency 3 that B's direct donation produces. Loses to 1.
+      thread n(
+         [&s]{
+            s.n_gate.acquire();
+            while (!s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[1].bytes, thread::priority(2), core0);
+
+      // B, base 3 on core1: the middle link. Holds m2, blocks on m1, and is
+      // therefore a BRIDGE on m1's queue.
+      thread b(
+         [&s]{
+            s.m2.lock();
+            while (!s.c_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m1.lock();      // parks behind C, donating urgency 3
+            s.m1.unlock();
+            s.m2.unlock();
+         },
+         stacks[2].bytes, thread::priority(3), core1);
+      s.b = &b;
+
+      // Witness on B's core, worse base priority, so it runs only once B has
+      // actually parked on m1.
+      thread wb(
+         [&s]{
+            s.b_parked.store(true, std::memory_order_release);
+         },
+         stacks[3].bytes, thread::priority(6), core1);
+
+      // A, base 1 on core2: arrives last and should lift C to 1 THROUGH B.
+      thread a(
+         [&s]{
+            while (!s.b_parked.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m2.lock();
+            s.m2.unlock();
+            s.a_done.store(true, std::memory_order_release);
+         },
+         stacks[4].bytes, thread::priority(1), core2);
+
+      thread driver(
+         [&s]{
+            if (!bounded_poll([&]{ return s.b_parked.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+               return;
+            }
+            if (!bounded_poll([&]{ return s.c_resumed.load(std::memory_order_acquire); })) {
+               s.c_urgency.store(s.c->get_priority(), std::memory_order_release);
+               s.b_urgency.store(s.b->get_priority(), std::memory_order_release);
+               s.failed_stage.store(2, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+            }
+         },
+         stacks[5].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "B never parked on m1";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "the far holder C never ran again. C reported urgency "
+         << s.c_urgency.load() << ", B reported " << s.b_urgency.load()
+         << " (C at 1 means the fold is right and nothing prompted core0)";
+
+      kernel::finalise();
+   }
+}

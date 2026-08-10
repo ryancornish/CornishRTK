@@ -213,6 +213,32 @@ std::uint8_t urgency_at(thread_control_block const& tcb, unsigned const depth) n
 
 void request_repick(thread_control_block& tcb)
 {
+   /* A BLOCKED holder cannot act on a prompt, and it is not the thread that
+    * needs one. Its own urgency rose, so the urgency of whatever holds the
+    * resource IT is parked on rose too, and so on down the chain. That is the
+    * transitive case, and the thread at the far end is on a core with no reason
+    * to pick again.
+    *
+    * Nothing links a TCB to the resources it is armed on, so the chain cannot be
+    * walked from here. Prompt every core instead. Legitimate because this is a
+    * doorbell: it carries nothing, every core folds its own truth when it picks,
+    * and a core with nothing better to run switches back immediately. Bounded by
+    * core count, and only on the donate-to-a-blocked-holder path.
+    *
+    * The state read is deliberately lossy. Reading it stale one way costs a few
+    * redundant prompts, the other way costs latency, and neither can be wrong. */
+   if (tcb.state == thread_state::blocked) {
+      auto const this_core = cyros_port_get_core_id();
+      for (std::uint32_t core = 0; core < config::cores; ++core) {
+         if (core == this_core) {
+            cyros_port_pend_reschedule();
+         } else {
+            cyros_port_send_reschedule_ipi(core);
+         }
+      }
+      return;
+   }
+
    if (tcb.pinned_core == cyros_port_get_core_id()) {
       cyros_port_pend_reschedule();
    } else {
