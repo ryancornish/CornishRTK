@@ -198,6 +198,10 @@ schedule_hint ready_thread(thread_control_block& tcb)
       return schedule_hint::unwarranted;
    }
 
+   // Reset local current thread's disposition in case we were committed to block
+   // on a waitable thats owner has just handed to us
+   tcb.disposition = thread_disposition::none;
+
    return scheduler.set_thread_ready(tcb);
 }
 
