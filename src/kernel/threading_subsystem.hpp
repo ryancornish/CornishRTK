@@ -116,10 +116,10 @@ struct thread_control_block
    core_affinity  affinity;
 
    /* Priority inheritance ---------------------------------------------------
-    * pi_lock protects mutation of held_slots and held_mask. It is the OUTER
-    * lock of the pi_lock -> queue-lock ordering, nothing holding a wait_queue
-    * lock may take it. Reads of held_slots need no lock, which is the whole
-    * point: see the ordering note on held_mask. */
+    * pi_lock serialises this thread's OWN mutation of held_slots and held_mask
+    * against itself. Nothing holding a wait_queue lock may take it, which is why
+    * a handover files its slot by CAS instead. Reads need no lock at all, which
+    * is the whole point: see the ordering note on held_mask. */
    spinlock pi_lock;
 
    /* The resources this thread currently owns.
@@ -131,10 +131,12 @@ struct thread_control_block
     * which is what lets a thread's urgency be computed at the point of use
     * instead of cached and propagated. See pi-design-principles.md.
     *
-    * MUTATION still happens only under pi_lock, in the owner's own context.
-    * Only reads are unlocked, and a reader may observe a slot that has just
-    * been released. That degrades to a stale-but-plausible urgency, which is
-    * the same tolerance the value-free doorbell already relies on.
+    * Two contexts write a slot: this thread, and a core committing a handover
+    * to it under a queue lock, which cannot reach pi_lock. Both claim by CAS so
+    * neither needs a lock the other cannot take. Reads are always unlocked, and
+    * a reader may observe a slot that has just been released. That degrades to
+    * a stale-but-plausible urgency, which is the same tolerance the value-free
+    * doorbell already relies on.
     *
     * A free slot is nullptr. pi_waitable::held_slot indexes back into here so
     * registration and retirement stay O(1), as the list's self-sentinel did. */
@@ -146,7 +148,7 @@ struct thread_control_block
     * actually held rather than max_held_per_thread.
     *
     * Measured before this existed: scanning eight empty slots cost 91 cycles
-    * against 106 for finding one resource, so the walk WAS the cost, not the
+    * against 106 for finding one resource, so the scan WAS the cost, not the
     * work. Threads that hold anything hold 1.01 resources on average.
     *
     * ORDERING, which is what makes it safe to read without pi_lock:
@@ -154,7 +156,11 @@ struct thread_control_block
     *   release:  clear the bit, THEN clear the slot
     * A reader that sees a stale set bit loads nullptr and skips. A reader that
     * misses a just-set bit computes a slightly stale urgency, which is the
-    * tolerance this whole design already rests on. */
+    * tolerance this whole design already rests on.
+    *
+    * A slot is claimed by CAS rather than under pi_lock alone, because a
+    * releasing core files a handover into the new owner's slots from under a
+    * queue lock, where that owner's pi_lock is out of reach. */
    std::atomic<std::uint8_t> held_mask{0};
    static_assert(max_held_per_thread <= 8, "held_mask is a uint8_t, so at most 8 slots");
 

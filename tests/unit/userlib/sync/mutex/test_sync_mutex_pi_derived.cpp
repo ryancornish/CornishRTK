@@ -695,3 +695,147 @@ TEST_F(SyncMutexPiDerived_Test,
       kernel::finalise();
    }
 }
+
+
+/* ============================================================================
+ * A holder that acquired by HANDOVER must be boostable too
+ *
+ * The sibling test above has the holder take the mutex uncontended, so it is
+ * registered in held_slots by its own acquiring poll. This one has it PARK on a
+ * held mutex and receive ownership from the releaser instead, which is the other
+ * way a thread becomes a holder and the one where ownership is committed by a
+ * different core.
+ *
+ * That commit runs under the queue lock, where the new owner's pi_lock is out of
+ * reach, so it is the case where "file the resource in the owner's slots" is
+ * hard rather than obvious. It has to happen anyway: routing at set_thread_ready
+ * and the urgency fold both key on held_slots, so ownership that is not there is
+ * ownership nothing can boost. H would sit in the ready matrix at base priority
+ * behind N for as long as N cares to spin, with U parked on the mutex H owns,
+ * which is precisely the unbounded inversion the subsystem exists to prevent.
+ *
+ * The choreography is otherwise the sibling's: N outranks H on base priority and
+ * never blocks, U is urgent and arrives only after the handover, and H running
+ * again at all is the property.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenAHolderThatAcquiredByHandover_WhenAnUrgentWaiterArrives_ThenItStillPreemptsTheSpinner)
+{
+   constexpr int reps = 20;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 6> stacks{};
+
+      struct state
+      {
+         mutex m;
+         sync::semaphore n_gate{0};
+         std::atomic<bool> l_holds{false};        // L owns the mutex
+         std::atomic<bool> h_parked{false};       // the witness saw H park
+         std::atomic<bool> spinner_running{false};
+         std::atomic<bool> l_released{false};     // ownership handed to H
+         std::atomic<bool> h_resumed{false};      // H got the core back
+         std::atomic<bool> stop_spinner{false};
+         std::atomic<int>  failed_stage{0};
+         std::atomic<int>  h_urgency{-1};         // what H reported when it stuck
+         thread* h{nullptr};
+      };
+      state s;
+
+      // L, on its own core: takes the mutex first so H must park on it and be
+      // handed ownership rather than taking it uncontended.
+      thread l(
+         [&s]{
+            s.m.lock();
+            s.l_holds.store(true, std::memory_order_release);
+            // Hold until the spinner owns core0, so the handover readies H
+            // BEHIND a better-base thread instead of straight onto the core.
+            while (!s.stop_spinner.load(std::memory_order_acquire)
+                   && !s.spinner_running.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m.unlock();                                  // hands the mutex to H
+            s.l_released.store(true, std::memory_order_release);
+         },
+         stacks[0].bytes, thread::priority(4), core1);
+
+      thread h(
+         [&s]{
+            while (!s.l_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m.lock();
+            s.h_resumed.store(true, std::memory_order_release);
+            s.stop_spinner.store(true, std::memory_order_release);
+            s.m.unlock();
+         },
+         stacks[1].bytes, thread::priority(5), core0);
+      s.h = &h;
+
+      // Witness: worse base priority than H and on H's core, so it runs only
+      // once H has actually parked. Releasing the spinner from anywhere else
+      // races H's park and can starve H before it ever reaches the queue.
+      thread w(
+         [&s]{
+            s.h_parked.store(true, std::memory_order_release);
+            s.n_gate.release();
+         },
+         stacks[2].bytes, thread::priority(6), core0);
+
+      // N: better base priority than H, never blocks, shares H's core.
+      thread n(
+         [&s]{
+            s.n_gate.acquire();
+            s.spinner_running.store(true, std::memory_order_release);
+            while (!s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[3].bytes, thread::priority(3), core0);
+
+      // U: the urgent waiter. It must arrive AFTER the handover, otherwise it
+      // would be the best waiter and the release would choose it, not H.
+      thread u(
+         [&s]{
+            while (!s.l_released.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m.lock();     // donates urgency 1 to H
+            s.m.unlock();
+         },
+         stacks[4].bytes, thread::priority(1), core2);
+
+      thread driver(
+         [&s]{
+            if (!bounded_poll([&]{ return s.h_parked.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+               return;
+            }
+            if (!bounded_poll([&]{ return s.h_resumed.load(std::memory_order_acquire); })) {
+               // Reported urgency separates the two ways this can fail: base
+               // priority means the donation never reached H at all, urgency 1
+               // means it did and the pick ignored it.
+               s.h_urgency.store(s.h->get_priority(), std::memory_order_release);
+               s.failed_stage.store(2, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+            }
+         },
+         stacks[5].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "H never parked on the held mutex";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "a holder that acquired the mutex by handover never ran again, and "
+            "reported urgency " << s.h_urgency.load()
+         << ". Ownership committed by the releaser is not reaching held_slots, so "
+            "nothing can boost it.";
+
+      kernel::finalise();
+   }
+}

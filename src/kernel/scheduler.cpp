@@ -225,7 +225,7 @@ void scheduler::unlink_holder(thread_control_block& tcb)
    if (!tcb.is_listed_holder()) return; // not tracked
 
    // Singly linked and removed by search. The list is holders-on-this-core,
-   // measured at about one, so the walk is not worth a back pointer in the TCB,
+   // measured at about one, so the search is not worth a back pointer in the TCB,
    // and TCB bytes are the scarcer resource. The predecessor is tracked here
    // rather than through a pointer-to-pointer walk only because the tail needs
    // repairing when the last element goes.

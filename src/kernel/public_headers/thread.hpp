@@ -114,15 +114,6 @@ public:
     */
    /* Bump if sizeof(thread_control_block) grows.
     *
-    * 256 was EXACTLY full before this work. Since then, per TCB:
-    *   + intake_next   (8)  the cross-core transport
-    *   + holder_next   (8)  the ready-holder list the pick folds over
-    *   - effective_priority the cache derived urgency replaced
-    *   - prev          (8)  the ready queue is singly linked now that nothing
-    *                        re-keys a thread's position
-    *   - active_waits  (8)  a pointer nobody read once the recompute that
-    *                        re-slotted armed nodes was deleted
-    *
     * MEASURED 2026-08-09, do not re-derive this by counting fields. The TCB is
     * 64-byte aligned and sizeof() lands on 3840 with the port context included,
     * which is exactly the budget. There is NO trailing slack: adding a single

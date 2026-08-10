@@ -315,41 +315,66 @@ pi_waitable::~pi_waitable()
    CYROS_ASSERT(owner.load(std::memory_order_relaxed) == nullptr); // Resource still owned by a thread
 }
 
+void pi_waitable::claim_slot(thread_control_block& tcb) noexcept
+{
+   // Claimed by CAS rather than scan-then-store, because this runs from two
+   // contexts: the owner registering its own acquisition under pi_lock, and a
+   // RELEASING core committing a handover under a queue lock, where the new
+   // owner's pi_lock is out of reach. The CAS is what makes those two safe
+   // against each other without giving either a lock the other cannot take.
+   std::size_t slot = max_held_per_thread;
+   for (std::size_t i = 0; i < max_held_per_thread; ++i) {
+      pi_waitable* expected = nullptr;
+      if (tcb.held_slots[i].compare_exchange_strong(expected, this,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+         slot = i;
+         break;
+      }
+   }
+   // Hard error, never a silent drop: an unrecorded held resource is a lost
+   // donation, which is the failure class this representation exists to remove.
+   CYROS_ASSERT_OP(slot, <, max_held_per_thread); // max_held_per_thread exceeded
+
+   held_slot = static_cast<std::uint8_t>(slot);
+   // The slot pointer is published by the CAS above, so setting the bit second
+   // means a reader that sees the bit can always see the pointer.
+   tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << slot),
+                          std::memory_order_release);
+}
+
 void pi_waitable::register_held(thread_control_block& tcb) noexcept
 {
-   {
-      spinlock_guard guard(tcb.pi_lock);
+   spinlock_guard guard(tcb.pi_lock);
 
-      // Idempotent: a wait_condition re-poll after a spurious wake can land
-      // here for a resource the earlier round already registered, and must not
-      // occupy a second slot.
-      if (held_slot != not_held) {
-         return;
-      }
-
-      std::size_t free_slot = max_held_per_thread;
-      for (std::size_t i = 0; i < max_held_per_thread; ++i) {
-         if (tcb.held_slots[i].load(std::memory_order_relaxed) == nullptr) {
-            free_slot = i;
-            break;
-         }
-      }
-      // Hard error, never a silent drop: an unrecorded held resource is a lost
-      // donation, which is the failure class this representation exists to remove.
-      CYROS_ASSERT_OP(free_slot, <, max_held_per_thread); // max_held_per_thread exceeded
-
-      held_slot = static_cast<std::uint8_t>(free_slot);
-      // Publish the slot BEFORE the bit. A reader that sees the bit must be able
-      // to see the pointer, so the bit is what makes the slot visible.
-      tcb.held_slots[free_slot].store(this, std::memory_order_release);
-      tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << free_slot),
-                             std::memory_order_release);
+   // Idempotent: a wait_condition re-poll after a spurious wake can land here
+   // for a resource the earlier round already registered, and a handover
+   // registers on the caller's behalf before it ever runs. Neither may occupy a
+   // second slot.
+   if (held_slot != not_held) {
+      return;
    }
+
+   claim_slot(tcb);
 
    // Nothing to propagate. Waiters already queued at acquisition time (the
    // uncontended CAS can win while others are parked, and a transferred owner
    // can inherit waiters) are picked up automatically, because urgency is folded
    // from the queue tops at the point of use rather than pushed to a cache here.
+}
+
+void pi_waitable::retire_held(thread_control_block& tcb) noexcept
+{
+   CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // resource not registered to its owner
+   CYROS_ASSERT(tcb.held_slots[held_slot].load(std::memory_order_relaxed) == this); // slot mismatch
+
+   // Clear the bit BEFORE the slot, the mirror of registration. A reader that
+   // still sees the bit finds a slot that is either this resource (about to be
+   // released, so a stale-but-plausible answer) or nullptr, and skips.
+   tcb.held_mask.fetch_and(static_cast<std::uint8_t>(~(1U << held_slot)),
+                           std::memory_order_release);
+   tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
+   held_slot = not_held;
 }
 
 bool pi_waitable::pi_try_acquire() noexcept
@@ -379,23 +404,23 @@ bool pi_waitable::pi_acquire_condition(thread& caller) noexcept
    }
 
    if (expected == &tcb) {
-      // Ownership was transferred to us while parked. The releaser committed
-      // the ownership word under the queue lock but deliberately did NOT
-      // touch our held list: linkage takes our pi_lock, and queue-lock ->
-      // pi_lock nesting is forbidden because the recompute nests them the
-      // other way round. The handover is completed here, in our own context.
-      // Any inversion this defers is nil, the transfer chose the BEST waiter,
-      // so no remaining waiter is more urgent than us in the gap.
-      register_held(tcb);
+      // Ownership was transferred to us while parked, and the releaser already
+      // filed the resource in our held slots on our behalf. All that is left is
+      // to drop the marker that says the assignment is still unclaimed, which is
+      // what stops wait_on_any handing it back.
+      {
+         spinlock_guard guard(tcb.pi_lock);
+         assigned_unclaimed = false;
+      }
       return true;
    }
 
    // About to park behind a live owner: donate. The doorbell carries no
-   // priority value, only "recompute from current truth", so a ring that goes
-   // stale in flight (the owner released, or another donor got there first)
-   // degrades to a redundant recompute rather than a wrong answer. Our own
-   // urgency is visible to that recompute because we armed before polling,
-   // the queue's top already includes us.
+   // priority value, only "look again", so a ring that goes stale in flight
+   // (the owner released, or another donor got there first) degrades to a
+   // redundant pick rather than a wrong answer. Our own urgency is already
+   // visible to that pick because we armed before polling, so this queue's top
+   // includes us.
    //
    // expected is the owner the failed CAS above observed, so no second load is
    // needed. It races the owner terminating, but an owner must not terminate
@@ -418,24 +443,13 @@ void pi_waitable::pi_release(reschedule_policy policy) noexcept
    auto& tcb = thread_action::get_current_thread_on_this_core();
    CYROS_ASSERT_OP(owner.load(std::memory_order_relaxed), ==, &tcb); // release by non-owner
 
-   // Retire from the held list FIRST, so the restore recompute below no
-   // longer counts this resource's waiters against us. A donor ringing in
-   // this window recomputes us without this resource, which is correct, we
-   // are giving it up and its waiters' urgency is about to become the next
-   // owner's concern.
+   // Retire from the held slots FIRST, so a fold running during the handover no
+   // longer counts this resource's waiters against us. That is correct: we are
+   // giving it up, and its waiters' urgency is about to become the next owner's
+   // concern.
    {
       spinlock_guard guard(tcb.pi_lock);
-
-      CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // resource not registered to its owner
-      CYROS_ASSERT(tcb.held_slots[held_slot].load(std::memory_order_relaxed) == this); // slot mismatch
-
-      // Clear the bit BEFORE the slot, the mirror of registration. A reader that
-      // still sees the bit finds a slot that is either this resource (about to
-      // be released, so a stale-but-plausible answer) or nullptr, and skips.
-      tcb.held_mask.fetch_and(static_cast<std::uint8_t>(~(1U << held_slot)),
-                              std::memory_order_release);
-      tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
-      held_slot = not_held;
+      retire_held(tcb);
    }
 
    // Hand over (or free) with the commit under the queue lock, closing the
@@ -458,6 +472,20 @@ void pi_waitable::hand_over(reschedule_policy policy) noexcept
    queue.wake_one_and_commit(
       [this](thread_control_block* chosen) {
          owner.store(chosen, std::memory_order_release);
+         if (chosen != nullptr) {
+            // File the resource in the new owner's slots HERE, not in its own
+            // next poll. Ownership that is not in held_slots is invisible to
+            // both the pick's routing and the urgency fold, so deferring it
+            // leaves the new owner unboostable for as long as it takes to run,
+            // which a mid-priority thread on its core can make unbounded.
+            //
+            // No pi_lock is taken, so the queue-lock -> pi_lock nesting the
+            // lock order forbids does not arise. claim_slot uses a CAS for
+            // exactly that reason, and the new owner is parked, so the only
+            // other claimant is another core committing a second handover.
+            claim_slot(*chosen);
+            assigned_unclaimed = true;
+         }
       },
       policy);
 }
@@ -471,22 +499,26 @@ void pi_waitable::renounce_if_assigned(thread::id const thread_id) noexcept
 
    // Assigned versus already-owned is the load-bearing distinction here. The
    // ownership word alone cannot make it: a caller that held this resource
-   // BEFORE entering the group wait also reads its own id. What separates
-   // them is registration, an earlier acquisition linked us into the
-   // caller's held list, an in-flight assignment did not (linkage happens in
-   // the wait_condition poll the group wait never reached). Renouncing
-   // registered ownership would put two threads in one critical section, so
-   // it is kept.
-   //
-   // The read is safe unlocked: held_slot mutates only in the owner's own
-   // context, and we ARE the owner's context.
-   if (held_slot != not_held) {
-      return; // registered ownership from before the wait, the caller keeps it
+   // BEFORE entering the group wait also reads its own id. Nor can slot
+   // occupancy, because a handover files the slot on the new owner's behalf, so
+   // both cases are registered. What separates them is assigned_unclaimed,
+   // which the handover sets and only the owner's own acquiring poll clears.
+   // Renouncing ownership the caller already had would put two threads in one
+   // critical section, so that case is kept.
+   auto& tcb = thread_action::get_current_thread_on_this_core();
+   {
+      // The owner's own context, same as pi_release, so the same lock covers
+      // the flag and the slot it guards.
+      spinlock_guard guard(tcb.pi_lock);
+      if (!assigned_unclaimed) {
+         return; // ownership from before the wait, the caller keeps it
+      }
+      assigned_unclaimed = false;
+      retire_held(tcb);
    }
 
-   // No unlink (never linked) and no restore recompute (an unregistered
-   // resource never contributed to our priority). Waiters parked behind the
-   // assignment are honoured by the same barge-free commit as a release.
+   // No unlink, it was never linked. Waiters parked behind the assignment are
+   // honoured by the same barge-free commit as a release.
    hand_over(reschedule_policy::automatic);
 }
 

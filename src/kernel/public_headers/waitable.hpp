@@ -351,23 +351,27 @@ protected:
  *      owner_id when free, recognition of ownership already transferred while
  *      parked, and a barge-free handover committed under the queue lock.
  *
- *   2. Donation: a thread about to park behind a live owner rings a priority
- *      recompute for that owner, so the owner runs at the urgency of its most
- *      urgent waiter.
+ *   2. Donation: a thread about to park behind a live owner arms itself on this
+ *      queue first, so the queue's top already reports it, and then hints the
+ *      owner's core to pick again. Nothing carries a priority value: the owner's
+ *      urgency is folded from what it holds at the moment the pick asks.
  *
- *   3. Restore: release retires the resource from the owner's held list and
- *      recomputes the owner from remaining truth, so donations never outlive
- *      the contention that justified them.
+ *   3. Restore: release retires the resource from the owner's held slots, and
+ *      that alone ends the donation, because nothing cached it.
  *
  * Lock ordering
  * ----------------------------
- * The recompute nests pi_lock -> queue lock, therefore nothing running under
- * a queue lock may take any pi_lock. This is why the handover commit only
- * writes this object's own atomics and the woken thread completes its own
- * held-list linkage in its next wait_condition poll, in its own context.
+ * Nothing running under a queue lock may take any pi_lock. The handover commit
+ * therefore files the new owner's slot with a lock-free CAS rather than under
+ * that owner's pi_lock. It must still file it: ownership missing from
+ * held_slots is ownership no waiter can boost, and the new owner may not run
+ * for an unbounded time.
  *
- * Not ISR-safe: acquisition and release take the calling thread's pi_lock and
- * recompute, both of which assume thread context.
+ * Nor may anything running under a queue lock ask for a thread's urgency, since
+ * the fold takes queue locks of its own. See thread_action::urgency_at.
+ *
+ * Not ISR-safe: acquisition and release take the calling thread's pi_lock, which
+ * assumes thread context.
  *
  * A thread must not terminate while owning a pi_waitable ,
  * and a pi_waitable must not be destroyed while owned.
@@ -414,10 +418,21 @@ private:
     * donation target all read it, so there is no pair to keep ordered. */
    std::atomic<thread_control_block*> owner{nullptr}; // nullptr when free
    /* Index of this resource's slot in its owner's held_slots, or not_held.
-    * Replaces the old intrusive next_held link and its self-sentinel, keeping
-    * registration, retirement and the "am I registered" test all O(1). */
+    * Keeps registration, retirement and the "am I registered" test all O(1). */
    static constexpr std::uint8_t not_held = 0xFFu;
    std::uint8_t held_slot{not_held};
+
+   /* Ownership was committed by a handover and the new owner has not run since.
+    * The discriminator wait_on_any needs: slot occupancy cannot separate an
+    * in-flight assignment from ownership the caller already had, because the
+    * handover files the slot itself. See renounce_if_assigned. */
+   bool assigned_unclaimed{false};
+
+   /// File this resource in @p tcb's held slots. Lock-free, see the .cpp.
+   void claim_slot(thread_control_block& tcb) noexcept;
+
+   /// Remove it again. Caller holds tcb.pi_lock.
+   void retire_held(thread_control_block& tcb) noexcept;
 
    void register_held(thread_control_block& tcb) noexcept;
 

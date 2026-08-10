@@ -60,12 +60,17 @@ schedule_hint ready_thread(thread_control_block& tcb);
  * inheritance. Following it needs a bound, because a wait-for CYCLE is a
  * deadlocked application and the kernel must not walk one forever.
  *
- * Nothing here takes a lock at any depth. held_slots and wait_queue::bridge_slots
- * are both bounded arrays of atomics precisely so this recursion reads a moving
- * graph without nesting queue locks around it, which is the shape that would
- * deadlock the kernel on the application's deadlock rather than merely observing
- * it. A torn read yields a stale-but-plausible urgency, the same tolerance the
- * rest of this design rests on.
+ * CALLER MUST NOT HOLD A QUEUE LOCK. The recursion reaches wait_queue::top,
+ * which takes one to snapshot the bridges parked on that queue. It releases it
+ * before recursing, so queue locks are never NESTED and a wait-for cycle is
+ * merely observed rather than deadlocked on, but that only holds while every
+ * caller enters from outside. In particular nothing inside a wake_one_and_commit
+ * callback may ask for a thread's urgency, and thread::get_priority() is exactly
+ * that question.
+ *
+ * held_slots is a bounded array of atomics so the fold itself needs no lock, and
+ * a torn read yields a stale-but-plausible urgency, the same tolerance the rest
+ * of this design rests on.
  */
 [[nodiscard]] std::uint8_t urgency_at(thread_control_block const& tcb, unsigned depth) noexcept;
 

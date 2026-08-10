@@ -1,18 +1,71 @@
 import gdb
 
+def unwrap(val):
+    """Strip atomic wrappers until a plain value is left.
+
+    Several shapes reach here: cyros::relaxed_atomic<T> (member 'value'),
+    std::atomic<T> over a scalar ('_M_base._M_i'), and std::atomic<T*>
+    ('_M_b._M_p'). Reading the storage directly rather than parsing the
+    built-in printer's text is what keeps this working for pointers, enums and
+    integers alike.
+    """
+    for _ in range(6):
+        try:
+            fields = val.type.strip_typedefs().fields()
+        except Exception:
+            return val
+
+        by_name = {f.name: f for f in fields if f.name}
+        stepped = False
+        for name in ("value", "_M_base", "_M_i", "_M_b", "_M_p"):
+            if name in by_name:
+                val = val[name]
+                stepped = True
+                break
+        if stepped:
+            continue
+
+        # libstdc++ reaches the storage of an integral std::atomic through a
+        # BASE class (__atomic_base<T>), which gdb reports as an unnamed-ish
+        # field rather than a member, so descending members alone stops short.
+        for field in fields:
+            if getattr(field, "is_base_class", False):
+                val = val.cast(field.type)
+                stepped = True
+                break
+        if not stepped:
+            return val
+    return val
+
+
+def array_length(val):
+    """Element count of a gdb array value.
+
+    Derived from the type's index range, NOT from sizeof(array)/sizeof(target):
+    these arrays reach gdb through a libstdc++ typedef whose target() is the
+    array itself, so the division silently yields 1 and every printer built on
+    it shows only the first element.
+    """
+    low, high = val.type.strip_typedefs().range()
+    return high - low + 1
+
+
 def format_atomic(val):
-    """Delegates formatting to GDB's built-in printer to guarantee accuracy."""
+    """Human-readable value of a possibly-atomic field."""
     try:
-        raw_str = str(val)
-        if "{" in raw_str and "}" in raw_str:
-            return raw_str.split("{")[1].split("}")[0].strip()
-        return raw_str
+        text = str(unwrap(val))
     except Exception:
         return "Unreadable"
+    # Fallback for any wrapper unwrap did not recognise: gdb renders those as
+    # "std::atomic<bool> = { true }", and only the payload is wanted.
+    if "{" in text and "}" in text:
+        return text.split("{")[1].split("}")[0].strip()
+    return text
 
 def get_tcb_summary(tcb_ptr):
     """Safely dereferences a TCB pointer to grab its ID or returns nullptr/error."""
     try:
+        tcb_ptr = unwrap(tcb_ptr)
         addr = int(tcb_ptr)
         if addr == 0:
             return "nullptr"
@@ -27,30 +80,63 @@ class ThreadControlBlockPrinter:
     def __init__(self, val):
         self.val = val
 
-    def _get_state_string(self):
+    # Must match cyros::thread_state. 'created' is the zero value, so an
+    # off-by-one here silently renames every state rather than failing.
+    STATES = ("created", "ready", "running", "blocked", "terminated")
+    DISPOSITIONS = ("none", "prepared", "committed")
+
+    def _enum_string(self, field, names):
         try:
-            state_val = int(self.val['state'])
-            mapping = {0: "ready", 1: "running", 2: "blocked", 3: "terminated"}
-            return mapping.get(state_val, f"unknown({state_val})")
+            value = int(unwrap(self.val[field]))
+            return names[value] if 0 <= value < len(names) else f"unknown({value})"
         except Exception:
             return "unknown"
 
+    def _held(self):
+        """Which PI resources this thread owns, i.e. what its urgency folds over.
+
+        There is no effective_priority to print: urgency is min(base, best
+        waiter of every held resource) and is computed at the point of use, so
+        the slots below ARE the state that determines it. A boosted holder is
+        one with a slot whose queue has a better waiter than its base.
+        """
+        try:
+            mask = int(unwrap(self.val['held_mask']))
+        except Exception:
+            return "unreadable"
+        if mask == 0:
+            return "none"
+        slots = self.val['held_slots']['_M_elems']
+        count = array_length(slots)
+        held = []
+        for i in range(count):
+            if not (mask >> i) & 1:
+                continue
+            try:
+                addr = int(unwrap(slots[i]))
+            except Exception:
+                addr = 0
+            held.append(f"slot{i}=0x{addr:x}" if addr else f"slot{i}=<cleared>")
+        return f"mask 0x{mask:x} [{', '.join(held)}]"
+
     def to_string(self):
         t_id = int(self.val['id'])
-        state = self._get_state_string()
+        state = self._enum_string('state', self.STATES)
+        disposition = self._enum_string('disposition', self.DISPOSITIONS)
         base_pri = int(self.val['base_priority'])
-        eff_pri = int(self.val['effective_priority'])
         core = int(self.val['pinned_core'])
 
         this_addr = self.val.address
-        next_addr = self.val['next']
-        enqueued = "No (Sentinel)" if this_addr == next_addr else "Yes"
+        enqueued = "No (Sentinel)" if this_addr == unwrap(self.val['next']) else "Yes"
+        listed = "No (Sentinel)" if this_addr == unwrap(self.val['holder_next']) else "Yes"
 
         return (
-            f"TCB [ID: {t_id}] (State: {state})\n"
-            f"    ├── Priority (Eff/Base): {eff_pri} / {base_pri}\n"
+            f"TCB [ID: {t_id}] (State: {state}, Disposition: {disposition})\n"
+            f"    ├── Base Priority:       {base_pri}\n"
+            f"    ├── Holds (PI):          {self._held()}\n"
             f"    ├── Pinned Core:         {core}\n"
-            f"    └── Enqueued Status:     {enqueued}"
+            f"    ├── Enqueued Status:     {enqueued}\n"
+            f"    └── On Holder List:      {listed}"
         )
 
 
@@ -58,10 +144,42 @@ class SchedulerPrinter:
     def __init__(self, val):
         self.val = val
 
+    def _holder_chain(self):
+        """Ready threads pinned here that hold a PI resource, in pick order.
+
+        These are exactly the threads whose urgency can beat their base
+        priority, so this list plus each TCB's held slots is what the pick
+        folds. Bounded so a corrupt link prints instead of hanging gdb.
+        """
+        try:
+            node = self.val['holders_head']
+        except Exception:
+            return "unreadable"
+        ids = []
+        seen = set()
+        node = unwrap(node)
+        while int(node) != 0 and len(ids) < 16:
+            addr = int(node)
+            if addr in seen:
+                ids.append("<cycle>")
+                break
+            seen.add(addr)
+            try:
+                ids.append(str(int(node.dereference()['id'])))
+                node = unwrap(node.dereference()['holder_next'])
+            except Exception:
+                ids.append(f"<unreadable 0x{addr:x}>")
+                break
+        return " -> ".join(ids) if ids else "empty"
+
     def to_string(self):
         core_id = int(self.val['core_id'])
         pinned = format_atomic(self.val['pinned_thread_counter'])
-        poke = "Pending" if "true" in format_atomic(self.val['inbox_poke_pending']).lower() else "No"
+
+        # The intake head is the whole cross-core request state: the TCB is the
+        # message, so a non-null head means work is outstanding for this core.
+        intake = get_tcb_summary(self.val['intake_head'])
+        holders = self._holder_chain()
 
         curr_str = get_tcb_summary(self.val['current_thread'])
         idle_str = get_tcb_summary(self.val['idle_thread'])
@@ -80,7 +198,9 @@ class SchedulerPrinter:
             f"    ├── Idle TCB:            {idle_str}\n"
             f"    ├── Pinned Threads:      {pinned}\n"
             f"    ├── Ready Matrix Bitmap: {matrix_str}\n"
-            f"    └── Inbox Poke Status:   {poke}"
+            f"    ├── Intake Head:         {intake}\n"
+            f"    ├── Holder List:         {holders}\n"
+            f"    └── Tie Rotor:           0x{int(self.val['tie_rotor']):x}"
         )
 
 
@@ -106,9 +226,7 @@ class KernelStatePrinter:
         schedulers = self.val['schedulers']
         try:
             elems = schedulers['_M_elems']
-            array_type = elems.type
-            num_cores = int(array_type.sizeof / array_type.target().sizeof)
-            for i in range(num_cores):
+            for i in range(array_length(elems)):
                 yield f'Core {i}', elems[i]
         except Exception:
             yield 'schedulers_raw', schedulers

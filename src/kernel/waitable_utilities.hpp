@@ -21,11 +21,11 @@ namespace cyros
  * force its declaration into the public header (a friend FUNCTION must be
  * visibly declared to be callable, a friend STRUCT declaration is
  * self-contained), and granting friendship to all of thread_action would
- * bleed access far wider than the walk needs. This attorney is the narrow
+ * bleed access far wider than the fold needs. This attorney is the narrow
  * waist: the public header carries only "friend struct waitable_access", the
- * capability lives here in a kernel-internal header, and the walk consumes
- * these public statics with no friendship of its own, which also frees it to
- * be decomposed into ordinary helpers.
+ * capability lives here in a kernel-internal header, and the fold consumes
+ * these public statics with no friendship of its own, which is also what lets
+ * it be an ordinary free helper.
  *
  * Keep this surface minimal on purpose: every method added here widens what
  * ANY kernel-internal code can do to a waitable, so a new entry needs the
@@ -33,8 +33,8 @@ namespace cyros
  * ========================================================================= */
 struct waitable_access
 {
-   /// Best queued waiter's urgency for a held PI resource. Lock-free at every
-   /// depth: see thread_action::urgency_at.
+   /// Best queued waiter's urgency for a held PI resource. Takes the queue lock
+   /// when that queue has bridges on it: see thread_action::urgency_at.
    [[nodiscard]] static std::uint8_t queue_top(pi_waitable const& w, unsigned depth) noexcept
    {
       return w.queue.top(depth);

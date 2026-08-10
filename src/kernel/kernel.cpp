@@ -102,10 +102,9 @@ inline constexpr unsigned max_inheritance_depth = 8;
  *
  * The definition of effective priority, folded from current truth.
  *
- * NO LOCK REQUIRED. held_slots is a bounded array of atomics and the queue tops
- * are maintained atomics, both so this can be evaluated by any core at any time.
- * The recompute walk happens to hold the target's pi_lock when it calls this,
- * but that is the walk's business (it also mutates), not a precondition here.
+ * Evaluable by any core at any time and with no pi_lock: held_slots is a bounded
+ * array of atomics and the queue tops are maintained atomics for exactly that.
+ * The one restriction is on queue locks, see thread_action::urgency_at.
  */
 [[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target, unsigned const depth) noexcept
 {
@@ -412,6 +411,21 @@ void yield()
             if (waitable.wait_condition(*tcb.public_thread_handle)) {
                tcb.disposition = thread_disposition::none;
                chosen = i;
+
+               // Leave the queue we just acquired from IMMEDIATELY, rather than
+               // at the guard below. An owner still armed in its own resource's
+               // queue is a cycle in the wait-for graph: the fold reads that
+               // queue, finds the owner listed as a bridge, and recurses back
+               // into the owner until the depth budget runs out and answers 0.
+               // That is not the harmless over-boost it looks like. A thread
+               // folding to 0 can never be beaten by set_thread_ready's
+               // urgency < current comparison, so its core stops raising
+               // preemption hints entirely while the window is open.
+               //
+               // Safe to do early: we own it, so no release can transfer it to
+               // us in the meantime, which is the only thing the other nodes
+               // have to stay armed for.
+               waitable.queue.disarm(nodes[i]);
                break;
             }
             ++i;
