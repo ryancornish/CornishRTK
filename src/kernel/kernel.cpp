@@ -215,6 +215,16 @@ std::uint8_t urgency_at(thread_control_block const& tcb, unsigned const depth) n
    return donated_floor(tcb, depth);
 }
 
+void commit_to_block(thread_control_block& tcb)
+{
+   auto token = cyros_port_preempt_disable();
+   if (tcb.disposition == thread_disposition::prepared) {
+      tcb.disposition = thread_disposition::committed;
+      cyros_port_pend_reschedule(); // Delayed until preempt_enable()
+   }
+   cyros_port_preempt_enable(token);
+}
+
 void request_repick(thread_control_block& tcb)
 {
    /* A BLOCKED holder cannot act on a prompt, and it is not the thread that
@@ -462,13 +472,8 @@ void yield()
          }
 
          if (!chosen) {
-            auto token = cyros_port_preempt_disable();
-            if (tcb.disposition == thread_disposition::prepared) {
-               // Condition unsatisfied AND no wake came after arming, block until woken
-               tcb.disposition = thread_disposition::committed;
-               cyros_port_pend_reschedule(); // Delayed until preempt_enable()
-            }
-            cyros_port_preempt_enable(token);
+            // Nothing was satisfied. Park, unless a wake beat us to it.
+            thread_action::commit_to_block(tcb);
          }
       } // arm_guard: disarm all (and de-boost any holder whose top we lowered)
 

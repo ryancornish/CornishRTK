@@ -75,6 +75,25 @@ schedule_hint ready_thread(thread_control_block& tcb);
 [[nodiscard]] std::uint8_t urgency_at(thread_control_block const& tcb, unsigned depth) noexcept;
 
 /**
+ * @brief Commit to parking, unless a wake has already revoked the intent.
+ *
+ * The subtle half of the two-phase block, and the ONLY part of it that is worth
+ * sharing between the group wait and a primitive with its own blocking loop. The
+ * arming loops differ enough (one source versus many) that a shared abstraction
+ * would cost more readability than it saves, but this test-and-commit must be
+ * identical everywhere or the lost-wakeup window reopens.
+ *
+ * Preemption is disabled across the test and the store, so a wake cannot land
+ * between deciding to block and recording it. A wake that arrived earlier has
+ * already cleared the disposition, and that is what this re-reads: seeing
+ * anything other than prepared means someone readied us after we armed, so we
+ * must not park. The pend is deferred to preempt_enable by construction.
+ *
+ * Caller must be armed on every source it intends to wake from BEFORE calling.
+ */
+void commit_to_block(thread_control_block& tcb);
+
+/**
  * @brief Ask @p tcb's core to reconsider what it is running.
  *
  * A pure hint carrying nothing. Used when a thread's urgency has RISEN because a
