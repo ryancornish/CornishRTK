@@ -726,10 +726,18 @@ void cyros_port_send_reschedule_ipi(uint32_t core_id)
 {
    CYROS_ASSERT_OP(core_id, <, global.cores.size());
 
+   auto const target = global.cores[core_id].pthread;
+   if (target == pthread_t{}) {
+      // Signalling a core that has not been brought up yet is dropped.
+      // Allowed to be lossy because when the core is first brought up, it will
+      // see at first-pick whatever this IPI attempt was trying to communicate to it.
+      return;
+   }
+
    // Targeting the signal at a core is the whole IPI. A core at baseline takes
    // it now, a masked core takes it on unmask, an idle core parked in
    // sigsuspend wakes and reschedules. Self-targeting works the same way.
-   pthread_kill(global.cores[core_id].pthread, preempt_signo);
+   pthread_kill(target, preempt_signo);
 }
 
 
