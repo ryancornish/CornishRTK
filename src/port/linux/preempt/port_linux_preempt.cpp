@@ -140,6 +140,15 @@ struct cpu_core
    pthread_t               pthread{}; // core0 records pthread_self() here too
    uint32_t                core_id{};
    cyros_port_core_entry_t entry{};
+
+   /* Brought-up flag for the IPI guard in cyros_port_send_reschedule_ipi. The
+    * pthread handle is written by the spawning thread and read by any core
+    * wanting to signal this one, and an opaque pthread_t is neither atomic nor
+    * portably comparable, so the cross-core question "can this core receive a
+    * signal yet" gets its own atomic rather than being inferred from the
+    * handle. Always stored after the handle is recorded, so an acquire load
+    * that observes it also observes a valid handle. */
+   std::atomic<bool>       started{false};
 };
 
 struct global_state
@@ -159,7 +168,7 @@ struct global_state
       shutdown_requested.store(false);
       active_contexts.store(0);
       reschedule_handler = nullptr;
-      cores = {};
+      cores.clear(); // not '= {}', the started atomic makes cpu_core non-copyable
    }
 };
 static constinit global_state global;
@@ -640,6 +649,7 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
    // core0 runs on this calling OS thread. Record its handle so a cross-core IPI
    // can target it the same way as any spawned core.
    global.cores[0].pthread = pthread_self();
+   global.cores[0].started.store(true, std::memory_order_release);
 
    // Prevent IPIs from initialized cores to uninitialized/initializing cores.
    // This avoids a premature reschedule before the target core is ready.
@@ -683,6 +693,7 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
          },
          &core
       );
+      core.started.store(true, std::memory_order_release);
    }
 
    // core0 on the calling thread.
@@ -726,8 +737,8 @@ void cyros_port_send_reschedule_ipi(uint32_t core_id)
 {
    CYROS_ASSERT_OP(core_id, <, global.cores.size());
 
-   auto const target = global.cores[core_id].pthread;
-   if (target == pthread_t{}) {
+   auto& target = global.cores[core_id];
+   if (!target.started.load(std::memory_order_acquire)) {
       // Signalling a core that has not been brought up yet is dropped.
       // Allowed to be lossy because when the core is first brought up, it will
       // see at first-pick whatever this IPI attempt was trying to communicate to it.
@@ -737,7 +748,7 @@ void cyros_port_send_reschedule_ipi(uint32_t core_id)
    // Targeting the signal at a core is the whole IPI. A core at baseline takes
    // it now, a masked core takes it on unmask, an idle core parked in
    // sigsuspend wakes and reschedules. Self-targeting works the same way.
-   pthread_kill(target, preempt_signo);
+   pthread_kill(target.pthread, preempt_signo);
 }
 
 

@@ -78,7 +78,17 @@ private:
    std::atomic<thread_control_block*> owner{nullptr};
 
    static constexpr std::uint8_t not_held = 0xFFu;
-   std::uint8_t held_slot{not_held}; // Index of this resource's slot in its owner's held_slots, or not_held.
+
+   /* Index of this resource's slot in its owner's held_slots, or not_held.
+    * Written from two contexts on two cores, the owner registering under its
+    * pi_lock and a releasing core committing a handover under the queue lock,
+    * so it is atomic to make the cross-thread handoff formal. Relaxed is
+    * enough. The two contexts are mutually excluded by the owner word's
+    * transitions, only one of them can be claiming this mutex at a time, and
+    * the new owner observes the value through the happens-before of the
+    * scheduler wake that publishes the handover rather than through either
+    * lock. Codegen for a relaxed byte is identical to a plain one. */
+   std::atomic<std::uint8_t> held_slot{not_held};
 
    void claim_slot(thread_control_block& tcb) noexcept;
 

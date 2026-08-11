@@ -61,14 +61,22 @@ struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
 };
 
 template <typename Predicate>
-[[nodiscard]] bool bounded_poll(Predicate&& done) noexcept
+[[nodiscard]] bool bounded_poll(Predicate&& done, std::uint64_t budget = poll_budget) noexcept
 {
-   for (std::uint64_t i = 0; i < poll_budget; ++i) {
+   for (std::uint64_t i = 0; i < budget; ++i) {
       if (done()) return true;
       cyros_port_cpu_relax();
    }
    return false;
 }
+
+/* For a poll that is EXPECTED to exhaust in many rounds by design, like the
+ * first-stage poll of the window-hunting test below, where a full budget per
+ * exhaustion would dominate the suite's wall clock. Three orders of magnitude
+ * above the microsecond scale of the event being awaited, and exhausting it
+ * spuriously under load is harmless there because the full-budget second
+ * stage still owns the verdict. */
+constexpr std::uint64_t short_poll_budget = 250'000;
 
 class SyncMutexPiDerived_Test : public ::testing::Test {};
 
@@ -981,3 +989,205 @@ TEST_F(SyncMutexPiDerived_Test,
 }
 
 
+/* ============================================================================
+ * The prompt walk must not stop at a waiter that is not parked yet
+ *
+ * Same chain as the sibling test above: A -> m2 (held by B) -> B -> m1 (held
+ * by C) -> C, with a spinner N on C's core that only urgency 1 beats. The
+ * sibling parks B before A donates, so the walk always meets B blocked. This
+ * one aims A's donation at the window between B arming on m1 and B parking.
+ * In that window B is still running, or already rotated out READY by a
+ * preemption with blocked_on still published, and it stays ready for as long
+ * as a better thread wants its core. A donation arriving then must still walk
+ * through B to C. B cannot pass it on itself once its own donate has run, it
+ * will not run again to repeat it, and C's core has no tick to save it.
+ *
+ * Two independent hitters sweep that window from the b_locking anchor B
+ * publishes just before locking. A jitters its own donation so its walk reads
+ * B mid-window while B is running-and-armed. The driver jitters the release
+ * of P, base 0 on B's core, whose wake IPI preempts B mid-window and holds it
+ * off the core, so a later walk reads B ready-and-armed. The window is
+ * microseconds wide and the anchor-to-hit latencies are comparable, so not
+ * every round catches it. Rounds that miss degenerate to the sibling's
+ * blocked-B case and still assert the walk worked.
+ *
+ * The bail path is two-staged for a reason. If C never resumes, the driver
+ * first stops P alone and polls again. A round where B was preempted before
+ * its own donate ran self-heals here, because the resumed B finishes its
+ * acquire poll and prompts C itself, and that is a pass. A round where the
+ * walk genuinely stopped at a not-yet-blocked B does not self-heal, B just
+ * parks, and only then is the failure recorded. That distinction is what
+ * makes a red run diagnostic: C reporting urgency 1 at the failure means the
+ * fold computed the transitive boost and nothing delivered the prompt.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenATwoLinkChainAcrossCores_WhenTheMiddleWaiterIsNotParkedYet_ThenTheFarHolderStillPreempts)
+{
+   /* 140 rather than the 65 the sweep needs for coverage: detection is
+    * statistical here, unlike the deterministic mutation tests elsewhere, and
+    * the measured per-round catch against the reinstated gate put a 65-round
+    * run at roughly 75 percent. Doubling the rounds was measured, not assumed,
+    * to move a single run into the mid-90s. cross-core-defects.md section 9
+    * has the numbers. */
+   constexpr int reps = 140;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 6> stacks{};
+
+      struct state
+      {
+         mutex m1;                              // held by C, wanted by B
+         mutex m2;                              // held by B, wanted by A
+         sync::semaphore n_gate{0};
+         sync::semaphore p_gate{0};
+         std::atomic<bool> c_holds{false};      // C owns m1
+         std::atomic<bool> spinner_running{false};
+         std::atomic<bool> b_locking{false};    // B is about to arm on m1
+         std::atomic<bool> c_resumed{false};    // C got core0 back: THE PROPERTY
+         std::atomic<bool> stop_spinner{false};
+         std::atomic<bool> stop_p{false};
+         std::atomic<int>  failed_stage{0};
+         std::atomic<int>  c_urgency{-1};
+         std::atomic<int>  b_urgency{-1};
+         thread* b{nullptr};
+         thread* c{nullptr};
+      };
+      state s;
+
+      // C, base 5 on core0: take m1, hand the core to N, and come back only
+      // when something decides C is more urgent than N.
+      thread c(
+         [&s]{
+            s.m1.lock();
+            s.c_holds.store(true, std::memory_order_release);
+            s.n_gate.release();          // N (base 2) preempts us right here
+            s.c_resumed.store(true, std::memory_order_release);
+            s.stop_spinner.store(true, std::memory_order_release);
+            s.m1.unlock();
+         },
+         stacks[0].bytes, thread::priority(5), core0);
+      s.c = &c;
+
+      // N, base 2 on core0: never blocks. Beats C's base 5 and the urgency 3
+      // of B's direct donation. Loses only to the transitive 1.
+      thread n(
+         [&s]{
+            s.n_gate.acquire();
+            s.spinner_running.store(true, std::memory_order_release);
+            while (!s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[1].bytes, thread::priority(2), core0);
+
+      // B, base 3 on core1: the middle link. Waits until N owns core0, so its
+      // donation cannot land while C is still running and pass the round
+      // vacuously, then announces the lock attempt and arms.
+      thread b(
+         [&s, rep]{
+            s.m2.lock();
+            while (!s.spinner_running.load(std::memory_order_acquire)
+                   && !s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.b_locking.store(true, std::memory_order_release);
+            // Bounded stall, swept on a stride coprime with the driver's, so
+            // the arm-to-park window slides through P's fairly fixed wake
+            // latency and the two meet at some alignment in every run.
+            for (int j = (rep % 13) * 96; j > 0; --j) {
+               cyros_port_cpu_relax();
+            }
+            s.m1.lock();
+            s.m1.unlock();
+            s.m2.unlock();
+         },
+         stacks[2].bytes, thread::priority(3), core1);
+      s.b = &b;
+
+      // P, base 0 on B's core: released mid-window, then holds B off the core
+      // so B stays ready-and-armed while A donates.
+      thread p(
+         [&s]{
+            s.p_gate.acquire();
+            while (!s.stop_p.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[3].bytes, thread::priority(0), core1);
+
+      // A, base 1 on core2: the donor. Fires at a fixed delay past every
+      // possible landing of P, so in a round where P caught the window the
+      // walk is guaranteed to read a B that is READY, still armed, and whose
+      // own donate has already run. Firing earlier would not strengthen the
+      // test, it would let A's arm on m2 land before B's donate, and B's
+      // donate would then carry A's urgency to C by the fold and rescue a
+      // swallowed walk before it was ever observable.
+      thread a(
+         [&s]{
+            while (!s.b_locking.load(std::memory_order_acquire)
+                   && !s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            for (int j = 8192; j > 0; --j) {
+               cyros_port_cpu_relax();
+            }
+            s.m2.lock();
+            s.m2.unlock();
+         },
+         stacks[4].bytes, thread::priority(1), core2);
+
+      thread driver(
+         [&s, rep]{
+            if (!bounded_poll([&]{ return s.b_locking.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.stop_p.store(true, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+               s.p_gate.release();
+               return;
+            }
+
+            // Sweep P's release across B's arm-to-park window round by round.
+            // A hit rotates B out ready-and-armed and holds it there for A.
+            for (int j = (rep % 5) * 128; j > 0; --j) {
+               cyros_port_cpu_relax();
+            }
+            s.p_gate.release();
+
+            if (bounded_poll([&]{ return s.c_resumed.load(std::memory_order_acquire); },
+                             short_poll_budget)) {
+               s.stop_p.store(true, std::memory_order_release);
+               return;
+            }
+
+            // Stop P alone first, then wait the full budget for the verdict.
+            // A round where B was preempted before its own donate ran
+            // self-heals now, a genuinely swallowed walk does not.
+            s.stop_p.store(true, std::memory_order_release);
+            if (bounded_poll([&]{ return s.c_resumed.load(std::memory_order_acquire); })) {
+               return;
+            }
+
+            s.c_urgency.store(s.c->get_priority(), std::memory_order_release);
+            s.b_urgency.store(s.b->get_priority(), std::memory_order_release);
+            s.failed_stage.store(2, std::memory_order_release);
+            s.stop_spinner.store(true, std::memory_order_release);
+         },
+         stacks[5].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "B never reached its lock of m1";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "the far holder C never ran again with the middle waiter unparked. "
+            "C reported urgency " << s.c_urgency.load() << ", B reported "
+         << s.b_urgency.load()
+         << " (C at 1 means the fold is right and the walk stopped at a "
+            "not-yet-blocked B)";
+
+      kernel::finalise();
+   }
+}

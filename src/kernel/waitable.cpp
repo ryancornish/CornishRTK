@@ -104,7 +104,8 @@ void wait_queue::drop_bridge(wait_node& node) noexcept
    bridge_count.fetch_sub(1, std::memory_order_release);
 }
 
-std::uint8_t wait_queue::top(unsigned const depth) const noexcept
+std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_owner,
+                             unsigned const depth) const noexcept
 {
    auto const cached = top_priority.load(std::memory_order_acquire);
 
@@ -124,8 +125,21 @@ std::uint8_t wait_queue::top(unsigned const depth) const noexcept
    bool overflow = false;
    {
       spinlock_guard guard(const_cast<spinlock&>(lock));
+
+      // Relaxed is enough here: the transition this read must not miss is the
+      // handover, which stores the owner under this same lock, so the lock
+      // orders it. See the header note for why the read must be under the
+      // lock at all.
+      auto* const holder = resource_owner.load(std::memory_order_relaxed);
+
       for (auto* n = head; n != nullptr; n = n->next) {
          if (!n->counted_as_bridge) continue;
+         // The owner itself, still armed in its own queue between the winning
+         // CAS and its disarm. Recursing into it would be a self-cycle that
+         // exhausts the budget and answers 0. See the note on top()'s
+         // resource_owner parameter for why that is not the harmless
+         // over-boost it looks like.
+         if (n->owner == holder) continue;
          if (found == max_snapshot) { overflow = true; break; }
          bridges[found++] = n->owner;
       }

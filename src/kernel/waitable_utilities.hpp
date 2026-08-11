@@ -35,10 +35,16 @@ namespace cyros
 struct waitable_access
 {
    /// Best queued waiter's urgency for a held PI resource. Takes the queue lock
-   /// when that queue has bridges on it: see thread_action::urgency_at.
+   /// when that queue has bridges on it: see thread_action::urgency_at. The
+   /// owner WORD is passed down, not its value, so the fold reads it under the
+   /// queue lock and never recurses into the queue's own owner, which is
+   /// transiently also an armed waiter in it. Passing a value read here was
+   /// wrong: it could go stale against a handover and then exclude the
+   /// ex-owner re-armed as a legitimate bridge, an under-report. The note on
+   /// wait_queue::top has the full argument.
    [[nodiscard]] static std::uint8_t queue_top(base_mutex const& w, unsigned depth) noexcept
    {
-      return w.queue.top(depth);
+      return w.queue.top(w.owner, depth);
    }
 
    /// Who holds this resource right now, for the prompt walk. Lossy by nature:

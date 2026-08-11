@@ -34,13 +34,19 @@ base_mutex::~base_mutex()
  * - The owner registering its own acquisition under pi_lock
  * - a _releasing_ core committing a handover under a queue lock, where the new
  *   owner's pi_lock is out of reach
+ *
+ * The two contexts never run concurrently for one mutex. Only the context
+ * that just made tcb the owner can be here, and the owner word transitions
+ * through nullptr or a committed handover between owners, so claims for THIS
+ * mutex are serialised by ownership itself. What the CAS below arbitrates is
+ * different: concurrent claims for OTHER mutexes racing over the same
+ * thread's free slots.
  */
 void base_mutex::claim_slot(thread_control_block& tcb) noexcept
 {
    std::size_t slot = max_held_per_thread;
    for (std::size_t i = 0; i < max_held_per_thread; ++i) {
       base_mutex* expected = nullptr;
-      // CAS orders any competing calls from the two contexts
       if (tcb.held_slots[i].compare_exchange_strong(expected, this,
                                                     std::memory_order_acq_rel,
                                                     std::memory_order_relaxed)) {
@@ -50,7 +56,7 @@ void base_mutex::claim_slot(thread_control_block& tcb) noexcept
    }
    CYROS_ASSERT_OP(slot, <, max_held_per_thread); // Slot claim attempt failed!
 
-   held_slot = static_cast<std::uint8_t>(slot);
+   held_slot.store(static_cast<std::uint8_t>(slot), std::memory_order_relaxed);
    // The slot pointer is published by the CAS above, so setting the bit second
    // means a reader that sees the bit can always see the pointer.
    tcb.held_mask.fetch_or(static_cast<std::uint8_t>(1U << slot),
@@ -59,16 +65,17 @@ void base_mutex::claim_slot(thread_control_block& tcb) noexcept
 
 void base_mutex::retire_held(thread_control_block& tcb) noexcept
 {
-   CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // Not registered to its owner
-   CYROS_ASSERT(tcb.held_slots[held_slot].load(std::memory_order_relaxed) == this);
+   auto const slot = held_slot.load(std::memory_order_relaxed);
+   CYROS_ASSERT_OP(slot, <, max_held_per_thread); // Not registered to its owner
+   CYROS_ASSERT(tcb.held_slots[slot].load(std::memory_order_relaxed) == this);
 
    // Clear the bit BEFORE the slot, the mirror of registration. A reader that
    // still sees the bit finds a slot that is either this resource (about to be
    // released, so a stale-but-plausible answer) or nullptr, and skips.
-   tcb.held_mask.fetch_and(static_cast<std::uint8_t>(~(1U << held_slot)),
+   tcb.held_mask.fetch_and(static_cast<std::uint8_t>(~(1U << slot)),
                            std::memory_order_release);
-   tcb.held_slots[held_slot].store(nullptr, std::memory_order_release);
-   held_slot = not_held;
+   tcb.held_slots[slot].store(nullptr, std::memory_order_release);
+   held_slot.store(not_held, std::memory_order_relaxed);
 }
 
 void base_mutex::register_held(thread_control_block& tcb) noexcept
@@ -78,7 +85,7 @@ void base_mutex::register_held(thread_control_block& tcb) noexcept
    // Idempotent: a re-poll after a spurious wake can land here for a resource
    // the earlier round already registered, and a handover registers on the
    // caller's behalf before it ever runs. Neither may occupy a second slot.
-   if (held_slot != not_held) {
+   if (held_slot.load(std::memory_order_relaxed) != not_held) {
       return;
    }
 

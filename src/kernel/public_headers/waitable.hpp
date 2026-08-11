@@ -93,11 +93,30 @@ class CYROS_PUBLIC wait_queue
     * can be, so the fold runs over the bridges alone rather than the whole queue,
     * and bridge_mask is zero in the overwhelming majority of queues.
     *
+    * @param resource_owner The owner word of the resource this queue backs.
+    *        Read UNDER the queue lock and excluded from the bridge fold: an
+    *        acquirer is briefly both owner and armed waiter in its own queue
+    *        (the window between the winning CAS and its disarm), and recursing
+    *        into it from its own queue is a self-cycle that exhausts the depth
+    *        budget and answers 0. Skipping the owner makes that cycle
+    *        unrepresentable at every recursion depth rather than merely brief.
+    *
+    *        The read must happen inside the lock, not be passed in as a value.
+    *        A handover commits the owner under this same lock after unlinking
+    *        the chosen waiter, so an under-lock read is exactly consistent
+    *        with the queue contents: a thread observed both armed and owning
+    *        is the acquire-window self-cycle and nothing else. A value read
+    *        before the lock can go stale against exactly that handover, and
+    *        the ex-owner can re-arm as a legitimate bridge behind it, which
+    *        the stale exclusion would then skip, an UNDER-report. The lock-free
+    *        CAS take is the one owner transition outside this lock, and racing
+    *        it only misses the exclusion, the safe over-boost direction.
     * @param depth Remaining recursion budget. A wait-for cycle means the
     *        application has deadlocked; the budget stops the kernel following it
     *        forever and the answer is then conservative rather than wrong.
     */
-   [[nodiscard]] std::uint8_t top(unsigned depth) const noexcept;
+   [[nodiscard]] std::uint8_t top(std::atomic<thread_control_block*> const& resource_owner,
+                                  unsigned depth) const noexcept;
 
    void link  (wait_node&) noexcept;
    bool unlink(wait_node&) noexcept;

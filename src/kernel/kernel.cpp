@@ -256,10 +256,14 @@ void request_repick(thread_control_block& tcb)
          cyros_port_send_reschedule_ipi(target->pinned_core);
       }
 
-      // Only a blocked holder has somewhere further to pass this on. Anything
-      // else can act on the prompt itself once its core picks.
-      if (target->state != thread_state::blocked) return;
-
+      // Deliberately no thread_state check before continuing. blocked_on is
+      // published while the waiter is armed, whether or not the scheduler has
+      // parked it yet, so a ready or still-running waiter genuinely has
+      // somewhere to pass this on. Gating on state == blocked here once
+      // reintroduced an unbounded inversion: a waiter preempted between arming
+      // and parking is rotated out ready with blocked_on set, it does not
+      // re-donate when it resumes, and stopping the walk at it silences the
+      // far end of the chain, which is the thread the walk exists to reach.
       auto* const next_resource = target->blocked_on.load(std::memory_order_acquire);
       if (next_resource == nullptr) return;
 
