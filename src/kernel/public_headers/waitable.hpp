@@ -15,7 +15,7 @@ namespace cyros
 {
 
 class waitable;
-class pi_waitable;
+class base_mutex;
 class waitable_arm_guard;
 class wait_node_vector;
 struct waitable_access;
@@ -147,7 +147,7 @@ class CYROS_PUBLIC wait_queue
 
    // The only types that may drive a queue.
    friend class waitable;
-   friend class pi_waitable; // replaced by the kernel mutex
+   friend class base_mutex;
    friend class waitable_arm_guard;
    friend class wait_node_vector;
    friend struct waitable_access;
@@ -318,7 +318,6 @@ private:
    wait_queue queue;
 
    friend class wait_node_vector;
-   friend class pi_waitable;
    friend class waitable_arm_guard;
    friend struct waitable_access;
    friend std::size_t this_thread::wait_on_any(std::span<waitable_ref>) noexcept;
@@ -339,112 +338,6 @@ protected:
       return true;
    }
 };
-
-
-/* ============================================================================
- * pi_waitable - ownable waitable with priority inheritance
- *
- * The base for primitives that have a single owning thread at a time and must
- * bound priority inversion (typically a mutex). It packages three things:
- *
- *   1. The ownership protocol proven by wake_one_and_transfer: a CAS take on
- *      owner_id when free, recognition of ownership already transferred while
- *      parked, and a barge-free handover committed under the queue lock.
- *
- *   2. Donation: a thread about to park behind a live owner arms itself on this
- *      queue first, so the queue's top already reports it, and then hints the
- *      owner's core to pick again. Nothing carries a priority value: the owner's
- *      urgency is folded from what it holds at the moment the pick asks.
- *
- *   3. Restore: release retires the resource from the owner's held slots, and
- *      that alone ends the donation, because nothing cached it.
- *
- * Lock ordering
- * ----------------------------
- * Nothing running under a queue lock may take any pi_lock. The handover commit
- * therefore files the new owner's slot with a lock-free CAS rather than under
- * that owner's pi_lock. It must still file it: ownership missing from
- * held_slots is ownership no waiter can boost, and the new owner may not run
- * for an unbounded time.
- *
- * Nor may anything running under a queue lock ask for a thread's urgency, since
- * the fold takes queue locks of its own. See thread_action::urgency_at.
- *
- * Not ISR-safe: acquisition and release take the calling thread's pi_lock, which
- * assumes thread context.
- *
- * A thread must not terminate while owning a pi_waitable ,
- * and a pi_waitable must not be destroyed while owned.
- * ========================================================================= */
-class CYROS_PUBLIC pi_waitable : public waitable
-{
-public:
-   ~pi_waitable() override;
-
-protected:
-   pi_waitable() noexcept = default;
-
-   /**
-    * @brief Non-blocking CAS take of a free resource by the calling thread.
-    * @return true when ownership was acquired.
-    */
-   [[nodiscard]] bool pi_try_acquire() noexcept;
-
-   /**
-    * @brief The wait_condition body for an owned resource.
-    *
-    * Takes the resource when free, recognises ownership already transferred
-    * to the caller while it was parked, and otherwise donates to the live
-    * owner before the caller parks.
-    *
-    * @return true if the caller owns the resource and will not block.
-    */
-   bool pi_acquire_condition(thread& caller) noexcept;
-
-   /**
-    * @brief Release: barge-free handover to the best waiter, or free.
-    *
-    * Retires the resource from the caller's held slots, then commits the
-    * handover (or the free) under the queue lock. There is no restore step:
-    * nothing cached the boost, so urgency stops including this resource the
-    * moment it leaves held_slots.
-    */
-   void pi_release(reschedule_policy policy = reschedule_policy::automatic) noexcept;
-
-   void renounce_if_assigned(thread::id thread_id) noexcept override;
-
-private:
-   /* One word, not two. The CAS take, the transferred-recognition test and the
-    * donation target all read it, so there is no pair to keep ordered. */
-   std::atomic<thread_control_block*> owner{nullptr}; // nullptr when free
-   /* Index of this resource's slot in its owner's held_slots, or not_held.
-    * Keeps registration, retirement and the "am I registered" test all O(1). */
-   static constexpr std::uint8_t not_held = 0xFFu;
-   std::uint8_t held_slot{not_held};
-
-   /* Ownership was committed by a handover and the new owner has not run since.
-    * The discriminator wait_on_any needs: slot occupancy cannot separate an
-    * in-flight assignment from ownership the caller already had, because the
-    * handover files the slot itself. See renounce_if_assigned. */
-   bool assigned_unclaimed{false};
-
-   /// File this resource in @p tcb's held slots. Lock-free, see the .cpp.
-   void claim_slot(thread_control_block& tcb) noexcept;
-
-   /// Remove it again. Caller holds tcb.pi_lock.
-   void retire_held(thread_control_block& tcb) noexcept;
-
-   void register_held(thread_control_block& tcb) noexcept;
-
-   // The shared release commit: hand to the best waiter or free, under the
-   // queue lock. Used by pi_release (registered ownership) and
-   // renounce_if_assigned (in-flight assignment a group wait declined).
-   void hand_over(reschedule_policy policy) noexcept;
-
-   friend struct waitable_access;
-};
-
-
 
 
 } // namespace cyros

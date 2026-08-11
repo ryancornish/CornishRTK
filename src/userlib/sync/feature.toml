@@ -6,7 +6,6 @@ dependencies = [
 ]
 
 sources = [
-  "mutex.cpp",
   "semaphore.cpp",
 ]
 

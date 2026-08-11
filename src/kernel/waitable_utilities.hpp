@@ -2,6 +2,7 @@
 #define CYROS_WAITABLE_UTILITIES_VECTOR_HPP
 
 #include <cyros/config/config.hpp>
+#include <cyros/kernel/base_mutex.hpp>
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/port/port.h>
 
@@ -16,8 +17,8 @@ namespace cyros
 /* ============================================================================
  * waitable_access - attorney for the urgency fold
  *
- * The urgency fold needs one narrow operation on pi_waitable, and
- * pi_waitable internals. Granting friendship to the function itself would
+ * The urgency fold needs one narrow operation on base_mutex, and its
+ * internals. Granting friendship to the function itself would
  * force its declaration into the public header (a friend FUNCTION must be
  * visibly declared to be callable, a friend STRUCT declaration is
  * self-contained), and granting friendship to all of thread_action would
@@ -35,7 +36,7 @@ struct waitable_access
 {
    /// Best queued waiter's urgency for a held PI resource. Takes the queue lock
    /// when that queue has bridges on it: see thread_action::urgency_at.
-   [[nodiscard]] static std::uint8_t queue_top(pi_waitable const& w, unsigned depth) noexcept
+   [[nodiscard]] static std::uint8_t queue_top(base_mutex const& w, unsigned depth) noexcept
    {
       return w.queue.top(depth);
    }

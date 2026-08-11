@@ -138,9 +138,9 @@ struct thread_control_block
     * a stale-but-plausible urgency, which is the same tolerance the value-free
     * doorbell already relies on.
     *
-    * A free slot is nullptr. pi_waitable::held_slot indexes back into here so
+    * A free slot is nullptr. base_mutex::held_slot indexes back into here so
     * registration and retirement stay O(1), as the list's self-sentinel did. */
-   std::array<std::atomic<pi_waitable*>, max_held_per_thread> held_slots{};
+   std::array<std::atomic<base_mutex*>, max_held_per_thread> held_slots{};
 
    /* Occupancy bitmask over held_slots, so the overwhelmingly common "this
     * thread holds nothing" case is one load and one compare instead of a walk

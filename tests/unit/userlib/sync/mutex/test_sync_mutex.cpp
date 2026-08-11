@@ -6,6 +6,8 @@
 
 #include "gtest/gtest.h"
 
+#include <type_traits>
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -13,6 +15,21 @@
 #include <string>
 
 using namespace cyros;
+
+/* A mutex must never be composable into a wait_on_any group, and the ban is
+ * enforced by the type system rather than by a runtime check: sync::mutex is a
+ * facade over base_mutex, which is deliberately NOT a waitable.
+ *
+ * This assertion is what two deleted tests turned into. The renounce-window race
+ * and the already-admitted-group-waiter hole (cross-core-defects.md 8.1) were
+ * both only constructible through that composition, so making it ill-formed
+ * retires the machinery and the tests together. A compile-time check is the right
+ * shape here: there is no runtime behaviour left to observe.
+ * See mutex-first-class-plan.md D6. */
+static_assert(!std::is_convertible_v<mutex&, waitable&>,
+              "a mutex must not be usable as a waitable, or it can enter a wait_on_any group");
+static_assert(!std::is_base_of_v<waitable, mutex>,
+              "a mutex must not derive from waitable");
 
 static_assert(config::cores >= 4, "Test suite is designed for (at least) quad-core configuration");
 

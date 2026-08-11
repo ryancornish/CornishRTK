@@ -6,6 +6,7 @@ sources = [
   "scheduler.cpp",
   "threading_subsystem.cpp",
   "waitable.cpp",
+  "base_mutex.cpp",
   "spinlock.cpp",
 ]
 
@@ -20,5 +21,6 @@ public_headers = [
   "public_headers/spinlock.hpp -> cyros/kernel/spinlock.hpp",
   "public_headers/thread.hpp -> cyros/kernel/thread.hpp",
   "public_headers/waitable.hpp -> cyros/kernel/waitable.hpp",
+  "public_headers/base_mutex.hpp -> cyros/kernel/base_mutex.hpp",
   "public_headers/core.hpp -> cyros/kernel/core.hpp",
 ]
