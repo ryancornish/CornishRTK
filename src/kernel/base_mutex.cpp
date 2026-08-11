@@ -17,22 +17,30 @@
 namespace cyros
 {
 
+/**
+ * @brief Assert invariants of a destroyed mutex
+ */
 base_mutex::~base_mutex()
 {
-   CYROS_ASSERT(owner.load(std::memory_order_relaxed) == nullptr); // still owned
-   CYROS_ASSERT(queue.empty()); // destroyed with waiters parked on it
+   CYROS_ASSERT(owner.load(std::memory_order_relaxed) == nullptr); // Still owned
+   CYROS_ASSERT(queue.empty()); // Destroyed with waiters parked on it
 }
 
+/**
+ * @brief File this resource in tcb held_slots.
+ * @param tcb Targeted thread
+ *
+ * Executed from two contexts:
+ * - The owner registering its own acquisition under pi_lock
+ * - a _releasing_ core committing a handover under a queue lock, where the new
+ *   owner's pi_lock is out of reach
+ */
 void base_mutex::claim_slot(thread_control_block& tcb) noexcept
 {
-   // Claimed by CAS rather than scan-then-store, because this runs from two
-   // contexts: the owner registering its own acquisition under pi_lock, and a
-   // RELEASING core committing a handover under a queue lock, where the new
-   // owner's pi_lock is out of reach. The CAS is what makes those two safe
-   // against each other without giving either a lock the other cannot take.
    std::size_t slot = max_held_per_thread;
    for (std::size_t i = 0; i < max_held_per_thread; ++i) {
       base_mutex* expected = nullptr;
+      // CAS orders any competing calls from the two contexts
       if (tcb.held_slots[i].compare_exchange_strong(expected, this,
                                                     std::memory_order_acq_rel,
                                                     std::memory_order_relaxed)) {
@@ -40,9 +48,7 @@ void base_mutex::claim_slot(thread_control_block& tcb) noexcept
          break;
       }
    }
-   // Hard error, never a silent drop: an unrecorded held resource is a lost
-   // donation, which is the failure class this representation exists to remove.
-   CYROS_ASSERT_OP(slot, <, max_held_per_thread); // max_held_per_thread exceeded
+   CYROS_ASSERT_OP(slot, <, max_held_per_thread); // Slot claim attempt failed!
 
    held_slot = static_cast<std::uint8_t>(slot);
    // The slot pointer is published by the CAS above, so setting the bit second
@@ -53,7 +59,7 @@ void base_mutex::claim_slot(thread_control_block& tcb) noexcept
 
 void base_mutex::retire_held(thread_control_block& tcb) noexcept
 {
-   CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // not registered to its owner
+   CYROS_ASSERT_OP(held_slot, <, max_held_per_thread); // Not registered to its owner
    CYROS_ASSERT(tcb.held_slots[held_slot].load(std::memory_order_relaxed) == this);
 
    // Clear the bit BEFORE the slot, the mirror of registration. A reader that
@@ -77,18 +83,20 @@ void base_mutex::register_held(thread_control_block& tcb) noexcept
    }
 
    claim_slot(tcb);
-
-   // Nothing to propagate. Waiters already queued at acquisition time are picked
-   // up automatically, because urgency is folded from the queue tops at the
-   // point of use rather than pushed to a cache here.
 }
 
+/**
+ * @brief Take if free, recognise ownership already transferred to us, or donate.
+ *
+ * @param tcb
+ * @return
+ */
 bool base_mutex::acquire_condition(thread_control_block& tcb) noexcept
 {
    thread_control_block* expected = nullptr;
    if (owner.compare_exchange_strong(expected, &tcb, std::memory_order_acq_rel)) {
       register_held(tcb);
-      return true; // free, taken uncontended
+      return true; // Free for taking
    }
 
    if (expected == &tcb) {
@@ -97,11 +105,7 @@ bool base_mutex::acquire_condition(thread_control_block& tcb) noexcept
       return true;
    }
 
-   // About to park behind a live owner: donate. The doorbell carries no priority
-   // value, only "look again", so a ring that goes stale in flight degrades to a
-   // redundant pick rather than a wrong answer. Our own urgency is already
-   // visible to that pick because we armed before polling, so this queue's top
-   // includes us.
+   // About to park behind a live owner: donate our urgency to the owner.
    //
    // expected is the owner the failed CAS above observed, so no second load is
    // needed. It races the owner terminating, but an owner must not terminate
@@ -129,9 +133,6 @@ void base_mutex::lock() noexcept
 {
    auto& tcb = thread_action::get_current_thread_on_this_core();
 
-   // One node, on this thread's own stack, for the life of the call. A mutex
-   // waits on exactly one source, which is the whole reason it does not need
-   // wait_on_any's node vector.
    wait_queue::wait_node node{};
    node.owner = &tcb;
 
@@ -147,7 +148,7 @@ void base_mutex::lock() noexcept
       // until its depth budget ran out and answered 0. Both exits from the loop
       // below disarm before returning, and the handover check after the park is
       // what keeps a woken owner from coming back round to re-arm.
-      CYROS_ASSERT(owner.load(std::memory_order_relaxed) != &tcb); // owner queued on itself
+      CYROS_ASSERT(owner.load(std::memory_order_relaxed) != &tcb); // Owner queued on itself
       queue.arm(node);
 
       // Publish the wait-for edge AFTER arming and BEFORE polling, so it is set
@@ -175,9 +176,7 @@ void base_mutex::lock() noexcept
       tcb.blocked_on.store(nullptr, std::memory_order_release);
 
       // Recognise a handover BEFORE looping, so an owner never re-arms on its
-      // own queue. That is not just tidiness: an owner sitting in its own wait
-      // queue is a cycle in the wait-for graph, and it is the invariant the
-      // assert in the arm path above checks.
+      // own queue.
       if (owner.load(std::memory_order_acquire) == &tcb) {
          tcb.disposition = thread_disposition::none;
          return;
@@ -188,10 +187,10 @@ void base_mutex::lock() noexcept
 void base_mutex::unlock(reschedule_policy policy) noexcept
 {
    auto& tcb = thread_action::get_current_thread_on_this_core();
-   CYROS_ASSERT_OP(owner.load(std::memory_order_relaxed), ==, &tcb); // release by non-owner
+   CYROS_ASSERT_OP(owner.load(std::memory_order_relaxed), ==, &tcb); // Release by non-owner
 
    // Retire from the held slots FIRST, so a fold running during the handover no
-   // longer counts this resource's waiters against us. That is correct: we are
+   // longer counts this resource's waiters against us. Correct because we are
    // giving it up, and its waiters' urgency is about to become the next owner's
    // concern.
    {
@@ -200,32 +199,30 @@ void base_mutex::unlock(reschedule_policy policy) noexcept
    }
 
    hand_over(policy);
-
-   // No restore step. Our urgency stops including this resource the moment it
-   // leaves held_slots, because nothing cached it. And a release that mattered
-   // had waiters, so hand_over already woke one and applied the reschedule
-   // policy. A release with no waiters never boosted us at all, which is true
-   // for inheritance and would NOT be true for a ceiling protocol. See
-   // mutex-first-class-plan.md D6.
 }
 
+/**
+ * @brief The release commit: hand to the best waiter or free, under the queue lock.
+ *
+ * @param policy
+ */
 void base_mutex::hand_over(reschedule_policy policy) noexcept
 {
    queue.wake_one_and_commit(
       [this](thread_control_block* chosen) {
          owner.store(chosen, std::memory_order_release);
-         if (chosen != nullptr) {
-            // File the resource in the new owner's slots HERE, not in its own
-            // next poll. Ownership that is not in held_slots is invisible to
-            // both the pick's routing and the urgency fold, so deferring it
-            // leaves the new owner unboostable for as long as it takes to run,
-            // which a mid-priority thread on its core can make unbounded.
-            //
-            // No pi_lock is taken, so the queue-lock -> pi_lock nesting the lock
-            // order forbids does not arise. claim_slot uses a CAS for exactly
-            // that reason.
-            claim_slot(*chosen);
-         }
+         if (!chosen) return;
+
+         // File the resource in the new owner's slots HERE, not in its own
+         // next poll. Ownership that is not in held_slots is invisible to
+         // both the pick's routing and the urgency fold, so deferring it
+         // leaves the new owner unboostable for as long as it takes to run,
+         // which a mid-priority thread on its core can make unbounded.
+         //
+         // No pi_lock is taken, so the queue-lock -> pi_lock nesting the lock
+         // order forbids does not arise. claim_slot uses a CAS for exactly
+         // that reason.
+         claim_slot(*chosen);
       },
       policy);
 }

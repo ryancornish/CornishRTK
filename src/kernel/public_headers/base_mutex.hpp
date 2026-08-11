@@ -10,47 +10,35 @@
 namespace cyros
 {
 
-/* ============================================================================
- * base_mutex - ownable resource with priority inheritance, NOT a waitable
+
+/**
+ * @brief Thread-ownable resource with priority-inheritance semantics.
  *
- * The kernel half of the mutex. Users do not include this header, they include
- * <cyros/sync/mutex.hpp> and get a zero-cost facade over it, the same way
- * nobody includes <cyros/kernel/waitable.hpp> to use a semaphore. The type lives
- * here because the SCHEDULER has to name it: thread_control_block::held_slots
- * holds these, and the urgency fold walks them at every pick. That is a
- * statement about who owns the data, not about who owns the surface.
+ * `base_mutex` is the kernel's half of the mutex. The sync/ userlib feature
+ * uses this interface to build the mutex types that users consume. Therefore,
+ * this class is an abstract-base-class that is not intended to be instantiated
+ * itself.
  *
- * Why it is not a waitable
- * ------------------------
- * A waitable can enter a wait_on_any group. A mutex must not, and the ban is
- * structural rather than a runtime check, because the composition is not merely
- * unwanted but actively broken: a group waiter woken by its OTHER source is
- * admitted to the ready matrix holding nothing, and a handover landing on it
- * afterwards files a resource into a thread the fold no longer looks at. See
- * cross-core-defects.md 8.1. Not deriving from waitable makes that
- * unrepresentable at zero cost.
+ * Why this is separate from the generic waitable interface:
+ * Mutexes are considered the special child of Cyros. They require careful handling
+ * and synchronisation between threads and cores. Regular waitables don't require
+ * this machinery and are not burdened with the overhead.
+ * Priority transfer protocols are built-in to the `base_mutex` allowing for
+ * derived mutex types to implement priority inheritance protocols (chained/transitive)
+ * and priority ceiling protocols.
+ * It reuses some of the same machinery as the waitable class under the hood, but
+ * group composition with waiting on multiple mutexes is intentionally prohibited -
+ * unlike waitables.
  *
- * The consequence worth knowing: there is no renounce protocol here and no
- * "assigned but unclaimed" state, because a mutex can only ever be handed to a
- * thread that is waiting for exactly it. Both existed solely to disambiguate
- * the group-wait case.
+ * Care is taken so that the complexity and overhead of acquiring and releasing mutexes
+ * are only paid for when it is necessary.
  *
- * Inheritance, and what a held resource contributes
- * -------------------------------------------------
- * A thread's urgency is min(base, contribution of every resource it holds), and
- * this type's contribution is its queue's best waiter. That is the whole of
- * priority inheritance here: nothing is stored, propagated or restored, because
- * the fold reads current truth at the point of use.
+ * @note The `base_mutex`'s lifetime must outlive all threads interacting with it. It is recommended
+ * to be placed in static storage.
  *
- * The constructor is protected so this type cannot be instantiated bare. Today
- * there is one inversion policy and the facade in sync/ names it. When ceiling
- * lands as a sibling facade it becomes a constructor parameter plus one branch
- * in the fold, and the protected constructor is what guarantees every mutex in
- * the system states which protocol it runs. See mutex-first-class-plan.md D6.
- *
- * Not ISR-safe: acquisition and release take the calling thread's pi_lock, which
+ * @warning Not ISR-safe: acquisition and release take the calling thread's pi_lock, which
  * assumes thread context.
- * ========================================================================= */
+ */
 class CYROS_PUBLIC base_mutex
 {
 public:
@@ -83,33 +71,23 @@ public:
 
 protected:
    ~base_mutex();
-   base_mutex() noexcept = default;
+   constexpr base_mutex() noexcept = default;
 
 private:
-   /// Composed, not inherited. See wait_queue for why the name is visible here
-   /// and still unusable.
    wait_queue queue;
+   std::atomic<thread_control_block*> owner{nullptr};
 
-   /* One word, not two. The CAS take, the transferred-recognition test and the
-    * donation target all read it, so there is no pair to keep ordered. */
-   std::atomic<thread_control_block*> owner{nullptr}; // nullptr when free
-
-   /* Index of this resource's slot in its owner's held_slots, or not_held. */
    static constexpr std::uint8_t not_held = 0xFFu;
-   std::uint8_t held_slot{not_held};
+   std::uint8_t held_slot{not_held}; // Index of this resource's slot in its owner's held_slots, or not_held.
 
-   /// File this resource in @p tcb's held slots. Lock-free, see the .cpp.
    void claim_slot(thread_control_block& tcb) noexcept;
 
-   /// Remove it again. Caller holds tcb.pi_lock.
    void retire_held(thread_control_block& tcb) noexcept;
 
    void register_held(thread_control_block& tcb) noexcept;
 
-   /// Take if free, recognise ownership already transferred to us, or donate.
    bool acquire_condition(thread_control_block& tcb) noexcept;
 
-   /// The release commit: hand to the best waiter or free, under the queue lock.
    void hand_over(reschedule_policy policy) noexcept;
 
    friend struct waitable_access;

@@ -7,7 +7,6 @@
 #include <cyros/kernel/visibility.hpp>
 
 #include <cstddef>
-#include <array>
 #include <cstdint>
 #include <span>
 
@@ -23,9 +22,6 @@ struct waitable_access;
 /**
  * @brief Caller's instruction for whether signalling should trigger a
  *        reschedule on the *local* core.
- *
- * Namespace scope rather than nested in waitable, because the objects that
- * signal are no longer all waitables.
  */
 enum class reschedule_policy
 {
@@ -41,17 +37,7 @@ enum class reschedule_policy
  * barge-free handoff possible. Owns nothing about what is being waited FOR, so
  * both waitable and the mutex compose one rather than sharing a base.
  *
- * NOT API, despite appearing in a public header. A kernel that does not
- * allocate needs by-value members, and a by-value member needs a complete type
- * where its owner is declared, so the name has to be here. Being usable is a
- * separate question, and the answer is no: every member including the
- * constructor is private, and friendship is granted only to the kernel types
- * that own a queue. Outside those, the name can be written and nothing else.
- * The compiler enforces that, not a comment.
- *
- * The alternative, opaque std::byte storage, would hide the name at the cost of
- * placement-new in every owner's constructor, which costs waitable and
- * semaphore their constexpr constructors and moves them out of .bss.
+ * @note Private implementation detail of the kernel. Not a user-facing type!
  */
 class CYROS_PUBLIC wait_queue
 {
@@ -142,7 +128,9 @@ class CYROS_PUBLIC wait_queue
     * unbounded inversion this design exists to prevent. */
    std::atomic<std::uint8_t> bridge_count{0};
 
-   /** @brief Undo a node's bridge contribution. Caller holds the queue lock. */
+   /**
+    * @brief Undo a node's bridge contribution. Caller holds the queue lock.
+    */
    void drop_bridge(wait_node&) noexcept;
 
    // The only types that may drive a queue.
