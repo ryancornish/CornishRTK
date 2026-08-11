@@ -164,6 +164,19 @@ struct thread_control_block
    std::atomic<std::uint8_t> held_mask{0};
    static_assert(max_held_per_thread <= 8, "held_mask is a uint8_t, so at most 8 slots");
 
+   /* The mutex this thread is currently parked on, or nullptr.
+    *
+    * The one edge that makes the wait-for graph walkable FROM a thread. Without
+    * it the only direction available is queue to owner, so a prompt aimed at a
+    * blocked holder has nowhere to go and the far end of a chain is unreachable,
+    * which is why request_repick had to broadcast to every core.
+    *
+    * Published AFTER the node is armed and cleared BEFORE the queue is left, so
+    * it is set exactly while this thread is queued. Atomic because the walk
+    * reads it from other cores. A stale read costs a redundant or a missed
+    * prompt, never a wrong value. */
+   std::atomic<base_mutex*> blocked_on{nullptr};
+
    /* Cross-core requests outstanding against this thread, one bit per type.
     *
     * This is the request itself, not a claim on a slot elsewhere: the TCB is the

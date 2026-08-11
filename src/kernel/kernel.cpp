@@ -227,36 +227,46 @@ void commit_to_block(thread_control_block& tcb)
 
 void request_repick(thread_control_block& tcb)
 {
-   /* A BLOCKED holder cannot act on a prompt, and it is not the thread that
-    * needs one. Its own urgency rose, so the urgency of whatever holds the
-    * resource IT is parked on rose too, and so on down the chain. That is the
-    * transitive case, and the thread at the far end is on a core with no reason
-    * to pick again.
+   /* Prompt every core that could now want to run something different, by
+    * walking the wait-for chain rather than shouting at all of them.
     *
-    * Nothing links a TCB to the resources it is armed on, so the chain cannot be
-    * walked from here. Prompt every core instead. Legitimate because this is a
-    * doorbell: it carries nothing, every core folds its own truth when it picks,
-    * and a core with nothing better to run switches back immediately. Bounded by
-    * core count, and only on the donate-to-a-blocked-holder path.
+    * The donor knows only the holder it failed to CAS against. If that holder is
+    * itself blocked, its urgency rose too, and so did the urgency of whatever
+    * holds the resource IT is parked on, all the way down. The thread that can
+    * actually act is at the far end, and its core has no other reason to pick.
     *
-    * The state read is deliberately lossy. Reading it stale one way costs a few
-    * redundant prompts, the other way costs latency, and neither can be wrong. */
-   if (tcb.state == thread_state::blocked) {
-      auto const this_core = cyros_port_get_core_id();
-      for (std::uint32_t core = 0; core < config::cores; ++core) {
-         if (core == this_core) {
-            cyros_port_pend_reschedule();
-         } else {
-            cyros_port_send_reschedule_ipi(core);
-         }
-      }
-      return;
-   }
+    * blocked_on is what makes that chain walkable. Every read in here is a fact
+    * whose staleness costs a misdirected or a missing prompt and never a wrong
+    * value, so no lock is taken and nothing is retried: a lost prompt is
+    * repaired by the next reschedule on that core, exactly as a doorbell is
+    * allowed to be.
+    *
+    * Every owner met is prompted, not just the last one. That costs at most one
+    * hint per hop and it is what keeps a stale state read from silently dropping
+    * the prompt that mattered. Bounded by the same depth budget the fold uses,
+    * so a wait-for cycle in the application terminates the walk instead of
+    * spinning in it. */
+   auto const this_core = cyros_port_get_core_id();
+   auto* target = &tcb;
 
-   if (tcb.pinned_core == cyros_port_get_core_id()) {
-      cyros_port_pend_reschedule();
-   } else {
-      cyros_port_send_reschedule_ipi(tcb.pinned_core);
+   for (unsigned hop = 0; hop < max_inheritance_depth; ++hop) {
+      if (target->pinned_core == this_core) {
+         cyros_port_pend_reschedule();
+      } else {
+         cyros_port_send_reschedule_ipi(target->pinned_core);
+      }
+
+      // Only a blocked holder has somewhere further to pass this on. Anything
+      // else can act on the prompt itself once its core picks.
+      if (target->state != thread_state::blocked) return;
+
+      auto* const next_resource = target->blocked_on.load(std::memory_order_acquire);
+      if (next_resource == nullptr) return;
+
+      auto* const next = waitable_access::holder_of(*next_resource);
+      if (next == nullptr || next == target) return;
+
+      target = next;
    }
 }
 

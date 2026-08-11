@@ -150,7 +150,14 @@ void base_mutex::lock() noexcept
       CYROS_ASSERT(owner.load(std::memory_order_relaxed) != &tcb); // owner queued on itself
       queue.arm(node);
 
+      // Publish the wait-for edge AFTER arming and BEFORE polling, so it is set
+      // exactly while we are queued. A prompt walk that reaches us can then
+      // follow it to whoever holds this resource, which is what lets a
+      // transitive donation reach the far end of a chain without broadcasting.
+      tcb.blocked_on.store(this, std::memory_order_release);
+
       if (acquire_condition(tcb)) {
+         tcb.blocked_on.store(nullptr, std::memory_order_release);
          tcb.disposition = thread_disposition::none;
          // Leave our own queue immediately. An owner still armed in its own
          // resource's queue is a cycle in the wait-for graph, and the fold would
@@ -165,6 +172,7 @@ void base_mutex::lock() noexcept
       // once something readies us, which for a mutex means a handover.
       thread_action::commit_to_block(tcb);
       queue.disarm(node);
+      tcb.blocked_on.store(nullptr, std::memory_order_release);
 
       // Recognise a handover BEFORE looping, so an owner never re-arms on its
       // own queue. That is not just tidiness: an owner sitting in its own wait

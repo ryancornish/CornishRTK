@@ -41,6 +41,13 @@ struct waitable_access
       return w.queue.top(depth);
    }
 
+   /// Who holds this resource right now, for the prompt walk. Lossy by nature:
+   /// a stale answer costs a misdirected hint and never a wrong value.
+   [[nodiscard]] static thread_control_block* holder_of(base_mutex const& w) noexcept
+   {
+      return w.owner.load(std::memory_order_acquire);
+   }
+
 };
 
 class wait_node_vector
