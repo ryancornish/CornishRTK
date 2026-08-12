@@ -1322,3 +1322,201 @@ TEST_F(SyncMutexPiDerived_Test,
       kernel::finalise();
    }
 }
+
+
+/* ============================================================================
+ * A ceiling lock must not CUT a transitive chain that passes through it
+ *
+ * The sibling test above proves a ceiling boosts its holder with no waiter
+ * present. This one asks the harder question: what does a ceiling lock
+ * contribute when the thread waiting on it is itself boosted from somewhere
+ * else?
+ *
+ * Chain: U -> M (held by W) -> W -> C (held by H) -> H, where C is a cemutex
+ * and M is an ordinary inheritance mutex.
+ *
+ *   H  base 5, core0   holds C, ceiling 2
+ *   X  base 1, core0   CPU-bound, never blocks, released on cue
+ *   W  base 4, core1   holds M, then parks on C, so it is a BRIDGE on C's queue
+ *   U  base 0, core2   parks on M, lifting W to urgency 0
+ *
+ * The two candidate answers for H's urgency differ, and X sits between them:
+ *
+ *   contribution = ceiling                  -> H is 2, and X at 1 preempts it
+ *   contribution = min(ceiling, queue top)  -> H is 0, and X cannot
+ *
+ * Note what the ceiling contract can and cannot see here. It requires the
+ * ceiling to be at least as urgent as every thread that LOCKS the resource,
+ * and both lockers satisfy it, 2 <= 4 and 2 <= 5. U is the thread whose
+ * urgency goes missing and U never touches C at all, so no assert on any
+ * acquire path is a party to this. That is why it has to be a test.
+ *
+ * The observation is deliberately the negative one, X failing to run, so the
+ * control matters: after H releases, X MUST run. Otherwise "X never ran" could
+ * mean the wake was simply lost and the test would be vacuous. Stage 5 catches
+ * that.
+ *
+ * Every gate is set from a different core than the thread waiting on it, and H
+ * holds its core until the driver releases it rather than terminating, because
+ * thread teardown reschedules and would hand X the core for free. That is the
+ * lesson the sibling test above paid for.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenAChainThroughACeilingLock_WhenTheFarWaiterIsBoosted_ThenTheCeilingHolderStillOutranksIt)
+{
+   constexpr int reps = 20;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 6> stacks{};
+
+      struct state
+      {
+         sync::cemutex c{thread::priority(2)};  // held by H, wanted by W
+         mutex m;                               // held by W, wanted by U
+         sync::semaphore x_gate{0};
+         std::atomic<bool> h_holds{false};      // H owns C
+         std::atomic<bool> w_parked{false};     // witness saw W park on C
+         std::atomic<bool> x_ran{false};        // the spinner got core0
+         std::atomic<bool> finish_h{false};     // driver releases H's critical section
+         std::atomic<bool> cs_done{false};      // H left its critical section
+         std::atomic<bool> stop_all{false};
+         std::atomic<int>  failed_stage{0};
+         std::atomic<int>  h_urgency{-1};
+         std::atomic<int>  w_urgency{-1};
+         thread* h{nullptr};
+         thread* w{nullptr};
+      };
+      state s;
+
+      // H: take the ceiling lock and stay inside the critical section. Only the
+      // urgency it holds while in there decides whether X can take the core.
+      thread h(
+         [&s]{
+            s.c.lock();
+            s.h_holds.store(true, std::memory_order_release);
+
+            while (!s.finish_h.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.cs_done.store(true, std::memory_order_release);
+            s.c.unlock();
+
+            // Back at base 5. Stay alive so the run does not end here.
+            while (!s.stop_all.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[0].bytes, thread::priority(5), core0);
+      s.h = &h;
+
+      // X: better base priority than the ceiling, so it decides the question.
+      // Blocks first so H can take C uncontended.
+      thread x(
+         [&s]{
+            s.x_gate.acquire();
+            s.x_ran.store(true, std::memory_order_release);
+            while (!s.stop_all.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[1].bytes, thread::priority(1), core0);
+
+      // W: the middle link. Holds M, then parks on C, which makes it a bridge
+      // on C's queue and the thing a correct fold has to look at.
+      thread w(
+         [&s]{
+            s.m.lock();
+            while (!s.h_holds.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.c.lock();      // parks behind H
+            s.c.unlock();
+            s.m.unlock();
+         },
+         stacks[2].bytes, thread::priority(4), core1);
+      s.w = &w;
+
+      // Witness on W's core, worse base priority, so it runs only once W has
+      // actually parked on C.
+      thread witness(
+         [&s]{
+            s.w_parked.store(true, std::memory_order_release);
+         },
+         stacks[3].bytes, thread::priority(6), core1);
+
+      // U: the source of the urgency that must reach H. Never touches C.
+      thread u(
+         [&s]{
+            while (!s.w_parked.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+            s.m.lock();     // lifts W to 0, which must reach H through C
+            s.m.unlock();
+         },
+         stacks[4].bytes, thread::priority(0), core2);
+
+      thread driver(
+         [&s]{
+            if (!bounded_poll([&]{ return s.h_holds.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(1, std::memory_order_release);
+            } else if (!bounded_poll([&]{ return s.w_parked.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(2, std::memory_order_release);
+            } else if (!bounded_poll([&]{ return s.w->get_priority() == 0; })) {
+               // W must be boosted BEFORE X is released, or the question is not
+               // being asked. This is U's donation arriving at the middle link.
+               s.w_urgency.store(s.w->get_priority(), std::memory_order_release);
+               s.failed_stage.store(3, std::memory_order_release);
+            } else {
+               // The chain now exists in full. Admit X and see who core0 keeps.
+               s.x_gate.release();
+
+               // Short on purpose: in the passing case this MUST exhaust, and it
+               // only has to outlast a cross-core admit, which is microseconds.
+               if (bounded_poll([&]{ return s.x_ran.load(std::memory_order_acquire); },
+                                short_poll_budget)) {
+                  s.h_urgency.store(s.h->get_priority(), std::memory_order_release);
+                  s.w_urgency.store(s.w->get_priority(), std::memory_order_release);
+                  s.failed_stage.store(4, std::memory_order_release);
+               }
+            }
+
+            // Release H either way so the kernel can quiesce.
+            s.finish_h.store(true, std::memory_order_release);
+            (void)bounded_poll([&]{ return s.cs_done.load(std::memory_order_acquire); });
+
+            // Control: X must run once the ceiling lock is released. Without
+            // this, "X never ran" would also be satisfied by a lost wake.
+            if (s.failed_stage.load(std::memory_order_acquire) == 0
+                && !bounded_poll([&]{ return s.x_ran.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(5, std::memory_order_release);
+            }
+
+            s.stop_all.store(true, std::memory_order_release);
+         },
+         stacks[5].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "H never took the ceiling lock";
+      EXPECT_NE(s.failed_stage.load(), 2) << "W never parked on the ceiling lock";
+      EXPECT_NE(s.failed_stage.load(), 3)
+         << "the donation never reached the middle link, so the chain under test "
+            "was never formed. W reported urgency " << s.w_urgency.load()
+         << ", expected 0";
+      EXPECT_NE(s.failed_stage.load(), 4)
+         << "a base-1 spinner preempted the ceiling holder while a chain through "
+            "the ceiling lock should have lifted it to 0. H reported urgency "
+         << s.h_urgency.load() << " and W reported " << s.w_urgency.load()
+         << " (H at 2 means the ceiling contribution ignored its own queue and "
+            "cut the chain, which is an under-report)";
+      EXPECT_NE(s.failed_stage.load(), 5)
+         << "the spinner never ran even after the ceiling lock was released, so "
+            "the negative observation above proved nothing";
+
+      kernel::finalise();
+   }
+}

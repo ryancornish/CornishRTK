@@ -351,12 +351,69 @@ static std::array const owned_signals = std::to_array<owned_signal>({
 });
 
 /**
- * @brief Does this core's current depth state call for @p s to be blocked?
+ * @brief Does the given depth state call for @p s to be blocked?
+ *
+ * Takes the depths rather than reading them, so a raise path can ask what the
+ * mask will need to be a moment before it needs it. That is the whole reason
+ * this is parameterised: see the ordering rule on block_for().
+ *
+ * Monotone non-decreasing in both depths, which is what makes a raise able to
+ * add blocks and never need to remove one.
+ */
+static bool should_block(owned_signal const& s, unsigned interrupt_depth, unsigned preempt_depth)
+{
+   if (interrupt_depth > 0) return true;
+   return s.gated_by_preempt && preempt_depth > 0;
+}
+
+/**
+ * @brief Does this core's CURRENT depth state call for @p s to be blocked?
  */
 static bool should_block(owned_signal const& s)
 {
-   if (current_core.interrupt_disable_depth > 0) return true;
-   return s.gated_by_preempt && current_core.preempt_disable_depth > 0;
+   return should_block(s, current_core.interrupt_disable_depth,
+                       current_core.preempt_disable_depth);
+}
+
+/**
+ * @brief Tighten the mask to what @p interrupt_depth / @p preempt_depth call for.
+ *
+ * The RAISE half of the mask model, and the counterpart to apply_mask(). Callers
+ * pass the depths they are ABOUT TO HAVE, then raise them.
+ *
+ * Only ever adds blocks, because should_block() is monotone in both depths, so
+ * a raise can never need an unblock. That is why one SIG_BLOCK is the whole
+ * operation, and why apply_mask() is not needed afterwards: the mask this
+ * installs already IS what apply_mask() would derive once the depth is raised.
+ *
+ * ORDERING RULE, and the reason this function exists at all. The mask may be
+ * MORE restrictive than the depths for an instant, never less. So:
+ *
+ *    raise:   tighten the mask, THEN raise the depth   (here)
+ *    lower:   lower the depth,  THEN loosen the mask   (apply_mask, restores)
+ *
+ * Both leave the same safe skew, a moment where a signal is blocked that the
+ * counters do not yet or no longer require. The opposite skew is a live defect:
+ * `depth++` followed by apply_mask() leaves an interval where the counters say
+ * the region is protected and the signal is still deliverable, and a reschedule
+ * landing there captures the thread with the depth raised and its frame's mask
+ * open. cross-core-defects.md 8.7d has the probe output, p=1 at handler entry
+ * with frame_blk=0, and 8.7e has why the naive reorder cannot fix it.
+ */
+static void block_for(unsigned interrupt_depth, unsigned preempt_depth)
+{
+   sigset_t block;
+   sigemptyset(&block);
+
+   bool any = false;
+   for (auto const& s : owned_signals) {
+      if (should_block(s, interrupt_depth, preempt_depth)) {
+         sigaddset(&block, s.signo);
+         any = true;
+      }
+   }
+
+   if (any) pthread_sigmask(SIG_BLOCK, &block, nullptr);
 }
 
 /**
@@ -368,34 +425,10 @@ static bool should_block(owned_signal const& s)
  * having to read the mask back first. Blocks before unblocking so no owned signal
  * is transiently deliverable, and skips a syscall for an empty set so a
  * transition still costs the one call it always did.
+ *
+ * The LOWERING half of the model. Raising paths use block_for() instead, which
+ * can answer for a depth state that is not the current one.
  */
-/**
- * @brief Block every owned signal, unconditionally.
- *
- * Used by the two RAISE paths before they touch a depth. Raising a depth can
- * only ever ADD blocks, never remove one, so pre-blocking is always a superset
- * of the state apply_mask() is about to derive and settles to it immediately
- * after.
- *
- * This closes a real window. `depth++` followed by apply_mask() leaves an
- * interval where the counters say the region is protected and the signal is
- * still deliverable, and a reschedule landing there captures the thread with
- * the depth raised and its frame's mask open. That capture is what
- * cross-core-defects.md 8.7d observed: p=1 at handler entry with frame_blk=0.
- *
- * The rule the two directions share: the mask may be MORE restrictive than the
- * depths for an instant, never less. So tighten the mask before raising a
- * depth, and lower a depth before loosening the mask, which is what the restore
- * paths already do.
- */
-static void block_owned_signals()
-{
-   sigset_t all;
-   sigemptyset(&all);
-   for (auto const& s : owned_signals) sigaddset(&all, s.signo);
-   pthread_sigmask(SIG_BLOCK, &all, nullptr);
-}
-
 static void apply_mask()
 {
    sigset_t block;
@@ -482,8 +515,16 @@ static void assert_mask_matches_depths()
  */
 static void enter_dormant_region()
 {
-   current_core.interrupt_disable_depth++;
-   apply_mask();
+   // A raise, so it obeys the same ordering rule as the public raise paths:
+   // tighten first, then raise into it. Every call site today happens to arrive
+   // with the mask already at least this restrictive (a spawned core inherits
+   // the dormant mask, and the shutdown resume is left blocked), so the old
+   // raise-then-apply order was safe here incidentally rather than by the rule.
+   // Spelling it the same way as the others removes a trap for the next call
+   // site, which may not arrive already masked.
+   block_for(current_core.interrupt_disable_depth + 1,
+             current_core.preempt_disable_depth);
+   ++current_core.interrupt_disable_depth;
    assert_mask_matches_depths();
 }
 
@@ -799,9 +840,12 @@ cyros_mask_token_t cyros_port_irq_save(void)
    // only on this port: the depth raised below is what decides the mask.
    cyros_mask_token_t const token = deliverable_token();
 
-   block_owned_signals(); // BEFORE the depth, see block_owned_signals
-   current_core.interrupt_disable_depth++;
-   apply_mask();
+   // Tighten to what the raised depth calls for, THEN raise into it. Do not
+   // fold the two together: block_for(..., ++depth) sequences the increment
+   // BEFORE the syscall and re-opens the very window this closes.
+   block_for(current_core.interrupt_disable_depth + 1,
+             current_core.preempt_disable_depth);
+   ++current_core.interrupt_disable_depth;
    return token;
 }
 
@@ -831,9 +875,11 @@ cyros_mask_token_t cyros_port_preempt_disable(void)
 
    cyros_mask_token_t const token = deliverable_token();
 
-   block_owned_signals(); // BEFORE the depth, see block_owned_signals
-   current_core.preempt_disable_depth++;
-   apply_mask();
+   // Tighten first, then raise into it. See the ordering rule on block_for,
+   // and note the increment must stay a separate statement.
+   block_for(current_core.interrupt_disable_depth,
+             current_core.preempt_disable_depth + 1);
+   ++current_core.preempt_disable_depth;
    return token;
 }
 
