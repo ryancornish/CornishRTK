@@ -32,6 +32,7 @@
  * different core.
  * ========================================================================= */
 
+#include <cyros/sync/cemutex.hpp>
 #include <cyros/sync/mutex.hpp>
 #include <cyros/sync/semaphore.hpp>
 #include <cyros/kernel/kernel.hpp>
@@ -1187,6 +1188,136 @@ TEST_F(SyncMutexPiDerived_Test,
          << s.b_urgency.load()
          << " (C at 1 means the fold is right and the walk stopped at a "
             "not-yet-blocked B)";
+
+      kernel::finalise();
+   }
+}
+
+
+/* ============================================================================
+ * A ceiling boosts on an UNCONTENDED acquire, which is the whole difference
+ *
+ * Inheritance cannot do this. It has nothing to inherit from until a waiter
+ * arrives, so a holder runs at its base priority until it is already blocking
+ * somebody, and the inversion is repaired rather than prevented. A ceiling
+ * raises the holder the moment it takes the lock, so the thread that would have
+ * caused the inversion never gets to run in the critical section at all.
+ *
+ * The observation is deliberately of the SAME shape as the busy-spinner tests
+ * above, so the two protocols can be read side by side:
+ *
+ *   H, base 5 on core0, takes a cemutex with ceiling 2 and never contends
+ *   N, base 3 on core0, a CPU-bound spinner released once H holds the lock
+ *
+ * With inheritance H sits at 5, N at 3 wins every pick, and H does not run
+ * again until N stops. With the ceiling H is at 2 from the moment it acquires,
+ * so N cannot take the core at all while the lock is held. No third thread and
+ * no waiter is involved, which is the point: nothing donates anything here.
+ *
+ * The release half is asserted too, and it is the part most likely to regress.
+ * A ceiling release drops urgency with no waiter to wake, so nothing pends a
+ * reschedule unless the release does it explicitly. Without that prompt N stays
+ * ready behind a thread that is no longer boosted, on a tickless build, forever.
+ * ========================================================================= */
+TEST_F(SyncMutexPiDerived_Test,
+       GivenACeilingLockTakenUncontended_WhenASpinnerIsReleased_ThenItCannotPreemptTheHolder)
+{
+   constexpr int reps = 20;
+
+   for (int rep = 0; rep < reps; ++rep) {
+      SCOPED_TRACE("rep " + std::to_string(rep));
+
+      kernel::initialise();
+
+      static std::array<aligned_stack, 3> stacks{};
+
+      struct state
+      {
+         sync::cemutex m{thread::priority(2)};
+         sync::semaphore n_gate{0};
+         std::atomic<bool> spinner_ran{false};   // N got the core
+         std::atomic<bool> cs_done{false};       // H finished its critical section
+         std::atomic<bool> preempted_in_cs{false};
+         std::atomic<bool> n_ran_after{false};   // N got the core AFTER the release
+         std::atomic<bool> stop_spinner{false};
+         std::atomic<int>  failed_stage{0};
+      };
+      state s;
+
+      thread h(
+         [&s]{
+            s.m.lock();
+
+            // N becomes runnable here and outranks our BASE priority. Only the
+            // ceiling keeps us on the core.
+            s.n_gate.release();
+            for (std::uint32_t i = 0; i < 200000; ++i) {
+               cyros_port_cpu_relax();
+            }
+            s.preempted_in_cs.store(s.spinner_ran.load(std::memory_order_acquire),
+                                    std::memory_order_release);
+            s.cs_done.store(true, std::memory_order_release);
+
+            s.m.unlock();   // urgency drops to 5, N must now take the core
+
+            // Spin at base priority. If the release prompted a reschedule, N
+            // runs and sets its flag while we are still here.
+            /* Stay alive at base priority until the driver says stop, and
+             * spin on nothing else.
+             *
+             * Load-bearing for the second assertion. If this waited on
+             * n_ran_after instead, then when no prompt is issued the loop would
+             * simply run out, H would TERMINATE, and the exit itself
+             * reschedules and lets N run. The test would pass with the prompt
+             * removed, which it did on the first attempt. Holding the core
+             * until told otherwise means the only thing that can hand it to N
+             * is the release prompt. */
+            while (!s.stop_spinner.load(std::memory_order_acquire)) {
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[0].bytes, thread::priority(5), core0);
+
+      thread n(
+         [&s]{
+            s.n_gate.acquire();
+            s.spinner_ran.store(true, std::memory_order_release);
+            if (s.cs_done.load(std::memory_order_acquire)) {
+               s.n_ran_after.store(true, std::memory_order_release);
+            }
+            while (!s.stop_spinner.load(std::memory_order_acquire)) {
+               s.n_ran_after.store(true, std::memory_order_release);
+               cyros_port_cpu_relax();
+            }
+         },
+         stacks[1].bytes, thread::priority(3), core0);
+
+      thread driver(
+         [&s]{
+            if (!bounded_poll([&]{ return s.cs_done.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(1, std::memory_order_release);
+               s.stop_spinner.store(true, std::memory_order_release);
+               return;
+            }
+            if (!bounded_poll([&]{ return s.n_ran_after.load(std::memory_order_acquire); })) {
+               s.failed_stage.store(2, std::memory_order_release);
+            }
+            // Unconditional: on success N owns core0 and H is back at base
+            // priority, so H can never run to stop it. The driver is the only
+            // thread left that can.
+            s.stop_spinner.store(true, std::memory_order_release);
+         },
+         stacks[2].bytes, thread::priority(0), core3);
+
+      kernel::start();
+
+      EXPECT_NE(s.failed_stage.load(), 1) << "the ceiling holder never finished its critical section";
+      EXPECT_FALSE(s.preempted_in_cs.load())
+         << "a base-3 spinner preempted a ceiling-2 holder inside its critical section, "
+            "so the ceiling did not apply on an uncontended acquire";
+      EXPECT_NE(s.failed_stage.load(), 2)
+         << "the spinner never ran after the ceiling was released, so the release "
+            "dropped urgency without prompting a reschedule";
 
       kernel::finalise();
    }

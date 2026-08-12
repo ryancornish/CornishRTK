@@ -34,16 +34,22 @@ namespace cyros
  * ========================================================================= */
 struct waitable_access
 {
-   /// Best queued waiter's urgency for a held PI resource. Takes the queue lock
-   /// when that queue has bridges on it: see thread_action::urgency_at. The
-   /// owner WORD is passed down, not its value, so the fold reads it under the
-   /// queue lock and never recurses into the queue's own owner, which is
-   /// transiently also an armed waiter in it. Passing a value read here was
-   /// wrong: it could go stale against a handover and then exclude the
-   /// ex-owner re-armed as a legitimate bridge, an under-report. The note on
-   /// wait_queue::top has the full argument.
-   [[nodiscard]] static std::uint8_t queue_top(base_mutex const& w, unsigned depth) noexcept
+   /// What a held resource contributes to its holder's urgency. THE variation
+   /// point between the inversion protocols, and the only one.
+   ///
+   /// Ceiling answers a constant and reads no queue at all, which is the whole
+   /// reason the protocol is nearly free under derived urgency: the boost is
+   /// known at construction and applies from the moment the resource is filed
+   /// in held_slots. A ceiling below some locker's base priority would make
+   /// this an UNDER-report, so base_mutex asserts that contract on every
+   /// acquire rather than paying a queue read here to paper over it.
+   ///
+   /// Inheritance answers the queue's best waiter. The owner word is passed
+   /// down rather than its value, so the fold reads it under the queue lock and
+   /// never recurses into the queue's own owner: see wait_queue::top.
+   [[nodiscard]] static std::uint8_t urgency_contribution(base_mutex const& w, unsigned depth) noexcept
    {
+      if (w.uses_ceiling()) return w.ceiling_priority;
       return w.queue.top(w.owner, depth);
    }
 

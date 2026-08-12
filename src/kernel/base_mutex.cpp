@@ -124,9 +124,26 @@ bool base_mutex::acquire_condition(thread_control_block& tcb) noexcept
    return false;
 }
 
+/**
+ * @brief Enforce the ceiling contract, on every path that can acquire.
+ *
+ * A ceiling less urgent than the acquirer's own base priority is not a tuning
+ * mistake, it is the protocol inverted: the holder would run BELOW a thread
+ * that can be blocked by it, which is the exact inversion the ceiling exists to
+ * prevent. Caught here rather than absorbed by folding the queue as well,
+ * because absorbing it would hide the misconfiguration and cost every ceiling
+ * acquire a queue read. POSIX rejects the same case with EINVAL.
+ */
+void base_mutex::check_ceiling_contract(thread_control_block const& tcb) const noexcept
+{
+   if (!uses_ceiling()) return;
+   CYROS_ASSERT_OP(ceiling_priority, <=, tcb.base_priority); // ceiling below locker
+}
+
 bool base_mutex::try_lock() noexcept
 {
    auto& tcb = thread_action::get_current_thread_on_this_core();
+   check_ceiling_contract(tcb);
 
    thread_control_block* expected = nullptr;
    if (!owner.compare_exchange_strong(expected, &tcb, std::memory_order_acq_rel)) {
@@ -139,6 +156,7 @@ bool base_mutex::try_lock() noexcept
 void base_mutex::lock() noexcept
 {
    auto& tcb = thread_action::get_current_thread_on_this_core();
+   check_ceiling_contract(tcb);
 
    wait_queue::wait_node node{};
    node.owner = &tcb;
@@ -206,6 +224,23 @@ void base_mutex::unlock(reschedule_policy policy) noexcept
    }
 
    hand_over(policy);
+
+   /* A ceiling release needs a prompt that an inheritance release does not.
+    *
+    * Inheritance only ever boosts under contention, so a release with no waiter
+    * never boosted us and there is nothing to give back. A ceiling boosts on an
+    * UNCONTENDED acquire, so releasing it can drop our urgency with no waiter to
+    * wake and therefore nothing to pend a reschedule. A thread that was held off
+    * by the ceiling would then sit ready behind us until some unrelated
+    * reschedule arrived, which on a tickless build may be never.
+    *
+    * Unconditional rather than conditional on having actually been preempted:
+    * the pend coalesces, and the alternative is reconstructing what the ceiling
+    * held off, which is exactly the cached-derived-value shape this design
+    * refuses. */
+   if (uses_ceiling() && policy != reschedule_policy::never) {
+      cyros_port_pend_reschedule();
+   }
 }
 
 /**

@@ -108,9 +108,19 @@ class CYROS_PUBLIC wait_queue
     *        is the acquire-window self-cycle and nothing else. A value read
     *        before the lock can go stale against exactly that handover, and
     *        the ex-owner can re-arm as a legitimate bridge behind it, which
-    *        the stale exclusion would then skip, an UNDER-report. The lock-free
-    *        CAS take is the one owner transition outside this lock, and racing
-    *        it only misses the exclusion, the safe over-boost direction.
+    *        the stale exclusion would then skip, an UNDER-report.
+    *
+    *        The lock-free CAS take is the one owner transition outside this
+    *        lock, and racing it is UNREACHABLE rather than merely benign. A
+    *        fold arrives at a queue only through waitable_access::queue_top,
+    *        whose sole caller walks a thread's held_slots, and a mutex is filed
+    *        there only by claim_slot, called either after the CAS that made the
+    *        owner or from the handover commit under this lock. So anything able
+    *        to consult this queue already observes the owner word set. Stated
+    *        as unreachable on purpose: calling it "the safe over-boost
+    *        direction" would repeat the mistake this parameter exists to fix,
+    *        since a fabricated 0 is unsafe for a RUNNING thread and the
+    *        acquirer here is running. Principle 8.
     * @param depth Remaining recursion budget. A wait-for cycle means the
     *        application has deadlocked; the budget stops the kernel following it
     *        forever and the answer is then conservative rather than wrong.

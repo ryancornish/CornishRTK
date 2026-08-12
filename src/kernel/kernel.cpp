@@ -122,7 +122,7 @@ inline constexpr unsigned max_inheritance_depth = 8;
 
       auto* held = target.held_slots[slot].load(std::memory_order_acquire);
       if (held == nullptr) continue; // bit was stale, see the ordering note on held_mask
-      floor = std::min(waitable_access::queue_top(*held, depth), floor);
+      floor = std::min(waitable_access::urgency_contribution(*held, depth), floor);
    }
    return floor;
 }

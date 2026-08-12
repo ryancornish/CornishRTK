@@ -103,6 +103,8 @@
 
 #include "gtest/gtest.h"
 
+#include <chrono>
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -158,7 +160,19 @@ struct chain_result
    bool          restored{false};      // every holder returned to its base
    std::uint64_t propagate_spins{0};   // proxy for end-to-end propagation latency
    std::uint8_t  worst_observed{0};    // least urgent priority seen at the check
+
+   /* Cost of ONE urgency fold, nanoseconds, measured while the chain is fully
+    * formed and every participant is parked, so the queue locks are uncontended.
+    * deep_ns folds the whole chain (the deepest holder, one queue lock and one
+    * recursion per link). flat_ns is the same call on a thread holding nothing,
+    * which is the overwhelmingly common case and the pick's old cost. */
+   double        deep_ns{0.0};
+   double        flat_ns{0.0};
 };
+
+/* Kept out of the optimiser's reach. get_priority is [[nodiscard]] and lives
+ * out of line, but the loop below is otherwise dead code. */
+std::atomic<unsigned> fold_sink{0};
 
 /**
  * @brief Build a depth-D chain, donate once at the top, observe the far end.
@@ -172,7 +186,8 @@ struct chain_result
  * lock per link. A budget tuned for a depth-3 chain, spent on a depth-10 one,
  * turns a failing assertion into a 60-second timeout, which is the failure mode
  * this suite least wants. */
-chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll_budget) noexcept
+chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll_budget,
+                       bool measure_fold = false) noexcept
 {
    chain_result result{};
 
@@ -207,6 +222,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
       std::array<thread*, over_budget_depth> holder{};
       std::size_t                    depth{0};
       std::uint64_t                  budget{chain_poll_budget};
+      bool                           measure{false};
       chain_result*                  out{nullptr};
    };
    static state s;
@@ -215,6 +231,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
    s.f      = &*fx;
    s.depth  = depth;
    s.budget = poll_budget;
+   s.measure = measure_fold;
    s.out    = &result;
 
    // holder[0] is the deepest and least urgent. Urgent is 1, conductor 0.
@@ -301,6 +318,33 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
          };
          r.propagate_spins = poll_counting(s.budget, all_urgent);
          r.propagated      = (r.propagate_spins != 0);
+
+         /* Cost of the fold, measured here because the chain is formed, fully
+          * propagated and completely parked, so nothing contends the queue
+          * locks. This is the pick's new term: pick_next folds urgency for
+          * every holder on its core, and holder[0]'s fold is the worst case
+          * because it walks every link. */
+         if (r.propagated && s.measure) {
+            constexpr int fold_samples = 2000;
+            unsigned sink = 0;
+
+            auto const t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < fold_samples; ++i) {
+               sink += static_cast<unsigned>(s.holder[0]->get_priority());
+            }
+            auto const t1 = std::chrono::steady_clock::now();
+
+            // Same call on a thread holding nothing: the fast path, one load
+            // and a compare, and what the pick cost before any of this.
+            for (int i = 0; i < fold_samples; ++i) {
+               sink += static_cast<unsigned>(this_thread::priority());
+            }
+            auto const t2 = std::chrono::steady_clock::now();
+
+            fold_sink.fetch_add(sink, std::memory_order_relaxed);
+            r.deep_ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / fold_samples;
+            r.flat_ns = std::chrono::duration<double, std::nano>(t2 - t1).count() / fold_samples;
+         }
 
          // How far the chase actually got. On failure this says which link it
          // died at, which is the useful number.
@@ -420,6 +464,85 @@ TEST_F(SyncMutexPiChain_Test, GivenRepeatedShallowChains_WhenDonatingManyTimes_T
  * plus a reschedule, so expect roughly linear growth. Under derived urgency the
  * same measurement prices the recursive fold instead.
  * ========================================================================= */
+
+/* ============================================================================
+ * What one urgency fold costs, as a function of chain depth
+ *
+ * The pick used to be a bitmap scan. It is now a bitmap scan plus, for every
+ * holder ready on that core, a fold that can take a queue spinlock and recurse
+ * once per link, all inside the retire-and-pick critical section with local
+ * interrupts disabled. cross-core-defects.md 8.2 states that bound. This
+ * measures it, because principle 5 asks for a number and a stated bound is not
+ * a measured one.
+ *
+ * Reports two columns. FLAT is a thread holding nothing, which is the fast path
+ * and 98.9 percent of picks. DEEP is the chain's deepest holder, whose fold
+ * walks every link and is the worst case the depth budget permits.
+ *
+ * Measured with the whole chain parked, so the locks are UNCONTENDED. That is
+ * the floor, not the ceiling: a fold racing other cores on the same queues pays
+ * more. Report it as such.
+ *
+ * Measurement only, no assertion, so it stays disabled and is run deliberately:
+ *   ./test_sync_mutex --gtest_also_run_disabled_tests --gtest_filter='*FoldCost*'
+ * ========================================================================= */
+TEST_F(SyncMutexPiChain_Test, DISABLED_GivenIncreasingDepth_WhenFoldingUrgency_ThenReportFoldCost)
+{
+   constexpr int rounds_per_depth = 25;
+
+   std::fprintf(stderr,
+      "\ndepth | samples | flat ns | deep ns | per-link ns\n");
+   std::fprintf(stderr,
+      "------|---------|---------|---------|------------\n");
+
+   double flat_at_two = 0.0;
+   double deep_at_two = 0.0;
+
+   for (std::size_t depth = 2; depth <= max_depth; ++depth) {
+      double flat_sum = 0.0;
+      double deep_sum = 0.0;
+      int    ok       = 0;
+
+      for (int round = 0; round < rounds_per_depth; ++round) {
+         kernel::initialise();
+         auto const r = run_chain(depth, chain_poll_budget, /*measure_fold=*/true);
+         if (r.propagated && r.deep_ns > 0.0) {
+            flat_sum += r.flat_ns;
+            deep_sum += r.deep_ns;
+            ++ok;
+         }
+      }
+
+      if (ok == 0) {
+         std::fprintf(stderr, "%5zu | %7d |       - |       - |           -\n", depth, ok);
+         continue;
+      }
+
+      double const flat = flat_sum / ok;
+      double const deep = deep_sum / ok;
+      if (depth == 2) {
+         flat_at_two = flat;
+         deep_at_two = deep;
+      }
+      // Slope from depth 2, which is the marginal cost of one more link.
+      double const per_link = (depth > 2)
+         ? (deep - deep_at_two) / static_cast<double>(depth - 2)
+         : 0.0;
+
+      std::fprintf(stderr, "%5zu | %7d | %7.1f | %7.1f | %11.1f\n",
+                   depth, ok, flat, deep, per_link);
+   }
+
+   std::fprintf(stderr,
+      "\nflat is a thread holding nothing (the common pick). deep folds the whole\n"
+      "chain. Uncontended: every participant is parked while this is measured.\n");
+   if (flat_at_two > 0.0) {
+      std::fprintf(stderr, "ratio deep(2)/flat = %.1fx\n", deep_at_two / flat_at_two);
+   }
+   std::fflush(stderr);
+
+   SUCCEED() << "measurement only, see the table on stderr";
+}
 
 TEST_F(SyncMutexPiChain_Test, DISABLED_GivenIncreasingDepth_WhenMeasuringPropagation_ThenReportCostCurve)
 {

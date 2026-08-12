@@ -71,13 +71,44 @@ public:
 
 protected:
    ~base_mutex();
+
+   /// Priority inheritance: contribute the best waiter's urgency.
    constexpr base_mutex() noexcept = default;
+
+   /**
+    * @brief Priority ceiling: contribute @p ceiling for as long as it is held.
+    *
+    * Immediate ceiling, the POSIX PTHREAD_PRIO_PROTECT shape. The boost applies
+    * on acquisition whether or not anyone is waiting, which is what prevents the
+    * inversion rather than repairing it afterwards.
+    *
+    * @param ceiling Must be at least as urgent (numerically <=) as the base
+    *        priority of every thread that can lock this. Asserted on each
+    *        acquire, since a ceiling below a locker's priority silently
+    *        reintroduces the inversion the protocol exists to prevent. POSIX
+    *        rejects the same misconfiguration with EINVAL.
+    */
+   constexpr explicit base_mutex(std::uint8_t ceiling) noexcept : ceiling_priority(ceiling) {}
 
 private:
    wait_queue queue;
    std::atomic<thread_control_block*> owner{nullptr};
 
    static constexpr std::uint8_t not_held = 0xFFu;
+
+   /* The inversion protocol, and the only thing that differs between the mutex
+    * types built on this. The fold asks a held resource one question, what do
+    * you contribute to your holder's urgency, and this is the whole answer:
+    * a constant for ceiling, the queue's best waiter for inheritance.
+    *
+    * Fixed at construction, so it is immutable and needs no atomic. */
+   static constexpr std::uint8_t no_ceiling = 0xFFu;
+   std::uint8_t const ceiling_priority{no_ceiling};
+
+   [[nodiscard]] constexpr bool uses_ceiling() const noexcept
+   {
+      return ceiling_priority != no_ceiling;
+   }
 
    /* Index of this resource's slot in its owner's held_slots, or not_held.
     * Written from two contexts on two cores, the owner registering under its
@@ -95,6 +126,8 @@ private:
    void retire_held(thread_control_block& tcb) noexcept;
 
    void register_held(thread_control_block& tcb) noexcept;
+
+   void check_ceiling_contract(thread_control_block const& tcb) const noexcept;
 
    bool acquire_condition(thread_control_block& tcb) noexcept;
 

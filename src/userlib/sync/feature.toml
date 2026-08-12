@@ -11,6 +11,7 @@ sources = [
 
 public_headers = [
   "public_headers/mutex.hpp -> cyros/sync/mutex.hpp",
+  "public_headers/cemutex.hpp -> cyros/sync/cemutex.hpp",
   "public_headers/semaphore.hpp -> cyros/sync/semaphore.hpp",
 ]
 
