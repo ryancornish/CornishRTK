@@ -369,6 +369,33 @@ static bool should_block(owned_signal const& s)
  * is transiently deliverable, and skips a syscall for an empty set so a
  * transition still costs the one call it always did.
  */
+/**
+ * @brief Block every owned signal, unconditionally.
+ *
+ * Used by the two RAISE paths before they touch a depth. Raising a depth can
+ * only ever ADD blocks, never remove one, so pre-blocking is always a superset
+ * of the state apply_mask() is about to derive and settles to it immediately
+ * after.
+ *
+ * This closes a real window. `depth++` followed by apply_mask() leaves an
+ * interval where the counters say the region is protected and the signal is
+ * still deliverable, and a reschedule landing there captures the thread with
+ * the depth raised and its frame's mask open. That capture is what
+ * cross-core-defects.md 8.7d observed: p=1 at handler entry with frame_blk=0.
+ *
+ * The rule the two directions share: the mask may be MORE restrictive than the
+ * depths for an instant, never less. So tighten the mask before raising a
+ * depth, and lower a depth before loosening the mask, which is what the restore
+ * paths already do.
+ */
+static void block_owned_signals()
+{
+   sigset_t all;
+   sigemptyset(&all);
+   for (auto const& s : owned_signals) sigaddset(&all, s.signo);
+   pthread_sigmask(SIG_BLOCK, &all, nullptr);
+}
+
 static void apply_mask()
 {
    sigset_t block;
@@ -772,6 +799,7 @@ cyros_mask_token_t cyros_port_irq_save(void)
    // only on this port: the depth raised below is what decides the mask.
    cyros_mask_token_t const token = deliverable_token();
 
+   block_owned_signals(); // BEFORE the depth, see block_owned_signals
    current_core.interrupt_disable_depth++;
    apply_mask();
    return token;
@@ -803,6 +831,7 @@ cyros_mask_token_t cyros_port_preempt_disable(void)
 
    cyros_mask_token_t const token = deliverable_token();
 
+   block_owned_signals(); // BEFORE the depth, see block_owned_signals
    current_core.preempt_disable_depth++;
    apply_mask();
    return token;
