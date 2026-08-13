@@ -60,6 +60,31 @@ public:
       value.store(desired, std::memory_order_relaxed);
    }
 
+   /**
+    * @brief Indivisible conditional transition, e.g. prepared -> committed.
+    *
+    * The one operation here that is NOT single-writer, and the reason it exists
+    * is worth stating. Where one context READS a value and conditionally WRITES
+    * it back, a second writer (an ISR on the same core, or a remote core) can
+    * store between the two halves, and the read-modify-write then silently
+    * overwrites that store. A single compare-exchange instruction cannot be
+    * interrupted part way, so the transition either observes the other writer
+    * and fails, or completes before it.
+    *
+    * Relaxed like everything else here: this orders nothing, it only makes the
+    * transition indivisible.
+    *
+    * @param expected In/out. The value required for the exchange to happen, and
+    *        on failure it is overwritten with what was actually found.
+    * @return true when the exchange took place.
+    */
+   bool compare_exchange(T& expected, T desired) noexcept
+   {
+      return value.compare_exchange_strong(expected, desired,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed);
+   }
+
    // Allow explicit casts to integral types (or otherwise convertible)
    template <typename U> requires (std::is_convertible_v<T, U> || (std::is_enum_v<T> && std::integral<U>))
    explicit operator U() const noexcept
