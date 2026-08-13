@@ -175,14 +175,14 @@ void register_thread(thread_control_block& tcb)
       return;
    }
 
-   if (ready_thread(tcb) == schedule_hint::warranted) {
+   if (global_ready_thread(tcb) == schedule_hint::warranted) {
       // Weak request: Registering the thread is not itself blocking, it is
       // only flagging that a higher-priority thread became ready.
       cyros_port_pend_reschedule();
    }
 }
 
-schedule_hint ready_thread(thread_control_block& tcb)
+schedule_hint global_ready_thread(thread_control_block& tcb)
 {
    // Fast path: if the thread is already terminated. Can happen with stale remote-ready-requests
    // A thread that terminates AFTER this check is handled by the scheduler-level guard when the request is drained.
@@ -202,32 +202,8 @@ schedule_hint ready_thread(thread_control_block& tcb)
    // on a waitable thats owner has just handed to us
    tcb.disposition = thread_disposition::none;
 
-   /* A thread already RUNNING on this core is already runnable, so the
-    * disposition reset above is the WHOLE of what this wake has to do: it
-    * revokes the intent to block, which is exactly what a wake landing between
-    * arming and parking needs to accomplish.
-    *
-    * Falling through to set_thread_ready() is a defect rather than a
-    * redundancy, because that function also decides which STRUCTURE the thread
-    * belongs in. A running thread that happens to hold a mutex is filed onto
-    * its core's holder list, and the only exit from that list is being picked,
-    * so it carries on running, releases the mutex, and is left listed as a
-    * holder holding nothing. cross-core-defects.md section 11.
-    *
-    * This belongs HERE and not in scheduler::set_thread_ready, because
-    * reschedule() calls that deliberately to ROTATE the running thread with the
-    * same identity and state. The callers cannot be told apart from the TCB and
-    * differ only in intent, so the entry point has to carry the intent.
-    *
-    * DEPENDS ON commit_to_block's compare-exchange. Before that landed, this
-    * return lost wakeups: the old code's `state = ready` side effect was what
-    * made reschedule() ignore a disposition that had been raced, and removing
-    * it without closing the race hung about 30 percent of storm runs. See 11a.
-    *
-    * The intake path needs no equivalent guard. It services a make_ready
-    * against a running thread only from drain_intake at the top of
-    * reschedule(), which always goes on to pick and switch, so the state it
-    * leaves is resolved before anything else observes it. */
+   // Fast path 2: if the thread is already running, then there is nothing
+   // left to do after clearing its disposition (done above).
    if (tcb.state == thread_state::running) {
       return schedule_hint::unwarranted;
    }
@@ -249,24 +225,9 @@ void commit_to_block(thread_control_block& tcb)
 {
    auto token = cyros_port_preempt_disable();
 
-   /* Compare-exchange, NOT a read then a write.
-    *
-    * preempt_disable masks the reschedule signal and deliberately leaves the
-    * TIMER deliverable, which is the entire point of having two grades. So a
-    * same-core ISR can run between the two halves of a read-modify-write here.
-    * A wake inside that ISR clears the disposition, and a plain write would put
-    * `committed` straight back over it: the thread then parks even though its
-    * wake has already arrived and wake_one has already popped its wait node, so
-    * nothing is left to wake it. That is a lost wakeup and it presents as a
-    * hang.
-    *
-    * Either order is safe with the exchange. If the ISR wins, the exchange sees
-    * `none`, fails, and the thread does not park. If the exchange wins, the ISR
-    * clears the disposition afterwards and reschedule() then rotates this
-    * thread rather than blocking it, because it dispatches on a disposition
-    * that is no longer `committed`.
-    *
-    * cross-core-defects.md 11a has the trace and the measurement. */
+   // Atomic CAS prevents a race between a blocking thread and an ISR.
+   // Hazard: Without RMW, the thread could read 'prepared', an ISR could
+   // clear the disposition, and the thread would blindly overwrite it to 'committed'.
    auto expected = thread_disposition::prepared;
    if (tcb.disposition.compare_exchange(expected, thread_disposition::committed)) {
       cyros_port_pend_reschedule(); // Delayed until preempt_enable()

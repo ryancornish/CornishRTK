@@ -161,7 +161,7 @@ struct global_state
    /**
     * @brief Have any cores been launched?
     */
-   [[nodiscard]] bool cores_launched() const { return cores.size() > 0; }
+   [[nodiscard]] bool cores_launched() const { return !cores.empty(); }
 
    void reset()
    {

@@ -16,7 +16,7 @@ thread_control_block& get_current_thread_on_this_core();
 void register_thread(thread_control_block& tcb);
 
 /**
- * @brief Make a thread runnable on its pinned core (smp-safe).
+ * @brief Make a thread runnable on its pinned core (cross-core-safe).
  *
  * transitions @p tcb to the ready state and enqueues it on the ready queue
  * of its pinned core. if the thread belongs to another core, a cross-core
@@ -27,7 +27,7 @@ void register_thread(thread_control_block& tcb);
  *         core and has higher priority than the running thread, indicating
  *         the caller should request a local reschedule.
  */
-schedule_hint ready_thread(thread_control_block& tcb);
+schedule_hint global_ready_thread(thread_control_block& tcb);
 
 /**
  * @brief A thread's urgency, computed from truth: min(base, best waiter of

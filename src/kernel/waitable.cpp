@@ -212,7 +212,7 @@ void wait_queue::wake_one(reschedule_policy policy) noexcept
       refresh_top();
    }
 
-   schedule_hint hint = thread_action::ready_thread(*chosen);
+   schedule_hint hint = thread_action::global_ready_thread(*chosen);
    apply_reschedule_policy(policy, hint);
 }
 
@@ -238,7 +238,7 @@ void wait_queue::wake_all(reschedule_policy policy) noexcept
          drop_bridge(*node);
          refresh_top();
       }
-      schedule_hint hint = thread_action::ready_thread(*chosen);
+      schedule_hint hint = thread_action::global_ready_thread(*chosen);
       if (hint == schedule_hint::warranted) {
          aggregate_hint = schedule_hint::warranted;
       }
@@ -280,7 +280,7 @@ bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy 
    // delivery. Only the TCB is touched out here. The wait_node lives on the
    // waiter's stack and is only dereferenced under the lock, matching the
    // wake_one discipline.
-   schedule_hint hint = thread_action::ready_thread(*chosen);
+   schedule_hint hint = thread_action::global_ready_thread(*chosen);
    apply_reschedule_policy(policy, hint);
    return true;
 }

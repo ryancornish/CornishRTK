@@ -61,22 +61,15 @@ public:
    }
 
    /**
-    * @brief Indivisible conditional transition, e.g. prepared -> committed.
+    * @brief Atomic compare-and-swap (CAS)
     *
-    * The one operation here that is NOT single-writer, and the reason it exists
-    * is worth stating. Where one context READS a value and conditionally WRITES
-    * it back, a second writer (an ISR on the same core, or a remote core) can
-    * store between the two halves, and the read-modify-write then silently
-    * overwrites that store. A single compare-exchange instruction cannot be
-    * interrupted part way, so the transition either observes the other writer
-    * and fails, or completes before it.
+    * Wrapper around std::atomic's compare_exchange_strong()
+    * "atomically compares the value of the atomic object with non-atomic argument
+    * and performs atomic exchange if equal or atomic load if not."
     *
-    * Relaxed like everything else here: this orders nothing, it only makes the
-    * transition indivisible.
-    *
-    * @param expected In/out. The value required for the exchange to happen, and
-    *        on failure it is overwritten with what was actually found.
-    * @return true when the exchange took place.
+    * @param expected Reference to the value expected to be found in the atomic object.
+    * @param desired the value to store in the atomic object if it is as expected
+    * @return true if the underlying atomic value was successfully changed, false otherwise.
     */
    bool compare_exchange(T& expected, T desired) noexcept
    {
