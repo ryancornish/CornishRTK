@@ -126,6 +126,12 @@ static const int timer_signo = SIGRTMIN;
  */
 static constexpr std::size_t handler_stack_size = 128 * 1024; // 128KB
 
+/* Signal frames that can be live on one core's altstack at once: the reschedule
+ * interception's capture, plus a timer nesting above it. The handler body does
+ * not count, it runs on the handler stack. One more per additional signal that
+ * can nest. See preempt-port-masking-explained.md. */
+static constexpr unsigned altstack_depth = 2;
+
 
 /* ============================================================================
  * Internal State
@@ -182,10 +188,12 @@ static constinit global_state global;
  */
 struct current_core_state
 {
-   // Core's scheduler stack setup for sigctx.
-   // Layout: [ guard page (PROT_NONE) ][ handler_stack_bytes usable, grows down ]
+   // One mapping: [ guard ][ handler_stack ][ guard ][ altstack ], both grow down.
+   // The kernel lays signal frames on the altstack, sigctx runs on the handler stack.
    std::uint8_t*       handler_stack{nullptr};
    std::size_t         handler_stack_bytes{0};
+   std::uint8_t*       altstack{nullptr};
+   std::size_t         altstack_bytes{0};
    void*               stack_mapping{nullptr};
    std::size_t         stack_mapping_bytes{0};
 
@@ -226,15 +234,20 @@ struct current_core_state
    bool                mask_check_active{false};
 
    /**
-    * @brief Map the guarded handler stack.
+    * @brief Map the guarded handler stack and altstack.
     * @return 0 on success, or a negative errno.
     */
-   int allocate_handler_stack()
+   int allocate_signal_stacks()
    {
       if (handler_stack != nullptr) return 0; // Already mapped (TODO: Should this be an assert?)
 
       std::size_t const guard = guard_page_size();
-      stack_mapping_bytes = guard + handler_stack_size;
+
+      // Page-rounded so the guard above it lands on a boundary mprotect can take.
+      std::size_t const alt_min  = sigctx_altstack_min(altstack_depth);
+      std::size_t const alt_size = ((alt_min + guard - 1) / guard) * guard;
+
+      stack_mapping_bytes = guard + handler_stack_size + guard + alt_size;
 
       stack_mapping = mmap(nullptr, stack_mapping_bytes,
                            PROT_READ | PROT_WRITE,
@@ -245,7 +258,11 @@ struct current_core_state
          return -errno;
       }
 
-      if (mprotect(stack_mapping, guard, PROT_NONE) != 0) {
+      auto* const base = static_cast<std::uint8_t*>(stack_mapping);
+
+      // A guard beneath each, so an overflow faults instead of eating its neighbour.
+      if (mprotect(base, guard, PROT_NONE) != 0 ||
+          mprotect(base + guard + handler_stack_size, guard, PROT_NONE) != 0) {
          int const err = -errno;
          munmap(stack_mapping, stack_mapping_bytes);
          stack_mapping       = nullptr;
@@ -253,15 +270,17 @@ struct current_core_state
          return err;
       }
 
-      handler_stack       = static_cast<std::uint8_t*>(stack_mapping) + guard;
+      handler_stack       = base + guard;
       handler_stack_bytes = handler_stack_size;
+      altstack            = base + guard + handler_stack_size + guard;
+      altstack_bytes      = alt_size;
       return 0;
    }
 
    /**
-    * @brief Release handler stack memory and teardown page guard
+    * @brief Release the signal-stack mapping and its guards
     */
-   void free_handler_stack()
+   void free_signal_stacks()
    {
       if (stack_mapping == nullptr) return;
 
@@ -270,6 +289,8 @@ struct current_core_state
       stack_mapping_bytes = 0;
       handler_stack       = nullptr;
       handler_stack_bytes = 0;
+      altstack            = nullptr;
+      altstack_bytes      = 0;
    }
 
    static std::size_t guard_page_size()
@@ -307,13 +328,10 @@ static thread_local constinit current_core_state current_core;
  * Strict nesting worked. Overlap leaked, in both orders. Swapping to an absolute
  * SIG_SETMASK of the saved value does not help either: it unblocks preempt_signo
  * while the preempt region is still live, which is worse. The save/restore idiom
- * is only conditionally correct, requiring strictly LIFO nesting, and the leak
- * above is a property of two owners sharing one resource rather than of any one
- * call site. The kernel's one deliberately non-LIFO handover, thread_launcher
- * passing its preempt token to the exit routine, is gone now that the arbiter
- * owns termination, but that changes nothing here: the derived mask is what
- * makes a transition idempotent and independent of the order overlapping
- * regions open and close, which is worth having on its own.
+ * is only conditionally correct, requiring strictly LIFO nesting. The leak above
+ * is a property of two owners sharing one resource, not of any one call site,
+ * and the derived mask is what makes a transition idempotent and independent of
+ * the order overlapping regions open and close.
  *
  * A real target has no such problem: interrupt-disable is PRIMASK and
  * preempt-disable is BASEPRI or a software scheduler lock, so they are DISTINCT
@@ -546,15 +564,16 @@ static void leave_dormant_region()
 
 
 /* ----------------------------------------------------------------------------
- * Interrupt-handler regions
+ * Handler regions
  *
- * Both handlers in this port are entered with exactly the owned signals blocked,
- * which is precisely the mask interrupt-disable calls for: the reschedule
- * interception because sigctx holds the trigger signal down for the whole
- * interception and ORs in block_extra, the timer ISR because delivery blocks its
- * own signal and sa_mask adds the reschedule. So both ARE interrupt-disabled
- * regions rather than merely analogous to one, and both say so with the counter.
- * That is why the model needs no handler special case.
+ * A handler is entered with signals already masked by the machinery, so it must
+ * declare the matching depth or the mask and the counters disagree. The two are
+ * NOT the same region:
+ *
+ *   timer ISR               interrupt-disabled. Delivery blocks its own signal,
+ *                           sa_mask adds the reschedule.
+ *   reschedule interception preempt-disabled. Only its trigger is blocked, so a
+ *                           timer can land mid-reschedule.
  *
  * Both calls move the counter WITHOUT applying the mask, because at both ends the
  * machinery installs it: delivery on the way in, the sigreturn on the way out.
@@ -577,6 +596,17 @@ void isr_region_leave()
    current_core.interrupt_disable_depth--;
 }
 
+void preempt_region_enter()
+{
+   current_core.preempt_disable_depth++;
+}
+
+void preempt_region_leave()
+{
+   CYROS_ASSERT(current_core.preempt_disable_depth > 0); // handler region underflowed
+   current_core.preempt_disable_depth--;
+}
+
 } // namespace cyros::port
 
 
@@ -597,9 +627,9 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void*)
 {
    if (!global.cores_launched()) return paused; // Delivery after kernel teardown, ignore
 
-   // Covers every return path below, so the depth is balanced whichever branch
-   // chooses the context to resume.
-   cyros::port::isr_region const in_handler;
+   // Balanced on every return path below. Preempt and not interrupt: the timer
+   // stays deliverable across the handler.
+   cyros::port::preempt_region const in_handler;
 
    bool const bootstrapping = current_core.bootstrapping;
 
@@ -643,21 +673,20 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void*)
  */
 static int install_interceptor()
 {
-   int const mapped = current_core.allocate_handler_stack();
+   int const mapped = current_core.allocate_signal_stacks();
    if (mapped != 0) return mapped;
 
-   // Keep the timer signal masked during reschedule
-   sigset_t extra;
-   sigemptyset(&extra);
-   sigaddset(&extra, timer_signo);
-
+   // No block_extra: the timer stays deliverable through the interception, so it
+   // can preempt a reschedule. This is what altstack_depth is sized for.
    sigctx_intercept_cfg cfg{
       .signo       = preempt_signo,
+      .altstack_sp = current_core.altstack,
+      .altstack_ss = current_core.altstack_bytes,
       .handler_sp  = current_core.handler_stack,
       .handler_ss  = current_core.handler_stack_bytes,
       .handler     = on_reschedule,
       .arg         = nullptr, // the handler reads current_core, nothing to pass
-      .block_extra = &extra,
+      .block_extra = nullptr,
    };
    return sigctx_intercept_install(&cfg);
 }
@@ -757,7 +786,7 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
 
             // Mirror of the allocation above: this thread owns the mapping, so
             // this thread releases it, once its core entry has unwound.
-            current_core.free_handler_stack();
+            current_core.free_signal_stacks();
             return nullptr;
          },
          &core
@@ -773,7 +802,7 @@ void cyros_port_start_cores(size_t cores_to_use, cyros_port_core_entry_t entry)
    CYROS_ASSERT(rc == 0); // Interceptor failed to install on core0
 
    core0.entry();
-   current_core.free_handler_stack(); // core0's thread owns its mapping too
+   current_core.free_signal_stacks(); // core0's thread owns its mapping too
 
    sigset_t now;
    pthread_sigmask(SIG_BLOCK, /*set=*/nullptr, &now);
@@ -926,37 +955,27 @@ void cyros_port_context_init(cyros_port_context_t* context,
 
 void cyros_port_context_destroy(cyros_port_context_t* context)
 {
-   // The dying thread's frame is the interception's paused context on the
-   // handler stack, so there is nothing of it to release here, and the switch
-   // that follows is told not to copy it back into the TCB.
+   // Nothing of the frame to release: it is the interception's paused context on
+   // the handler stack, and the switch that follows is told not to save into it.
    context->~cyros_port_context();
 
    CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
 
    uint32_t const remaining = global.active_contexts.fetch_sub(1, std::memory_order_seq_cst) - 1;
 
-   // Quiescence is a property of a system that was started. Without that guard a
-   // port-level test that inits and destroys contexts of its own would drive the
-   // count to zero and latch shutdown_requested against no cores at all.
+   // A system that never started cannot have quiesced.
    if (!global.cores_launched()) return;
 
-   // One idle thread per core remaining means the system has quiesced. The first
-   // terminator to observe this wins the CAS and wakes every core to unwind.
-   //
-   // Running INSIDE the arbiter is what makes this safe to test here. The count
-   // drops at the retire, so a thread that has left its entry function but has
-   // not yet been retired is still counted, and no core can decide the system
-   // has finished while a transition is outstanding. The shutdown branch in
-   // on_reschedule() bypasses the arbiter, so a thread stranded that way would
-   // never reach thread_state::terminated and ~thread() would fire on it.
+   // One idle thread per core left means the system has quiesced. The first
+   // terminator to see it wins the CAS and wakes every core to unwind. Safe to
+   // test here because the count drops inside the arbiter, so a thread that has
+   // left entry() but is not yet retired is still counted.
    if (remaining > global.cores.size()) return;
 
    bool expected = false;
    if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       for (auto& core : global.cores) {
-         // Pends on us: we are inside the interception, which holds the signal
-         // down, so our own unwind waits for this pass to finish switching.
-         pthread_kill(core.pthread, preempt_signo);
+         pthread_kill(core.pthread, preempt_signo); // pends on us, blocked in here
       }
    }
 }
@@ -966,9 +985,8 @@ void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to)
    CYROS_ASSERT(to);
    CYROS_ASSERT(current_core.paused_uc); // a switch is only ever driven from on_reschedule
 
-   // A null 'from' is the scheduler saying there is nothing to save: either
-   // nothing has run on this core yet, or the outgoing thread was just retired
-   // and its TCB may already be gone. Either way the captured frame is dropped.
+   // Null 'from' means nothing to save: first switch, or the outgoing thread was
+   // retired and its TCB may already be gone.
    if (from) {
       // Relocate the captured frame into the outgoing TCB while paused_uc still
       // points at live handler-stack storage. This is what lets the thread

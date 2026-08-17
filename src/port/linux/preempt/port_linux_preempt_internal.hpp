@@ -40,6 +40,32 @@ struct isr_region
    isr_region& operator=(isr_region&&)      = delete;
 };
 
+/**
+ * @brief Declare that the reschedule interception is running on this core.
+ *
+ * Preempt-disabled, not interrupt-disabled: only the trigger signal is held
+ * down, so a timer can preempt the handler. Load-bearing rather than
+ * bookkeeping, because a preempt_enable inside the handler recomputes the mask
+ * from the counters, and without this it would unblock the trigger and let the
+ * interception re-enter itself on the shared handler stack.
+ *
+ * Prefer preempt_region wherever scoping allows.
+ */
+void preempt_region_enter();
+void preempt_region_leave();
+
+/** @brief Scoped form of preempt_region_enter/leave. */
+struct preempt_region
+{
+   preempt_region() { preempt_region_enter(); }
+   ~preempt_region() { preempt_region_leave(); }
+
+   preempt_region(preempt_region const&)            = delete;
+   preempt_region(preempt_region&&)                 = delete;
+   preempt_region& operator=(preempt_region const&) = delete;
+   preempt_region& operator=(preempt_region&&)      = delete;
+};
+
 } // namespace cyros::port
 
 #endif /* CYROS_PORT_LINUX_PREEMPT_INTERNAL_HPP */

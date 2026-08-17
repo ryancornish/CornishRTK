@@ -37,11 +37,10 @@
  * returns. The process-wide sigaction is installed once, the first time any core
  * calls setup(); the timers themselves are per-core.
  *
- * The reverse direction is closed symmetrically by the main port. Its reschedule
- * interceptor is installed with sigctx's block_extra set to timer_signo, so the
- * timer stays masked for the whole interception, capture and handler alike. A
- * timer can therefore never land on the shared handler stack mid-reschedule, and
- * the two signals can never nest into each other in either order.
+ * Nesting is one-directional. A reschedule cannot nest into a timer ISR (sa_mask
+ * above), but a timer ISR can nest into a reschedule, which is the point: on a
+ * real target any IRQ preempts PendSV. This handler is SA_ONSTACK, so its frame
+ * lands on the altstack and never touches the reschedule's handler stack.
  *
  * now() is backed by CLOCK_MONOTONIC, so time advances on its own. The
  * deterministic cyros_port_time_advance() hook the periodic and tickless driver
@@ -164,6 +163,7 @@ void interceptor_disarm(core_timer& ct)
 
 void on_timer_signal(int, siginfo_t*, void*)
 {
+
    // Runs on the core whose timer fired (SIGEV_THREAD_ID targeted this thread),
    // with the reschedule signal masked so a reschedule cannot nest in here.
    // Invoke the driver's ISR, which reads cyros_port_get_core_id() and so

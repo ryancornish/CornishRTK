@@ -30,14 +30,9 @@
  *      transitions, which are depth changes on the same mask, and which a
  *      single long-running test would never sample. Hence several lifecycles.
  *
- * WHAT THIS DOES NOT YET COVER, and do not assume otherwise. The interleaving
- * CLAUDE_cyros.md section 7 actually asks for is a tick landing INSIDE a
- * reschedule, and that is unreachable in the tree as it stands: stage 2 is not
- * applied, so install_interceptor still passes timer_signo in block_extra and
- * the timer is masked for the whole interception. This binary is the
- * prerequisite fuzzer for that change rather than evidence about it. Once stage
- * 2 lands, this test becomes that fuzzer with no modification, and the honest
- * order of work is to land stage 2 and then soak this.
+ *   4. A tick landing INSIDE a reschedule. The interceptor passes no
+ *      block_extra, so the timer is deliverable through the interception and
+ *      preempts the kernel's reschedule the way an IRQ preempts PendSV.
  *
  * The assertions here are deliberately weak, because the value is in the soak
  * rather than in any one run. A run that neither trips an assert nor hangs is

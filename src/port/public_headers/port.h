@@ -328,21 +328,11 @@ void cyros_port_context_init(cyros_port_context_t* context,
  * @brief Destroy a thread context
  * @param context The dead thread's context. Never entered or resumed again.
  *
- * Called when a thread exits: by reschedule() when it terminates the current
- * thread, after the kernel bookkeeping and before the switch away from it.
+ * Called by the scheduler when a thread terminates, before the switch away from
+ * it, and must return normally.
  *
- * Must return normally to the outer reschedule().
- *
- * The port can use this to perform internal bookkeeping on context tracking, to
- * invalidate the context, or nothing at all if it has nothing to release. The
- * storage itself belongs to the caller and outlives this call, so a port must
- * not assume it may reuse or free it.
- *
- * The context may still be SUSPENDED when this is called, and on a port with
- * stackful contexts it usually is: the thread is parked inside the final
- * reschedule that retired it and is never resumed to unwind. Abandoning a
- * suspended context is the contract. Unwinding one is not required and must not
- * be attempted.
+ * The storage is the caller's and outlives this call. The context may still be
+ * SUSPENDED, so abandon it rather than unwinding it.
  */
 void cyros_port_context_destroy(cyros_port_context_t* context);
 
@@ -354,10 +344,8 @@ void cyros_port_context_destroy(cyros_port_context_t* context);
  * Saves the current CPU state into 'from' and loads the state from 'to'.
  * Execution resumes in 'to' context.
  *
- * 'from' is NULL in two cases, and they want the same handling: the first
- * switch on a core, where no context has run yet, and a switch away from a
- * thread that has just been retired, whose context must not be written back
- * because its joiner may already be tearing the TCB down.
+ * 'from' is NULL on the first switch on a core, and when switching away from a
+ * retired thread whose context must not be written back.
  */
 void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to);
 
