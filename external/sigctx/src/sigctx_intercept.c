@@ -14,6 +14,18 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Opt-in install diagnostics. The sizing returns (-ENOMEM, -ERANGE) are runtime
+ * conditions a caller cannot precompute, so a bare errno leaves them guessing
+ * which buffer and which macro to change. Define SIGCTX_DIAGNOSTICS to have a
+ * failing install print the actual comparison and the fix to stderr. Off by
+ * default: zero cost (and no stdio pulled in). */
+#ifdef SIGCTX_DIAGNOSTICS
+#include <stdio.h>
+#define SIGCTX_DIAG(...) ((void)fprintf(stderr, "sigctx: " __VA_ARGS__))
+#else
+#define SIGCTX_DIAG(...) ((void)0)
+#endif
+
 /* Per-thread because sigaltstack and the active config are per-thread. */
 _Thread_local static sigctx_intercept_cfg g_cfg;
 _Thread_local static size_t g_fp_cap; /* bytes to reserve for a captured FP area */
@@ -22,11 +34,6 @@ _Thread_local static size_t g_fp_cap; /* bytes to reserve for a captured FP area
  * the handler can consult it at delivery time without the caller's set having to
  * outlive install. */
 _Thread_local static sigset_t g_block_extra;
-
-/* The kernel delivers the handler on this altstack and lays its (possibly large,
- * AVX-sized) signal frame here. Library-owned and generously bounded. Install
- * asserts it covers the runtime _SC_SIGSTKSZ. */
-_Alignas(64) _Thread_local static uint8_t g_altstack[64 * 1024];
 
 /* OR the signals set in src into dst. Hand-rolled rather than sigorset so the library
  * needs no _GNU_SOURCE, and built only from the async-signal-safe sig* primitives so
@@ -93,20 +100,43 @@ static void interceptor_on_signal(int sig, siginfo_t* info, void* opaque)
    kctx->uc_mcontext.rip = (uint64_t)interceptor_trampoline;
 }
 
+size_t sigctx_altstack_slot_min(void)
+{
+   long want = sysconf(_SC_SIGSTKSZ);
+   size_t frame = (want > 0) ? (size_t)want : (size_t)SIGSTKSZ;
+
+   /* The handler's own C frame runs on this stack above the kernel-laid signal
+    * frame, so budget for it too, matching the +4096 in SIGCTX_INTERCEPT_MIN_FRAME. */
+   return frame + 4096u;
+}
+
+size_t sigctx_altstack_min(unsigned depth)
+{
+   return (depth == 0 ? 1u : depth) * sigctx_altstack_slot_min();
+}
+
 int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
 {
    /* Config is the caller's contract, so a malformed config asserts. The returns
     * below are for genuine runtime conditions the caller cannot check in advance:
-    * the machine's signal-frame size, the supplied stack's adequacy at the runtime
+    * the machine's signal-frame size, the supplied stacks' adequacy at the runtime
     * XSAVE size, and the underlying syscalls. */
    assert(cfg != NULL);
-   assert(cfg->handler != NULL);
+   assert(cfg->altstack_sp != NULL);
    assert(cfg->handler_sp != NULL);
+   assert(cfg->handler != NULL);
    assert(cfg->signo > 0);
 
-   long want = sysconf(_SC_SIGSTKSZ);
-   if (want > 0 && (size_t)want > sizeof(g_altstack)) {
-      return -ENOMEM; /* altstack bound too small for this CPU's signal frame */
+   size_t const slot_min = sigctx_altstack_slot_min();
+
+   /* The altstack must hold at least one runtime signal frame, and for nesting
+    * (any extra signals preempting one another and the bottom handler) it
+    * must hold one per simultaneously-live frame. The caller declares the depth
+    * it designed for via its mask priority table. Verified here the buffer covers it. */
+   if (cfg->altstack_ss < slot_min) {
+      SIGCTX_DIAG("altstack_ss %zu < one signal frame %zu: raise it to at least "
+                  "sigctx_altstack_min(depth)\n", cfg->altstack_ss, slot_min);
+      return -ENOMEM;
    }
 
    uint32_t xsave = sigctx_fpstate_size();
@@ -121,6 +151,9 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
     * SIGCTX_FPSTATE_CAPACITY, which is purely a consumer-side inline-struct concern. */
    size_t const need = sizeof(sigctx_ucontext_t) + (size_t)xsave + 4096u;
    if (cfg->handler_ss < need) {
+      SIGCTX_DIAG("handler_ss %zu < required %zu: raise it to at least "
+                  "SIGCTX_INTERCEPT_MIN_FRAME, and on AVX-512/AMX also raise "
+                  "SIGCTX_FPSTATE_CAPACITY\n", cfg->handler_ss, need);
       return -ERANGE;
    }
 
@@ -137,8 +170,8 @@ int sigctx_intercept_install(sigctx_intercept_cfg const* cfg)
    }
 
    stack_t ss;
-   ss.ss_sp    = g_altstack;
-   ss.ss_size  = sizeof(g_altstack);
+   ss.ss_sp    = cfg->altstack_sp;
+   ss.ss_size  = cfg->altstack_ss;
    ss.ss_flags = 0;
    if (sigaltstack(&ss, NULL) == -1) {
       return -errno;

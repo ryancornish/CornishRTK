@@ -52,12 +52,63 @@ typedef sigctx_ucontext_t* (*sigctx_handler_fn)(sigctx_ucontext_t* paused, void*
 typedef struct
 {
    int               signo;       /* signal that triggers a switch, e.g. SIGURG/SIGUSR1 */
+   uint8_t*          altstack_sp; /* base of the signal-delivery altstack, see below */
+   size_t            altstack_ss; /* its size, see sigctx_altstack_min() below */
    uint8_t*          handler_sp;  /* base of the stack the handler and capture run on */
    size_t            handler_ss;  /* its size, see SIGCTX_INTERCEPT_MIN_FRAME below */
    sigctx_handler_fn handler;     /* picks the context to resume */
    void*             arg;         /* opaque, passed through to handler */
    sigset_t const*   block_extra; /* optional extra signals to hold blocked for the duration of an interception. NULL for none. */
 } sigctx_intercept_cfg;
+
+/*
+ * What is the altstack? What is the handler stack? How are they different? How do I size them?
+ *
+ * altstack_sp/ss - where the LINUX KERNEL lays each raw signal frame (registers + FP)
+ *   on delivery, via SA_ONSTACK. sigctx never writes here, it only hands the
+ *   region to sigaltstack(). Size it with sigctx_altstack_min(depth):
+ *
+ *     - depth is 1 for a lone interceptor that no other signal preempts.
+ *     - depth is your NESTING count when other signals are installed (each its own
+ *       plain SA_ONSTACK handler) and can preempt one another and this interceptor.
+ *       Under SA_ONSTACK the kernel stacks a nested frame directly above the
+ *       current one and pops it on sigreturn, so at peak, one frame per
+ *       simultaneously-live handler coexists here.
+ *
+ *       Note that THIS interceptor occupies a slot only during its capture
+ *       phase, not while your handler callback runs. The capture diverts
+ *       execution onto handler_sp before calling you, and the kernel picks the
+ *       altstack base rather than nesting whenever the interrupted SP is outside
+ *       the altstack. So a signal arriving during your callback starts a fresh
+ *       frame at the base. Count the capture window, not the callback, or you
+ *       will over-size by one level per interceptor. The peak equals the number
+ *       of distinct priority levels in your signal mask table, which stays
+ *       finite only if that table is an ACYCLIC ordering (level N preemptible
+ *       strictly by levels above N). Count the levels, pass that as depth.
+ *
+ * handler_sp/ss - where sigctx relocates the captured context and runs your
+ *   handler callback, AFTER capture, as ordinary code. Size it with
+ *   SIGCTX_INTERCEPT_MIN_FRAME (or larger for a deep handler call chain). This
+ *   stack does not nest: the trigger signal is masked while the handler runs.
+ *
+ * The two are separate because they serve different phases (kernel delivery vs
+ * post-capture handler) and have different sizing laws (nesting vs not). One
+ * altstack is shared across every SA_ONSTACK signal on the OS-thread because
+ * sigaltstack registers exactly one per OS-thread. Which is why its sizing must
+ * account for all of them nesting, while each interceptor's handler stack is
+ * private to that interceptor.
+ */
+
+/*
+ * Minimum bytes for altstack_ss. sigctx_altstack_slot_min() is one runtime
+ * signal frame plus the handler-frame margin, measured against THIS machine's
+ * _SC_SIGSTKSZ (so it is correct on AVX-512/AMX without a compile-time guess).
+ * sigctx_altstack_min(depth) is that times the nesting depth. These are NOT
+ *  compile-time constants. Call them at startup to size a caller-owned buffer.
+ * Install re-checks and returns -ENOMEM if altstack_ss is below one slot.
+ */
+size_t sigctx_altstack_slot_min(void);
+size_t sigctx_altstack_min(unsigned depth);
 
 /*
  * Conservative compile-time lower bound for handler_ss, derived from the inline FP
@@ -71,11 +122,22 @@ typedef struct
 
 /*
  * Install the interceptor on the calling thread. A malformed config (null cfg,
- * null handler, null handler_sp, or signo <= 0) is a caller bug and asserts.
- * Returns 0 on success, or a negative errno for a genuine runtime condition:
- * -ENOMEM if this CPU's signal frame exceeds the internal altstack, -ERANGE if
- * handler_ss is too small for the runtime FP area, or a sigaltstack or sigaction
- * errno. The caller decides how to handle failure.
+ * null handler, null handler_sp, null altstack_sp, or signo <= 0) is a caller
+ * bug and asserts. Returns 0 on success, or a negative errno for a genuine
+ * runtime condition the caller cannot precompute:
+ *
+ *   -ENOMEM  altstack_ss is below one runtime signal frame. FIX: size the
+ *            altstack with sigctx_altstack_min(depth), where depth is your
+ *            nesting-level count (see the config doc above).
+ *   -ERANGE  handler_ss is below the runtime capture frame. FIX: raise it to at
+ *            least SIGCTX_INTERCEPT_MIN_FRAME; on an AVX-512/AMX machine also
+ *            raise SIGCTX_FPSTATE_CAPACITY (or use a dynamically sized handler
+ *            stack against sigctx_fpstate_size()).
+ *   other    a sigaltstack or sigaction errno, passed through unchanged.
+ *
+ * Build with -DSIGCTX_DIAGNOSTICS to have a failing install print the offending
+ * sizes and the fix to stderr, which turns a bare errno at the call site into an
+ * actionable message. The caller decides how to handle failure.
  */
 int sigctx_intercept_install(sigctx_intercept_cfg const* cfg);
 
