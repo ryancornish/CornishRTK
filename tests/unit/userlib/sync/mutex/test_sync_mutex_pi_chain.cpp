@@ -115,6 +115,8 @@
 
 using namespace cyros;
 static_assert(config::cores >= 4, "Chain tests assume at least a quad-core configuration");
+// The conductor sits one step below the least urgent holder, at over_budget_depth + 3.
+static_assert(config::max_priorities > 10 + 3, "not enough priority levels for the conductor");
 
 namespace
 {
@@ -294,7 +296,33 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
       thread::priority(1),
       core_of(depth));
 
-   // Conductor. Blocked until the chain is armed, so it never starves a builder.
+   /* Conductor. LEAST URGENT thread in the run, which is what makes its spin
+    * legal, and it took a flake to learn it.
+    *
+    * It used to run at priority 0, on the reasoning that `formed` proves the
+    * chain is built so every holder must already be parked. That reasoning is
+    * wrong. `formed` is released by the donor as soon as it observes
+    * link[D-1], and a holder arms its link BEFORE it parks:
+    *
+    *     m[i].lock(); link[i].release(); m[i-1].lock();   <- parks here
+    *
+    * so at the moment the conductor wakes, any holder can still be sitting in
+    * the window between arming and parking. A priority-0 conductor sharing that
+    * holder's core then preempts it and spins its whole budget, and the holder
+    * never reaches m[i-1].lock(). The link it was going to arm stays empty, the
+    * donation cannot cross it, and the test reports an under-boost that the
+    * kernel never committed.
+    *
+    * MEASURED, desktop 2026-08-17, at depth 10 under 16-way load. Failures were
+    * always holder[7], which shares core3 with the conductor, showing
+    * holders 0..6 at 6 and 7..9 at 1. The value 6 is the tell: it is holder[6]'s
+    * OWN base priority, so m[6] had no waiter at all. A fold that had merely
+    * failed to cross an armed queue would have read 5, holder[7]'s base.
+    *
+    * Least urgent fixes it by construction: the conductor cannot preempt a
+    * holder, so it only runs once the holders on its core have parked, which is
+    * the precondition its spin always claimed to have. depth+3 is one step less
+    * urgent than the least urgent holder, which is base_of(0) == depth+2. */
    threads[depth + 1].emplace(
       [depth]{
          auto& f = *s.f;
@@ -303,9 +331,9 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
          f.formed.acquire();
          r.formed = true;
 
-         // Safe to spin here and only here: every holder is blocked on a mutex
-         // and the donor is blocked on the top of the chain, so this thread is
-         // the only runnable one on whatever core it shares.
+         /* Spinning here is safe ONLY because the conductor is the least
+          * urgent thread in the run, and that is load-bearing rather than
+          * incidental. See its priority at the bottom of this function. */
          // <= rather than ==. Over-boosting is legal: past the fold's depth
          // budget a link answers 0, which is MORE urgent than the donor and is
          // the deliberate safe direction. An exact-match poll would spin its
@@ -360,7 +388,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
          r.restored = true;
       },
       stacks[depth + 1].bytes,
-      thread::priority(0),
+      thread::priority(static_cast<std::uint8_t>(depth + 3)),
       core_of(depth + 1));
 
    kernel::start();
