@@ -35,9 +35,6 @@ public:
       bool expected = false;
       CYROS_ASSERT(terminated.compare_exchange_strong(expected, true, std::memory_order_release));
 
-      // terminate() is invoked on the teardown path of the thread launcher.
-      // Invoking a reschedule is forbidden during this period as it as we might
-      // otherwise switch away and never return to continue the teardown.
       wake_all(reschedule_policy::never);
    }
 };
@@ -67,9 +64,10 @@ enum class thread_request : std::uint8_t
 
 enum class thread_disposition : uint8_t
 {
-   none,      ///< No pending wish - scheduled purely on position.
-   prepared,  ///< Wishes to block but still deciding - stays runnable if preempted.
-   committed, ///< Decision made under preempt-disable - reschedule will park it.
+   none,        ///< No pending wish - scheduled purely on position.
+   prepared,    ///< Wishes to block but still deciding - stays runnable if preempted.
+   committed,   ///< Decision made under preempt-disable - reschedule will park it.
+   terminating, ///< Finished. The arbiter retires it. Outranks state, never revoked.
 };
 
 /**
@@ -255,7 +253,6 @@ struct thread_control_block
    {
       return next != this;
    }
-
 
    /**
     * @brief True when this thread owns no pi_waitable. One load, one compare.

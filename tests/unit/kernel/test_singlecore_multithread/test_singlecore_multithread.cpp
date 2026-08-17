@@ -705,3 +705,200 @@ TEST(SingleCoreMultiThread_Test,
 
    kernel::finalise();
 }
+
+
+/*** Explicit termination via this_thread::thread_exit() ***/
+
+/* thread_exit() and falling off the end of an entry function are the same
+ * operation: both record thread_disposition::terminating and hand the thread to
+ * the reschedule arbiter, which performs the transition. These cover the
+ * explicit spelling, which the automatic one exercises on every other test in
+ * the suite. */
+
+TEST(SingleCoreMultiThread_Test,
+     GivenThreadCallingThreadExit_WhenItExits_ThenTheRestOfItsEntryFunctionDoesNotRun)
+{
+   kernel::initialise();
+
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_exiter{};
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_other{};
+
+   std::vector<int> markers;
+
+   // GIVEN:
+
+   thread exiter(
+      [&]{
+         markers.push_back(1);
+         this_thread::thread_exit();
+         markers.push_back(99); // Unreachable: the arbiter never picks us again
+      },
+      s_exiter,
+      thread::priority(0),
+      core0
+   );
+
+   thread other(
+      [&]{
+         markers.push_back(2);
+      },
+      s_other,
+      thread::priority(1),
+      core0
+   );
+
+   ASSERT_EQ(kernel::active_threads(), 2u);
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   ASSERT_EQ(markers.size(), 2u) << "code after thread_exit() ran";
+   EXPECT_EQ(markers[0], 1);
+   EXPECT_EQ(markers[1], 2) << "the lower priority thread did not get the core after the exit";
+   EXPECT_EQ(kernel::active_threads(), 0u);
+
+   kernel::finalise();
+}
+
+TEST(SingleCoreMultiThread_Test,
+     GivenThreadExitCalledFromANestedFrame_WhenItExits_ThenTheThreadStillTerminates)
+{
+   kernel::initialise();
+
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_exiter{};
+
+   std::atomic<bool> reached_inner{false};
+   std::atomic<bool> returned_from_inner{false};
+
+   // GIVEN:
+
+   // Exiting does NOT unwind: the frames below are abandoned where they stand,
+   // exactly as they are on a thread that is preempted and never resumed.
+   auto inner = [&]{
+      reached_inner.store(true, std::memory_order_release);
+      this_thread::thread_exit();
+   };
+
+   thread exiter(
+      [&]{
+         inner();
+         returned_from_inner.store(true, std::memory_order_release);
+      },
+      s_exiter,
+      thread::priority(0),
+      core0
+   );
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   EXPECT_TRUE(reached_inner.load(std::memory_order_acquire));
+   EXPECT_FALSE(returned_from_inner.load(std::memory_order_acquire))
+      << "thread_exit() returned to its caller";
+   EXPECT_EQ(kernel::active_threads(), 0u);
+
+   kernel::finalise();
+}
+
+TEST(SingleCoreMultiThread_Test,
+     GivenJoinerBlockedOnTarget_WhenTargetCallsThreadExit_ThenTheJoinerIsWokenAndReturns)
+{
+   kernel::initialise();
+
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_stack{};
+
+   std::atomic<bool> target_reached_exit{false};
+   std::atomic<bool> joiner_returned{false};
+
+   // GIVEN:
+
+   thread target(
+      [&]{
+         this_thread::yield(); // let the joiner park on us first
+         target_reached_exit.store(true, std::memory_order_release);
+         this_thread::thread_exit();
+      },
+      target_stack,
+      thread::priority(3),
+      core0
+   );
+
+   thread joiner(
+      [&]{
+         target.join();
+         joiner_returned.store(true, std::memory_order_release);
+
+         // The wake is issued by the arbiter AFTER the state transition, so a
+         // returning joiner always observes a finished thread.
+         ASSERT_TRUE(target_reached_exit.load(std::memory_order_acquire));
+      },
+      joiner_stack,
+      thread::priority(0), // higher, so it blocks on the join before target runs
+      core0
+   );
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   EXPECT_TRUE(target_reached_exit.load(std::memory_order_acquire));
+   EXPECT_TRUE(joiner_returned.load(std::memory_order_acquire))
+      << "join() did not return, so thread_exit() did not signal the termination waitable";
+   EXPECT_EQ(kernel::active_threads(), 0u);
+
+   kernel::finalise();
+}
+
+TEST(SingleCoreMultiThread_Test,
+     GivenSeveralThreadsExitingBothWays_WhenSystemRuns_ThenAllTerminateAndTheCoreDrains)
+{
+   kernel::initialise();
+
+   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::array<std::byte, STACK_SIZE>, 6> stacks{};
+
+   std::vector<thread> threads;
+   threads.reserve(stacks.size());
+   std::vector<uint32_t> markers;
+
+   // GIVEN:
+
+   // Alternate the two spellings so both retire paths run interleaved on one core.
+   for (unsigned i = 0; auto& stack : stacks) {
+      bool const explicit_exit = (i % 2) == 0;
+      threads.emplace_back(
+         [&, explicit_exit]{
+            markers.push_back(this_thread::id());
+            this_thread::yield();
+            markers.push_back(this_thread::id());
+            if (explicit_exit) this_thread::thread_exit();
+         },
+         stack, thread::priority(0), core0);
+      ++i;
+   }
+
+   ASSERT_EQ(kernel::active_threads(), 6u);
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   ASSERT_EQ(markers.size(), 12u);
+   for (unsigned i = 0; i < 6; ++i) {
+      EXPECT_EQ(markers[i], i + 1) << "first round not in registration order at " << i;
+      EXPECT_EQ(markers[i + 6], i + 1) << "second round not in registration order at " << i;
+   }
+   EXPECT_EQ(kernel::active_threads(), 0u);
+
+   kernel::finalise();
+}

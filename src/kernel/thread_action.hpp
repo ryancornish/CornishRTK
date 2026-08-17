@@ -16,6 +16,11 @@ thread_control_block& get_current_thread_on_this_core();
 void register_thread(thread_control_block& tcb);
 
 /**
+ * @brief Update kernel's accounting for a thread leaving the system.
+ */
+void unregister_thread(thread_control_block& tcb);
+
+/**
  * @brief Make a thread runnable on its pinned core (cross-core-safe).
  *
  * transitions @p tcb to the ready state and enqueues it on the ready queue

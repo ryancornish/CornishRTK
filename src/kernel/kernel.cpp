@@ -182,11 +182,17 @@ void register_thread(thread_control_block& tcb)
    }
 }
 
+void unregister_thread(thread_control_block& tcb)
+{
+   CYROS_ASSERT_OP(tcb.state, ==, thread_state::terminated); // Retire before you unregister
+   CYROS_ASSERT(k.active_threads.fetch_sub(1, std::memory_order_seq_cst) != 0);
+}
+
 schedule_hint global_ready_thread(thread_control_block& tcb)
 {
-   // Fast path: if the thread is already terminated. Can happen with stale remote-ready-requests
+   // Fast path: if the thread is already terminated (or terminating). Can happen with stale remote-ready-requests
    // A thread that terminates AFTER this check is handled by the scheduler-level guard when the request is drained.
-   if (tcb.state == thread_state::terminated) {
+   if (tcb.state == thread_state::terminated || tcb.disposition == thread_disposition::terminating) {
       return schedule_hint::unwarranted;
    }
 
@@ -199,7 +205,7 @@ schedule_hint global_ready_thread(thread_control_block& tcb)
    }
 
    // Reset local current thread's disposition in case we were committed to block
-   // on a waitable thats owner has just handed to us
+   // on a waitable that's owner has just handed to us
    tcb.disposition = thread_disposition::none;
 
    // Fast path 2: if the thread is already running, then there is nothing
@@ -291,28 +297,11 @@ void thread_launcher(void* tcb_ptr)
 {
    auto* tcb = static_cast<thread_control_block*>(tcb_ptr);
 
-   cyros_port_set_tls_pointer(tcb); // for now point tls to the tcb, but in future, tls sits just after tcb
+   cyros_port_set_tls_pointer(tcb); // For now point TLS to the tcb, but in future, TLS sits just after tcb
 
    tcb->entry();
 
-   auto& scheduler = scheduler_for_this_core();
-
-   // Idle threads are outside the teardown bookkeeping and return normally
-   if (tcb->id == scheduler::idle_thread_id) {
-      scheduler.set_thread_terminated(*tcb);
-      return;
-   }
-
-   // Teardown of the user thread must not be interrupted.
-   // Bookkeeping and port exit mechanics must be made
-   // atomically. It is up to the port exit routine to
-   // return us to the reschedule routine.
-   auto token = cyros_port_preempt_disable();
-
-   scheduler.set_thread_terminated(*tcb);
-   CYROS_ASSERT(k.active_threads.fetch_sub(1, std::memory_order_seq_cst) != 0);
-
-   cyros_port_thread_exit(token);
+   this_thread::thread_exit();
 }
 
 void idle_task()
@@ -440,8 +429,20 @@ namespace this_thread
 
 [[noreturn]] void thread_exit()
 {
-   // todo
-   CYROS_PORT_UNREACHABLE();
+   auto& tcb = thread_action::get_current_thread_on_this_core();
+
+   // Flag the thread's intent to terminate, the arbiter will handle the state
+   // transition and teardown on next reschedule (requested immediately).
+   // Any preemption landing before this point is okay as eventually the scheduler
+   //  will pick this thread again and continue teardown.
+   tcb.disposition = thread_disposition::terminating;
+   // Any preemption landing after this point will cause the arbiter to retire
+   // this thread and never return. Most of the time, this window is not preempted
+   // and so we manually trigger a reschedule which is guaranteed to not pick this thread
+   // again.
+   cyros_port_thread_yield();
+
+   CYROS_PORT_UNREACHABLE(); // Bug: The arbiter declined to retire this thread!
 }
 
 void yield()

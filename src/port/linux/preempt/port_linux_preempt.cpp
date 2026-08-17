@@ -215,9 +215,6 @@ struct current_core_state
    bool                bootstrapping{false};
    cyros_port_context* first_ctx{nullptr};
 
-   // The outgoing thread is dead, so the next switch must not save it back.
-   bool                discard_outgoing{false};
-
    // Interrupt-masking depth (Critical Sections). Masks the hardware.
    std::uint32_t       interrupt_disable_depth{0};
 
@@ -310,9 +307,13 @@ static thread_local constinit current_core_state current_core;
  * Strict nesting worked. Overlap leaked, in both orders. Swapping to an absolute
  * SIG_SETMASK of the saved value does not help either: it unblocks preempt_signo
  * while the preempt region is still live, which is worse. The save/restore idiom
- * is only conditionally correct, requiring strictly LIFO nesting, and cyros
- * breaks that deliberately because thread_launcher hands its preempt token to
- * cyros_port_thread_exit() to release later.
+ * is only conditionally correct, requiring strictly LIFO nesting, and the leak
+ * above is a property of two owners sharing one resource rather than of any one
+ * call site. The kernel's one deliberately non-LIFO handover, thread_launcher
+ * passing its preempt token to the exit routine, is gone now that the arbiter
+ * owns termination, but that changes nothing here: the derived mask is what
+ * makes a transition idempotent and independent of the order overlapping
+ * regions open and close, which is worth having on its own.
  *
  * A real target has no such problem: interrupt-disable is PRIMASK and
  * preempt-disable is BASEPRI or a software scheduler lock, so they are DISTINCT
@@ -923,6 +924,38 @@ void cyros_port_context_init(cyros_port_context_t* context,
                  entry, arg);
 }
 
+void cyros_port_context_retire(cyros_port_context_t* context)
+{
+   /* Nothing to release. The dying thread's frame is the interception's paused
+    * context on the handler stack, and the switch that follows is told not to
+    * copy it back into the TCB. */
+   (void)context;
+
+   CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
+
+   uint32_t const remaining = global.active_contexts.fetch_sub(1, std::memory_order_seq_cst) - 1;
+
+   // One idle thread per core remaining means the system has quiesced. The first
+   // terminator to observe this wins the CAS and wakes every core to unwind.
+   //
+   // Running INSIDE the arbiter is what makes this safe to test here. The count
+   // drops at the retire, so a thread that has left its entry function but has
+   // not yet been retired is still counted, and no core can decide the system
+   // has finished while a transition is outstanding. The shutdown branch in
+   // on_reschedule() bypasses the arbiter, so a thread stranded that way would
+   // never reach thread_state::terminated and ~thread() would fire on it.
+   if (remaining > global.cores.size()) return;
+
+   bool expected = false;
+   if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      for (auto& core : global.cores) {
+         // Pends on us: we are inside the interception, which holds the signal
+         // down, so our own unwind waits for this pass to finish switching.
+         pthread_kill(core.pthread, preempt_signo);
+      }
+   }
+}
+
 void cyros_port_context_destroy(cyros_port_context_t* context)
 {
    context->~cyros_port_context();
@@ -933,7 +966,10 @@ void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to)
    CYROS_ASSERT(to);
    CYROS_ASSERT(current_core.paused_uc); // a switch is only ever driven from on_reschedule
 
-   if (from && !current_core.discard_outgoing) {
+   // A null 'from' is the scheduler saying there is nothing to save: either
+   // nothing has run on this core yet, or the outgoing thread was just retired
+   // and its TCB may already be gone. Either way the captured frame is dropped.
+   if (from) {
       // Relocate the captured frame into the outgoing TCB while paused_uc still
       // points at live handler-stack storage. This is what lets the thread
       // resume later, after this handler invocation is gone.
@@ -941,7 +977,6 @@ void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to)
                   /*src=*/ current_core.paused_uc);
    }
 
-   current_core.discard_outgoing = false;
    current_core.paused_uc        = nullptr;
    current_core.current_context  = to;
 
@@ -1005,35 +1040,6 @@ void cyros_port_pend_reschedule(void)
    pthread_kill(pthread_self(), preempt_signo);
 }
 
-void cyros_port_thread_exit(cyros_mask_token_t token)
-{
-   CYROS_ASSERT(current_core.preempt_disable_depth > 0); // thread_exit routine must be uninterruptible!
-   CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
-
-   uint32_t remaining = global.active_contexts.fetch_sub(1, std::memory_order_seq_cst) - 1;
-
-   // One idle thread per core remaining means the system has quiesced. The first
-   // terminator to observe this wins the CAS and wakes every core to unwind.
-   if (remaining <= global.cores.size()) {
-      bool expected = false;
-      if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-         for (auto& core : global.cores) {
-            pthread_kill(core.pthread, preempt_signo); // pends on us, blocked above
-         }
-      }
-   }
-
-   // The next switch must not write this dead context back into the terminated
-   // TCB, whose joiner may already be tearing it down.
-   current_core.discard_outgoing = true;
-
-   // Pend our final reschedule, then unmask to let it fire. The handler discards
-   // this context and resumes either the next thread or, under shutdown, the
-   // bring-up context. We do not return.
-   pthread_kill(pthread_self(), preempt_signo);
-   cyros_port_preempt_enable(token);
-   CYROS_PORT_UNREACHABLE(); // the enable above must not come back
-}
 
 /* ----------------------------------------------------------------------------
  * Thread-Local Storage

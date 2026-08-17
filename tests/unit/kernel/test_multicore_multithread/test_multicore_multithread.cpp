@@ -241,3 +241,105 @@ TEST_F(MultiCoreMultiThread_Test,
    EXPECT_TRUE(core1_work_ran)
       << "core1 did not wake from idle to run queued work (possible missing condvar poke)";
 }
+
+/*** Explicit termination via this_thread::thread_exit(), across cores ***/
+
+TEST_F(MultiCoreMultiThread_Test,
+       GivenJoinersOnThreeCores_WhenTargetOnCore0CallsThreadExit_ThenEveryJoinerIsWokenAndReturns)
+{
+   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s_target{};
+   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::array<std::byte, STACK_SIZE>, 3> s_joiners{};
+
+   std::atomic<bool> target_exited{false};
+   std::array<std::atomic<bool>, 3> joiner_returned{};
+
+   // GIVEN:
+
+   // The retire runs on core0's arbiter, so each joiner is readied by a
+   // cross-core intake post and an IPI rather than a local enqueue.
+   thread target(
+      [&]{
+         for (int i = 0; i < 20; ++i) this_thread::yield(); // let the joiners park
+         target_exited.store(true, std::memory_order_release);
+         this_thread::thread_exit();
+      },
+      s_target,
+      thread::priority(1),
+      core0
+   );
+
+   std::vector<thread> joiners;
+   joiners.reserve(s_joiners.size());
+   auto const affinities = std::to_array({core1, core2, core3});
+
+   for (std::size_t i = 0; i < s_joiners.size(); ++i) {
+      joiners.emplace_back(
+         [&, i]{
+            target.join();
+            ASSERT_TRUE(target_exited.load(std::memory_order_acquire));
+            joiner_returned[i].store(true, std::memory_order_release);
+         },
+         s_joiners[i],
+         thread::priority(0),
+         affinities[i]
+      );
+   }
+
+   ASSERT_EQ(kernel::active_threads(), 4u);
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   EXPECT_TRUE(target_exited.load(std::memory_order_acquire));
+   for (std::size_t i = 0; i < joiner_returned.size(); ++i) {
+      EXPECT_TRUE(joiner_returned[i].load(std::memory_order_acquire))
+         << "joiner " << i << " was never woken by the remote thread_exit";
+   }
+   EXPECT_EQ(kernel::active_threads(), 0u);
+}
+
+TEST_F(MultiCoreMultiThread_Test,
+       GivenEveryCoreRunningThreadsThatExitExplicitly_WhenSystemRuns_ThenAllTerminateAndTheRunWindsDown)
+{
+   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::array<std::byte, STACK_SIZE>, 4> stacks{};
+
+   std::array<std::atomic<int>, 4> stages{};
+
+   // GIVEN:
+
+   // The LAST of these to retire is what drives the port's quiesce detection,
+   // and under this design that decision is made inside the arbiter, after the
+   // retiring thread's transition has already landed.
+   std::vector<thread> threads;
+   threads.reserve(stacks.size());
+   auto const affinities = std::to_array({core0, core1, core2, core3});
+
+   for (std::size_t i = 0; i < stacks.size(); ++i) {
+      threads.emplace_back(
+         [&, i]{
+            stages[i].store(1, std::memory_order_release);
+            this_thread::yield();
+            stages[i].store(2, std::memory_order_release);
+            this_thread::thread_exit();
+         },
+         stacks[i],
+         thread::priority(0),
+         affinities[i]
+      );
+   }
+
+   // WHEN:
+
+   kernel::start();
+
+   // THEN:
+
+   for (std::size_t i = 0; i < stages.size(); ++i) {
+      EXPECT_EQ(stages[i].load(std::memory_order_acquire), 2)
+         << "core " << i << " did not complete its thread";
+   }
+   EXPECT_EQ(kernel::active_threads(), 0u);
+}

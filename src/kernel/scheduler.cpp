@@ -57,8 +57,8 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
    this_core::critical_guard guard;
 
    // Idempotent: a remote core might have sent us a late request to ready
-   // this thread, and we have already terminated it since. No-op.
-   if (tcb.state == thread_state::terminated) {
+   // this thread, and we have already terminated it since (or are terminating). No-op.
+   if (tcb.state == thread_state::terminated || tcb.disposition == thread_disposition::terminating) {
       return schedule_hint::unwarranted;
    }
 
@@ -136,11 +136,19 @@ void scheduler::set_thread_terminated(thread_control_block& tcb)
 {
    CYROS_ASSERT_OP(tcb.pinned_core, ==, core_id);
    CYROS_ASSERT_OP(tcb.state, ==, thread_state::running);
+   CYROS_ASSERT(tcb.disposition == thread_disposition::terminating);
+   CYROS_ASSERT(&tcb != idle_thread); // A core always needs somewhere to go
    CYROS_ASSERT(!tcb.is_enqueued());
    CYROS_ASSERT(tcb.holds_nothing()); // Thread cannot own a pi_waitable on termination
 
    tcb.state = thread_state::terminated;
-   tcb.termination.terminate(); // signal joiners
+
+   thread_action::unregister_thread(tcb);
+
+   // Signal any and all joiners waiting on this thread
+   tcb.termination.terminate();
+
+   cyros_port_retire_context(tcb.context());
 }
 
 uint8_t scheduler::current_thread_urgency() const
@@ -196,7 +204,9 @@ thread_control_block* scheduler::pick_next()
 void scheduler::service_intake(thread_control_block& tcb, std::uint8_t bits)
 {
    if (bits & thread_control_block::request_bit(thread_request::make_ready)) {
-      tcb.disposition = thread_disposition::none;
+      if (tcb.disposition != thread_disposition::terminating) {
+         tcb.disposition = thread_disposition::none;
+      }
       // Runs during a reschedule, so there is no hint to acknowledge.
       (void)set_thread_ready(tcb);
    }
@@ -337,7 +347,7 @@ void scheduler::drain_intake()
 }
 
 /**
- * @brief Select the next runnable thread for this core and switch to it.
+ * @brief AKA: The 'ARBITER'. Select the next runnable thread for this core and switch to it.
  *
  * Sole arbiter of contested transitions. Runs on the owning core in the
  * current thread's context and reconciles that thread's own wish (its
@@ -354,13 +364,17 @@ void scheduler::drain_intake()
  * the thread stays runnable rather than parking on a stale decision. A
  * rotation and the pick must therefore preserve a prepared disposition, so a
  * waiter preempted mid-wait comes back still intending to block and cannot be
- * stranded.
+ * stranded. Termination is the one wish a wake may NOT revoke, and that is
+ * enforced where the wake lands rather than here: see
+ * thread_control_block::is_terminating.
  *
- * Dispatch on the running thread:
+ * Dispatch on the running thread, by its disposition:
+ *      terminating        -> retired, joiners woken, context handed to the port
  *      committed          -> park, not re-enqueued
  *      none / prepared    -> rotate, prepared preserved
+ * and by its state:
  *      ready              -> already readied by drain, not re-enqueued
- *      terminated         -> exiting, not re-enqueued
+ *      terminated         -> retired by an earlier pass, not re-enqueued
  *      blocked / created  -> illegal on entry (asserted)
  *
  * Entry contract: called only by the owning core, current_thread non-null
@@ -375,6 +389,7 @@ void scheduler::reschedule()
 
    thread_control_block* previous_thread = current_thread;
    thread_control_block* next_thread     = nullptr;
+   bool                  discard_prev    = false;
 
    {
       // The retire-and-pick must observe and mutate the matrix atomically.
@@ -384,7 +399,10 @@ void scheduler::reschedule()
 
       switch (previous_thread->state) {
          case thread_state::running:
-            if (previous_thread->disposition == thread_disposition::committed) {
+            if (previous_thread->disposition == thread_disposition::terminating) {
+               set_thread_terminated(*previous_thread);
+               discard_prev = true;
+            } else if (previous_thread->disposition == thread_disposition::committed) {
                set_thread_blocked(*previous_thread);
             } else {
                (void)set_thread_ready(*previous_thread);
@@ -397,6 +415,7 @@ void scheduler::reschedule()
 
          case thread_state::blocked:
          case thread_state::created:
+         default:
             CYROS_ASSERT1(false, previous_thread->state); // Illegal thread state
             break;
       }
@@ -407,7 +426,7 @@ void scheduler::reschedule()
       set_thread_running(*next_thread);
    }
 
-   cyros_port_switch(previous_thread->context(), next_thread->context());
+   cyros_port_switch(discard_prev ? nullptr : previous_thread->context(), next_thread->context());
 }
 
 void scheduler::reset()

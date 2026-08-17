@@ -347,6 +347,31 @@ static thread_local constinit current_core_state current_core;
  * ------------------------------------------------------------------------- */
 
 /**
+ * @brief Start the wind-down if only one idle thread per core is left.
+ *
+ * The first caller to observe quiescence wins the CAS and pokes every core.
+ * Idempotent for the losers, so both callers may run it unconditionally.
+ *
+ * The poke is what gets a core OUT of cyros_port_idle(). Once the last thread
+ * retires, its own core switches into its idle thread like any other pass, and
+ * every other core is already parked in there, so without it they all wait on a
+ * condition variable that nobody will ever signal again.
+ */
+static void request_shutdown_if_quiesced()
+{
+   if (global.active_contexts.load(std::memory_order_acquire) > global.cores.size()) return;
+
+   bool expected = false;
+   if (!global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return;
+   }
+
+   for (auto& c : global.cores) {
+      cyros_port_send_reschedule_ipi(c.core_id);
+   }
+}
+
+/**
  * @brief Entry point of a core's scheduler context.
  *
  * @note Must never return. A make_fcontext entry that returns is undefined
@@ -366,13 +391,10 @@ static void scheduler_trampoline(boost::context::transfer_t entry_transfer)
       global.reschedule_handler();
    }
 
-   // First core to observe quiescence initiates shutdown.
-   bool expected = false;
-   if (global.shutdown_requested.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-      for (auto& c : global.cores) {
-         cyros_port_send_reschedule_ipi(c.core_id);
-      }
-   }
+   // Normally already done by the retire that dropped the count, which is the
+   // only way this loop ends. Repeated here so no core can reach its unwind
+   // without the others having been poked.
+   request_shutdown_if_quiesced();
 
    current_core.os_caller.jump(nullptr);
    CYROS_PORT_UNREACHABLE(); // the jump above does not come back
@@ -654,6 +676,24 @@ void cyros_port_context_init(cyros_port_context_t* context,
    );
 }
 
+void cyros_port_context_retire(cyros_port_context_t* context)
+{
+   CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
+
+   // Drives the quiesce test in scheduler_trampoline()'s pump. Running INSIDE
+   // the arbiter is what makes the test below safe: the count drops at the
+   // retire, so a thread that has left its entry function but is not yet
+   // retired is still counted, and no core can decide the system has finished
+   // while a transition is outstanding.
+   global.active_contexts.fetch_sub(1, std::memory_order_seq_cst);
+   request_shutdown_if_quiesced();
+
+   // Abandoning a suspended fcontext costs nothing:
+   // it owns no memory of its own, the stack is the user's buffer,
+   // and the frames left on it hold nothing that must be released.
+   context->thread = context_handle{};
+}
+
 void cyros_port_context_destroy(cyros_port_context_t* context)
 {
    // Verify the thread context has run to completion
@@ -720,18 +760,6 @@ void cyros_port_pend_reschedule(void)
       // whichever of irq_restore() / preempt_enable() leaves both depths at 0.
       current_core.reschedule_pending = true;
    }
-}
-
-void cyros_port_thread_exit(cyros_mask_token_t token)
-{
-   CYROS_ASSERT(current_core.preempt_disable_depth > 0); // thread_exit routine must be uninterruptible!
-   CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
-
-   global.active_contexts.fetch_sub(1, std::memory_order_seq_cst);
-
-   // Unlike the preempt port this returns, unwinding thread_trampoline() so its
-   // final hand-back retires the context.
-   cyros_port_preempt_enable(token);
 }
 
 

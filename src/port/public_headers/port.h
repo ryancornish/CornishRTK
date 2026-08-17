@@ -322,6 +322,21 @@ void cyros_port_context_init(cyros_port_context_t* context,
                               void* arg);
 
 /**
+ * @brief Retire a context that has terminated
+ * @param context The dead thread's context. Never resumed again.
+ *
+ * Called by reschedule() when terminating the current thread
+ * (after the kernel bookkeeping and before the switch away from it).
+ *
+ * Must return 'normally' to the outer reschedule().
+ *
+ * The port can use this opportunity to perform internal bookkeeping
+ * on context tracking, invalidate the context (as they won't be accessed again),
+ * or nothing if not necessary.
+ */
+void cyros_port_context_retire(cyros_port_context_t* context);
+
+/**
  * @brief Destroy a thread context
  * @param context Pointer to context to destroy
  *
@@ -331,11 +346,16 @@ void cyros_port_context_destroy(cyros_port_context_t* context);
 
 /**
  * @brief Switch from one context to another
- * @param from Context to save (can be NULL for first switch)
+ * @param from Context to save, or NULL when there is nothing to save
  * @param to Context to restore and resume
  *
  * Saves the current CPU state into 'from' and loads the state from 'to'.
  * Execution resumes in 'to' context.
+ *
+ * 'from' is NULL in two cases, and they want the same handling: the first
+ * switch on a core, where no context has run yet, and a switch away from a
+ * thread that has just been retired, whose context must not be written back
+ * because its joiner may already be tearing the TCB down.
  */
 void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to);
 
@@ -455,14 +475,6 @@ void cyros_port_thread_yield(void);
  *    check and resolve.
  */
 void cyros_port_pend_reschedule(void);
-
-/**
- * @brief Thread exit handler
- *
- * Called when a thread's entry function returns.
- * Should never return.
- */
-void cyros_port_thread_exit(cyros_mask_token_t token);// __attribute__((noreturn));
 
 
 /* ----------------------------------------------------------------------------
