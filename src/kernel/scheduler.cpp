@@ -145,10 +145,14 @@ void scheduler::set_thread_terminated(thread_control_block& tcb)
 
    thread_action::unregister_thread(tcb);
 
-   // Signal any and all joiners waiting on this thread
-   tcb.termination.terminate();
+   cyros_port_context_destroy(tcb.context());
 
-   cyros_port_retire_context(tcb.context());
+   // Signal any and all joiners waiting on this thread.
+   // This is the last valid action for this TCB, nothing may
+   // access it afterwards. Any joiners on this can destroy the
+   // outer thread handle if desired. This releases the owner
+   // from the promise that the stack outlives this thread.
+   tcb.termination.terminate();
 }
 
 uint8_t scheduler::current_thread_urgency() const
@@ -365,8 +369,8 @@ void scheduler::drain_intake()
  * rotation and the pick must therefore preserve a prepared disposition, so a
  * waiter preempted mid-wait comes back still intending to block and cannot be
  * stranded. Termination is the one wish a wake may NOT revoke, and that is
- * enforced where the wake lands rather than here: see
- * thread_control_block::is_terminating.
+ * enforced where the wake lands rather than here: set_thread_ready and
+ * global_ready_thread both refuse a terminating thread outright.
  *
  * Dispatch on the running thread, by its disposition:
  *      terminating        -> retired, joiners woken, context handed to the port

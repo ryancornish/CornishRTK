@@ -120,7 +120,22 @@ struct ThreadArg
    std::atomic<int>* trace_len{};
 };
 
-// A thread that records its "thread_id" into trace, yields `stages` times, then returns.
+/**
+ * @brief End an entry function without returning from it.
+ *
+ * cyros_port_entry_t must never return: the kernel's launcher ends in
+ * this_thread::thread_exit(), and a context whose entry falls off the end leaves
+ * the port holding a spent handle it will later be asked to switch to. These
+ * tests drive the port directly, so they honour the same contract by parking
+ * here forever. The harness simply never re-enqueues a parked context, so the
+ * loop turns exactly once.
+ */
+[[noreturn]] static void park_forever()
+{
+   for (;;) cyros_port_pend_reschedule();
+}
+
+// A thread that records its "thread_id" into trace, then yields `stages` times.
 static void thread_yield_n(void* varg)
 {
    auto* a = static_cast<ThreadArg*>(varg);
@@ -141,15 +156,16 @@ static void thread_yield_n(void* varg)
       cyros_port_pend_reschedule();
    }
 
-   // Return = thread exits; port test harness regains control.
+   park_forever();
 }
 
-// A thread that runs once and returns (no yield).
+// A thread that runs once (no yield).
 static void thread_run_once(void* varg)
 {
    auto* ran = static_cast<std::atomic<bool>*>(varg);
    ASSERT_NE(ran, nullptr);
    ran->store(true, std::memory_order_release);
+   park_forever();
 }
 
 // Thread for the deferred-reschedule tests. Records a trace of "events":
@@ -198,14 +214,16 @@ static void thread_defer_probe(void* varg)
 
    cyros_port_preempt_enable(t);          // deferred reschedule resolves here
    defer_record(a, 300 + a->id);
+   park_forever();
 }
 
-// A peer that simply stamps the trace and exits.
+// A peer that simply stamps the trace.
 static void thread_defer_peer(void* varg)
 {
    auto* a = static_cast<DeferArg*>(varg);
    ASSERT_NE(a, nullptr);
    defer_record(a, 900 + a->id);          // marker: peer ran
+   park_forever();
 }
 
 class PortTest : public ::testing::Test
@@ -455,6 +473,7 @@ TEST_F(PortTest, GivenNestedPreemptDisable_WhenPendReschedule_ThenResolvesOnlyAt
 
       cyros_port_preempt_enable(t1);         // depth 0 - switch resolves here
       defer_record(a, 300 + a->id);
+      park_forever();
    };
 
    cyros_port_context_init(probe, s_probe.data(), s_probe.size(), nested_entry, &probe_arg);
@@ -509,6 +528,7 @@ TEST_F(PortTest, GivenBaselinePriority_WhenPendReschedule_ThenSwitchIsImmediate)
       a->harness->enqueue(a->self_ctx);
       cyros_port_pend_reschedule();          // baseline -> resolves NOW
       defer_record(a, 300 + a->id);           // resumed after peer
+      park_forever();
    };
 
    cyros_port_context_init(probe, s_probe.data(), s_probe.size(), baseline_entry, &probe_arg);

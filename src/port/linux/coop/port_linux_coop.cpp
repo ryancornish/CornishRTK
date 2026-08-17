@@ -119,20 +119,19 @@ private:
    boost::context::fcontext_t fctx{nullptr};
 };
 
-/**
- * @brief transfer_t::data protocol.
+/* transfer_t::data protocol.
  *
  * A make_fcontext entry point receives its argument through the data pointer of
- * the FIRST jump into it, and a finishing thread announces itself with a
- * sentinel so the switch that resumed it knows not to keep the handle.
+ * the FIRST jump into it. Nothing else is carried, and there is no sentinel:
  *
  *   first entry into a thread      : the cyros_port_context*
  *   first entry into a scheduler   : the cpu_core*
  *   ordinary suspend, either way   : nullptr
- *   a thread's final jump out      : thread_finished_signal
- */
-static std::byte   thread_finished_tag;  // Address-only sentinel, never read
-static void* const thread_finished_signal = &thread_finished_tag;
+ *
+ * A thread entry cannot finish (see cyros_port_entry_t), so the only way a
+ * context ends is cyros_port_context_destroy, and control only ever arrives back
+ * at a jump site from a suspend. That is what lets every resume store the handle
+ * unconditionally. */
 
 
 /* ============================================================================
@@ -386,15 +385,14 @@ static void scheduler_trampoline(boost::context::transfer_t entry_transfer)
    // Run kernel entry for this simulated core (will start first thread etc.)
    core->entry();
 
-   // Cooperative pump until only idle threads remain (one idle thread per core).
-   while (global.active_contexts.load(std::memory_order_acquire) > global.cores.size()) {
+   /* Cooperative pump. Runs until the system is done, which is a latched fact
+    * rather than a count this core re-derives: whichever core retires the last
+    * non-idle context sets the flag and pokes everyone, so every core leaves on
+    * the same edge. The poke is also what returns the OTHER cores from
+    * cyros_port_idle(), which is where they are parked by then. */
+   while (!global.shutdown_requested.load(std::memory_order_acquire)) {
       global.reschedule_handler();
    }
-
-   // Normally already done by the retire that dropped the count, which is the
-   // only way this loop ends. Repeated here so no core can reach its unwind
-   // without the others having been poked.
-   request_shutdown_if_quiesced();
 
    current_core.os_caller.jump(nullptr);
    CYROS_PORT_UNREACHABLE(); // the jump above does not come back
@@ -642,15 +640,9 @@ static void thread_trampoline(boost::context::transfer_t entry_transfer)
    current_core.thread_caller   = context_handle(entry_transfer.fctx);
    current_core.current_context = context;
 
-   context->entry(context->arg); // Enter user code
+   context->entry(context->arg); // Enter user code, which does not come back
 
-   current_core.current_context = nullptr;
-
-   // Final hand-back. The sentinel tells cyros_port_switch that this stack is
-   // finished, so it stores an empty handle rather than one pointing at a dead
-   // context.
-   current_core.thread_caller.jump(thread_finished_signal);
-   CYROS_PORT_UNREACHABLE(); // a finished stack is never resumed
+   CYROS_PORT_UNREACHABLE(); // Bug: a thread entry returned, see cyros_port_entry_t
 }
 
 void cyros_port_context_init(cyros_port_context_t* context,
@@ -676,28 +668,29 @@ void cyros_port_context_init(cyros_port_context_t* context,
    );
 }
 
-void cyros_port_context_retire(cyros_port_context_t* context)
+void cyros_port_context_destroy(cyros_port_context_t* context)
 {
    CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
 
    // Drives the quiesce test in scheduler_trampoline()'s pump. Running INSIDE
-   // the arbiter is what makes the test below safe: the count drops at the
-   // retire, so a thread that has left its entry function but is not yet
-   // retired is still counted, and no core can decide the system has finished
-   // while a transition is outstanding.
+   // the arbiter is what makes the test below safe: the count drops here, so a
+   // thread that has left its entry function but is not yet retired is still
+   // counted, and no core can decide the system has finished while a transition
+   // is outstanding.
    global.active_contexts.fetch_sub(1, std::memory_order_seq_cst);
-   request_shutdown_if_quiesced();
 
-   // Abandoning a suspended fcontext costs nothing:
-   // it owns no memory of its own, the stack is the user's buffer,
-   // and the frames left on it hold nothing that must be released.
+   // Quiescence is a property of a system that was started. Without that guard a
+   // port-level test that inits and destroys contexts of its own would drive the
+   // count to zero and latch shutdown_requested against no cores at all.
+   if (global.cores_launched()) request_shutdown_if_quiesced();
+
+
+   // Abandoning a suspended fcontext costs nothing. It owns no memory of its
+   // own, the stack is the user's buffer, and the frames left on it hold nothing
+   // that must be released. Note that this is ABANDONING, not UNWINDING: the
+   // port still never unwinds a suspended context, which is the property that
+   // lets it use raw fcontext instead of boost's fiber and stay -fno-exceptions.
    context->thread = context_handle{};
-}
-
-void cyros_port_context_destroy(cyros_port_context_t* context)
-{
-   // Verify the thread context has run to completion
-   CYROS_ASSERT(!context->thread); // Bug: destroying a live thread
 
    context->~cyros_port_context();
 }
@@ -712,8 +705,11 @@ void cyros_port_switch(cyros_port_context_t* /*from*/, cyros_port_context_t* to)
    // land inside the thread's own jump() and ignore it.
    auto const back = to->thread.jump(to);
 
-   to->thread = (back.data == thread_finished_signal) ? context_handle{}
-                                                      : context_handle(back.fctx);
+   // Always live: an entry never returns, so control only ever comes back here
+   // from a suspend, and the handle it hands us is resumable. A context that is
+   // finished is ended by cyros_port_context_destroy instead, which is the only
+   // thing that empties this handle.
+   to->thread = context_handle(back.fctx);
 
    current_core.current_context = nullptr;
 }

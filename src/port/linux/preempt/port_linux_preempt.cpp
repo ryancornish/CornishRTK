@@ -924,16 +924,21 @@ void cyros_port_context_init(cyros_port_context_t* context,
                  entry, arg);
 }
 
-void cyros_port_context_retire(cyros_port_context_t* context)
+void cyros_port_context_destroy(cyros_port_context_t* context)
 {
-   /* Nothing to release. The dying thread's frame is the interception's paused
-    * context on the handler stack, and the switch that follows is told not to
-    * copy it back into the TCB. */
-   (void)context;
+   // The dying thread's frame is the interception's paused context on the
+   // handler stack, so there is nothing of it to release here, and the switch
+   // that follows is told not to copy it back into the TCB.
+   context->~cyros_port_context();
 
    CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
 
    uint32_t const remaining = global.active_contexts.fetch_sub(1, std::memory_order_seq_cst) - 1;
+
+   // Quiescence is a property of a system that was started. Without that guard a
+   // port-level test that inits and destroys contexts of its own would drive the
+   // count to zero and latch shutdown_requested against no cores at all.
+   if (!global.cores_launched()) return;
 
    // One idle thread per core remaining means the system has quiesced. The first
    // terminator to observe this wins the CAS and wakes every core to unwind.
@@ -954,11 +959,6 @@ void cyros_port_context_retire(cyros_port_context_t* context)
          pthread_kill(core.pthread, preempt_signo);
       }
    }
-}
-
-void cyros_port_context_destroy(cyros_port_context_t* context)
-{
-   context->~cyros_port_context();
 }
 
 void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to)

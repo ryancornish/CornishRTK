@@ -133,6 +133,9 @@ typedef void (*cyros_port_reschedule_t)(void);
 
 /**
  * @brief Thread entry point signature
+ *
+ * MUST NOT RETURN.
+ * A port is free to enforce this however it likes, or not at all.
  */
 typedef void (*cyros_port_entry_t)(void* arg);
 
@@ -322,25 +325,24 @@ void cyros_port_context_init(cyros_port_context_t* context,
                               void* arg);
 
 /**
- * @brief Retire a context that has terminated
- * @param context The dead thread's context. Never resumed again.
- *
- * Called by reschedule() when terminating the current thread
- * (after the kernel bookkeeping and before the switch away from it).
- *
- * Must return 'normally' to the outer reschedule().
- *
- * The port can use this opportunity to perform internal bookkeeping
- * on context tracking, invalidate the context (as they won't be accessed again),
- * or nothing if not necessary.
- */
-void cyros_port_context_retire(cyros_port_context_t* context);
-
-/**
  * @brief Destroy a thread context
- * @param context Pointer to context to destroy
+ * @param context The dead thread's context. Never entered or resumed again.
  *
- * Called when a thread exits. Allows the port to clean up any resources.
+ * Called when a thread exits: by reschedule() when it terminates the current
+ * thread, after the kernel bookkeeping and before the switch away from it.
+ *
+ * Must return normally to the outer reschedule().
+ *
+ * The port can use this to perform internal bookkeeping on context tracking, to
+ * invalidate the context, or nothing at all if it has nothing to release. The
+ * storage itself belongs to the caller and outlives this call, so a port must
+ * not assume it may reuse or free it.
+ *
+ * The context may still be SUSPENDED when this is called, and on a port with
+ * stackful contexts it usually is: the thread is parked inside the final
+ * reschedule that retired it and is never resumed to unwind. Abandoning a
+ * suspended context is the contract. Unwinding one is not required and must not
+ * be attempted.
  */
 void cyros_port_context_destroy(cyros_port_context_t* context);
 
