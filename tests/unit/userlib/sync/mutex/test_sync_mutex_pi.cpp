@@ -4,6 +4,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -70,11 +72,6 @@ constexpr int renounce_rounds     = 400;
 // a renounce failure burns the whole budget.
 constexpr int probe_budget = 10'000'000;
 
-struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
-{
-   std::array<std::byte, STACK_SIZE> bytes;
-};
-
 // Spin until predicate or budget exhaustion. Returns false on exhaustion so
 // callers can record a failure and take their bail path.
 template <typename Predicate>
@@ -120,7 +117,7 @@ TEST_F(SyncMutexPi_Test, GivenSpinnerBetweenHolderAndWaiter_WhenHighBlocksOnHeld
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -169,7 +166,7 @@ TEST_F(SyncMutexPi_Test, GivenSpinnerBetweenHolderAndWaiter_WhenHighBlocksOnHeld
 
             s.m.unlock(); // hands to H, restores us to base
          },
-         stacks[0].bytes,
+         stacks[0],
          thread::priority(5),
          core0
       );
@@ -192,7 +189,7 @@ TEST_F(SyncMutexPi_Test, GivenSpinnerBetweenHolderAndWaiter_WhenHighBlocksOnHeld
             s.mid_stop.store(true, std::memory_order_release);
             s.h_done.store(true, std::memory_order_release);
          },
-         stacks[1].bytes,
+         stacks[1],
          thread::priority(1),
          core0
       );
@@ -217,7 +214,7 @@ TEST_F(SyncMutexPi_Test, GivenSpinnerBetweenHolderAndWaiter_WhenHighBlocksOnHeld
                cyros_port_cpu_relax(); // the starvation threat, defanged by PI
             }
          },
-         stacks[2].bytes,
+         stacks[2],
          thread::priority(3),
          core0
       );
@@ -270,7 +267,7 @@ TEST_F(SyncMutexPi_Test, GivenSpinnerBetweenHolderAndWaiter_WhenHighBlocksOnHeld
                return bail(3);
             }
          },
-         stacks[3].bytes,
+         stacks[3],
          thread::priority(0),
          core1
       );
@@ -317,7 +314,7 @@ TEST_F(SyncMutexPi_Test, GivenBlockedHolderChainAcrossCores_WhenUrgentWaiterJoin
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -348,7 +345,7 @@ TEST_F(SyncMutexPi_Test, GivenBlockedHolderChainAcrossCores_WhenUrgentWaiterJoin
             }
             s.m1.unlock(); // transfer to B, restore to base 5
          },
-         stacks[0].bytes,
+         stacks[0],
          thread::priority(5),
          core0
       );
@@ -368,7 +365,7 @@ TEST_F(SyncMutexPi_Test, GivenBlockedHolderChainAcrossCores_WhenUrgentWaiterJoin
             s.m1.unlock(); // frees, no waiters remain on M1
             s.m2.unlock(); // transfer to A, restore to base 3
          },
-         stacks[1].bytes,
+         stacks[1],
          thread::priority(3),
          core1
       );
@@ -385,7 +382,7 @@ TEST_F(SyncMutexPi_Test, GivenBlockedHolderChainAcrossCores_WhenUrgentWaiterJoin
             }
             s.m2.unlock();
          },
-         stacks[2].bytes,
+         stacks[2],
          thread::priority(1),
          core2
       );
@@ -447,7 +444,7 @@ TEST_F(SyncMutexPi_Test, GivenBlockedHolderChainAcrossCores_WhenUrgentWaiterJoin
             }
             s.a_exit.store(true, std::memory_order_release);
          },
-         stacks[3].bytes,
+         stacks[3],
          thread::priority(0),
          core3
       );

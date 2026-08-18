@@ -3,6 +3,8 @@
 #include <cyros/config/config.hpp>
 #include <cyros/port/port_traits.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -88,8 +90,8 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> signaler_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack signaler_stack;
 
       TestWaitable w;
       std::atomic<bool> waiter_completed{false};
@@ -131,8 +133,8 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> signaler_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack signaler_stack;
 
       TestWaitable w0;
       TestWaitable w1;
@@ -183,9 +185,9 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s1_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s2_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack s1_stack;
+      cyros::test::guarded_stack s2_stack;
 
       TestWaitable w;
       std::atomic<int> completion_count{0};
@@ -246,10 +248,10 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> w0_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> w1_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> w2_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> signaler_stack{};
+      cyros::test::guarded_stack w0_stack;
+      cyros::test::guarded_stack w1_stack;
+      cyros::test::guarded_stack w2_stack;
+      cyros::test::guarded_stack signaler_stack;
 
       TestWaitable w;
       std::atomic<int> woke_count{0};
@@ -312,8 +314,8 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> signaler_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack signaler_stack;
 
       TestWaitable w;
       std::atomic<int> rounds_completed{0};
@@ -372,9 +374,9 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_for_w0_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_for_w1_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack s_for_w0_stack;
+      cyros::test::guarded_stack s_for_w1_stack;
 
       TestWaitable w0;
       TestWaitable w1;
@@ -438,8 +440,8 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_stack{};
+      cyros::test::guarded_stack target_stack;
+      cyros::test::guarded_stack joiner_stack;
 
       std::atomic<bool> joiner_returned{false};
 
@@ -497,8 +499,8 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> signaler_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack signaler_stack;
 
       TestWaitable w0;
       TestWaitable w1;
@@ -572,10 +574,10 @@ TEST_F(MultiCoreWaitables_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> s0_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> s1_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE * 2> s2_stack{};
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack s0_stack;
+      cyros::test::guarded_stack s1_stack;
+      cyros::test::guarded_stack s2_stack;
 
       TestWaitable w0;
       TestWaitable w1;

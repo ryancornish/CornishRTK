@@ -101,6 +101,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <chrono>
@@ -137,11 +139,6 @@ constexpr auto CHAIN_STACK_SIZE = thread::min_stack_size + (16 * 1024);
 // doorbell round trips to settle, serialised, so the budget has to scale with
 // depth or a slow-but-correct chain reads as a failure.
 constexpr std::uint64_t chain_poll_budget = 60'000'000;
-
-struct alignas(CYROS_PORT_STACK_ALIGN) chain_stack
-{
-   std::array<std::byte, CHAIN_STACK_SIZE> bytes;
-};
 
 /// @brief Spin until predicate or budget. Returns iterations used, or 0 on failure.
 template <typename Predicate>
@@ -193,7 +190,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
 {
    chain_result result{};
 
-   static std::array<chain_stack, max_threads> stacks{};
+   static std::array<cyros::test::guarded_stack, max_threads> stacks;
 
    // Rebuilt per run. A failing chain does not necessarily leave its mutexes
    // free, and a failing chain is exactly what this file expects.
@@ -276,7 +273,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
             f.m[i].unlock();
             f.done.release();
          },
-         stacks[i].bytes,
+         stacks[i],
          thread::priority(base_of(i)),
          core_of(i));
       s.holder[i] = &threads[i].value();
@@ -292,7 +289,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
          f.m[depth - 1].lock();
          f.m[depth - 1].unlock();
       },
-      stacks[depth].bytes,
+      stacks[depth],
       thread::priority(1),
       core_of(depth));
 
@@ -387,7 +384,7 @@ chain_result run_chain(std::size_t depth, std::uint64_t poll_budget = chain_poll
          for (std::size_t i = 0; i < depth; ++i) f.done.acquire();
          r.restored = true;
       },
-      stacks[depth + 1].bytes,
+      stacks[depth + 1],
       thread::priority(static_cast<std::uint8_t>(depth + 3)),
       core_of(depth + 1));
 

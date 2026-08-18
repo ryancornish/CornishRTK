@@ -250,7 +250,6 @@ struct global_state
    void reset()
    {
       shutdown_requested.store(false);
-      active_contexts.store(0);
       reschedule_handler = nullptr;
       cores = {};
    }
@@ -462,6 +461,7 @@ static void resolve_pending_reschedule_if_baseline()
 
 void cyros_port_init(cyros_port_reschedule_t reschedule_handler)
 {
+   CYROS_ASSERT_OP(global.active_contexts.load(std::memory_order_relaxed), ==, 0u);
    global.reschedule_handler = reschedule_handler;
 }
 

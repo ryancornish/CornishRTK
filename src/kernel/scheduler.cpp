@@ -453,14 +453,9 @@ void scheduler::reset()
       CYROS_ASSERT_OP(node->state, ==, thread_state::terminated);
       node = next;
    }
-   CYROS_ASSERT(ready_matrix.empty()); // Cannot reset whilst threads still in the queue
+   CYROS_ASSERT(ready_matrix.empty()); // Bug: Cannot reset whilst threads still in the queue
 
-   /* A holder leaves the list only by being picked, and a thread can only
-    * release its last resource or terminate while running, i.e. already off it.
-    * So an occupant here means a thread was readied as a holder and the core
-    * never ran it, which is the starvation this list's FIFO order exists to
-    * prevent. */
-   CYROS_ASSERT(holders_head == nullptr);
+   CYROS_ASSERT(holders_head == nullptr); // Bug: An occupant in list means a thread was readied as a holder and the core never ran it
    holders_tail = nullptr;
    // Not correctness, but a lifecycle should not inherit the previous one's
    // tie phase: these objects outlive kernel::finalise.
@@ -468,6 +463,11 @@ void scheduler::reset()
 
    pinned_thread_counter.store(0, std::memory_order_relaxed);
    current_thread = nullptr;
+
+   if (idle_thread != nullptr) {
+      cyros_port_context_destroy(idle_thread->context());
+      idle_thread = nullptr;
+   }
 }
 
 }  // namespace cyros

@@ -4,6 +4,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/config/config.hpp>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -20,13 +22,12 @@ static constexpr auto STACK_SIZE = thread::min_stack_size + (32 * 1024);
 namespace
 {
 
-alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> bootstrap_stack{};
-alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> a_stack{};
-alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> b_stack{};
+cyros::test::guarded_stack bootstrap_stack;
+cyros::test::guarded_stack a_stack;
+cyros::test::guarded_stack b_stack;
 
 constexpr std::size_t num_workers = 5;
-struct alignas(CYROS_PORT_STACK_ALIGN) worker_stack { std::array<std::byte, STACK_SIZE> bytes; };
-std::array<worker_stack, num_workers> worker_stacks{};
+std::array<cyros::test::guarded_stack, num_workers> worker_stacks;
 
 }  // namespace
 
@@ -351,7 +352,7 @@ TEST(RoundRobin_Test,
    {
       workers.emplace_back(
          [&worker, i]{ worker(static_cast<int>(i)); },
-         worker_stacks[i].bytes,
+         worker_stacks[i],
          thread::priority(1),
          core0
       );

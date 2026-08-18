@@ -62,7 +62,9 @@
 #include <sigctx/sigctx.h>
 #include <sigctx/sigctx_intercept.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -79,9 +81,9 @@
  * Port Context Structure
  * ========================================================================= */
 
-struct cyros_port_context
+struct alignas(CYROS_PORT_CONTEXT_ALIGN) cyros_port_context
 {
-   sigctx_inl_t         sctx;        // resumable signal-frame context, FP inline
+   sigctx_dyn_t         sctx;        // Resumable signal-frame context, FP allocated
    void*                stack_top;
    size_t               stack_size;
    cyros_port_entry_t   entry;
@@ -129,8 +131,20 @@ static constexpr std::size_t handler_stack_size = 128 * 1024; // 128KB
 /* Signal frames that can be live on one core's altstack at once: the reschedule
  * interception's capture, plus a timer nesting above it. The handler body does
  * not count, it runs on the handler stack. One more per additional signal that
- * can nest. See preempt-port-masking-explained.md. */
+ * can nest.
+ */
 static constexpr unsigned altstack_depth = 2;
+
+/* FP bytes one context needs on THIS machine, 64-aligned. Runtime, because the
+ * XSAVE area varies by CPU and a compile-time bound either wastes space or
+ * silently truncates vector state on a machine that outgrows it.
+ */
+static std::size_t fpstate_bytes()
+{
+   std::size_t n = sigctx_fpstate_size();
+   n = std::max(n, sizeof(struct sigctx_fpstate)); // Legacy floor
+   return (n + 63u) & ~std::size_t{63};
+}
 
 
 /* ============================================================================
@@ -172,9 +186,8 @@ struct global_state
    void reset()
    {
       shutdown_requested.store(false);
-      active_contexts.store(0);
       reschedule_handler = nullptr;
-      cores.clear(); // not '= {}', the started atomic makes cpu_core non-copyable
+      cores.clear();
    }
 };
 static constinit global_state global;
@@ -199,7 +212,7 @@ struct current_core_state
 
    // Captured at first signal delivery. Resuming it unwinds through
    // cyros_port_start_first() so the owning OS-thread can be joined.
-   sigctx_inl_t        scheduler_ctx{};
+   sigctx_dyn_t        scheduler_ctx{};
 
    // This thread's core. An index into global.cores,
    // Defaults to 0: the bootstrap thread is core 0.
@@ -247,7 +260,8 @@ struct current_core_state
       std::size_t const alt_min  = sigctx_altstack_min(altstack_depth);
       std::size_t const alt_size = ((alt_min + guard - 1) / guard) * guard;
 
-      stack_mapping_bytes = guard + handler_stack_size + guard + alt_size;
+      std::size_t const fp_size = fpstate_bytes();
+      stack_mapping_bytes = guard + handler_stack_size + guard + alt_size + fp_size;
 
       stack_mapping = mmap(nullptr, stack_mapping_bytes,
                            PROT_READ | PROT_WRITE,
@@ -270,10 +284,12 @@ struct current_core_state
          return err;
       }
 
-      handler_stack       = base + guard;
-      handler_stack_bytes = handler_stack_size;
-      altstack            = base + guard + handler_stack_size + guard;
-      altstack_bytes      = alt_size;
+      handler_stack              = base + guard;
+      handler_stack_bytes        = handler_stack_size;
+      altstack                   = base + guard + handler_stack_size + guard;
+      altstack_bytes             = alt_size;
+      scheduler_ctx.fpstate      = altstack + alt_size;
+      scheduler_ctx.fpstate_size = fp_size;
       return 0;
    }
 
@@ -291,6 +307,8 @@ struct current_core_state
       handler_stack_bytes = 0;
       altstack            = nullptr;
       altstack_bytes      = 0;
+      scheduler_ctx.fpstate      = nullptr;
+      scheduler_ctx.fpstate_size = 0;
    }
 
    static std::size_t guard_page_size()
@@ -636,7 +654,7 @@ static sigctx_ucontext_t* on_reschedule(sigctx_ucontext_t* paused, void*)
    if (bootstrapping) {
       current_core.bootstrapping = false;
       sigctx_copy(/*dst=*/ &current_core.scheduler_ctx.uc, current_core.scheduler_ctx.fpstate,
-                  sizeof(current_core.scheduler_ctx.fpstate),
+                  current_core.scheduler_ctx.fpstate_size,
                   /*src=*/ paused);
    }
 
@@ -708,6 +726,7 @@ static int install_interceptor()
 
 void cyros_port_init(cyros_port_reschedule_t reschedule_handler)
 {
+   CYROS_ASSERT_OP(global.active_contexts.load(std::memory_order_relaxed), ==, 0u);
    global.reschedule_handler = reschedule_handler;
 }
 
@@ -936,8 +955,12 @@ void cyros_port_context_init(cyros_port_context_t* context,
 {
    global.active_contexts.fetch_add(1, std::memory_order_seq_cst);
 
+   std::size_t const fp_size = fpstate_bytes();
+   void* const fp = std::aligned_alloc(SIGCTX_FPSTATE_ALIGN, fp_size);
+   CYROS_ASSERT(fp != nullptr); // Out of memory for a thread's FP area
+
    ::new (context) cyros_port_context{
-      .sctx       = {},
+      .sctx       = { .uc = {}, .fpstate = static_cast<uint8_t*>(fp), .fpstate_size = fp_size },
       .stack_top  = static_cast<uint8_t*>(stack_base) + stack_size,
       .stack_size = stack_size,
       .entry      = entry,
@@ -948,15 +971,14 @@ void cyros_port_context_init(cyros_port_context_t* context,
    // supplied stack. The FP area lives inline in this TCB context, so it travels
    // with the context and the self-pointer stays valid as long as the TCB does.
    sigctx_create(&context->sctx.uc,
-                 context->sctx.fpstate, sizeof(context->sctx.fpstate),
+                 context->sctx.fpstate, context->sctx.fpstate_size,
                  stack_base, stack_size,
                  entry, arg);
 }
 
 void cyros_port_context_destroy(cyros_port_context_t* context)
 {
-   // Nothing of the frame to release: it is the interception's paused context on
-   // the handler stack, and the switch that follows is told not to save into it.
+   std::free(context->sctx.fpstate);
    context->~cyros_port_context();
 
    CYROS_ASSERT(global.active_contexts.load(std::memory_order_relaxed) != 0);
@@ -991,7 +1013,7 @@ void cyros_port_switch(cyros_port_context_t* from, cyros_port_context_t* to)
       // Relocate the captured frame into the outgoing TCB while paused_uc still
       // points at live handler-stack storage. This is what lets the thread
       // resume later, after this handler invocation is gone.
-      sigctx_copy(/*dst=*/ &from->sctx.uc, from->sctx.fpstate, sizeof(from->sctx.fpstate),
+      sigctx_copy(/*dst=*/ &from->sctx.uc, from->sctx.fpstate, from->sctx.fpstate_size,
                   /*src=*/ current_core.paused_uc);
    }
 

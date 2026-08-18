@@ -2,6 +2,8 @@
 #include <cyros/config/config.hpp>
 #include <cyros/port/port_traits.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -42,8 +44,8 @@ struct ThreadSafeLog
 TEST(SingleCoreMultiThread_Test,
      GivenTwoEqualPriorityThreads_WhenSystemStarts_ThenThreadsExecuteInRegistrationOrder)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack1{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack2{};
+   cyros::test::guarded_stack stack1;
+   cyros::test::guarded_stack stack2;
 
    std::vector<thread::id> order;
 
@@ -67,8 +69,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenTwoEqualPriorityThreads_WhenEachYields_ThenTheyCooperativelyProgressAlternating)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack1{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack2{};
+   cyros::test::guarded_stack stack1;
+   cyros::test::guarded_stack stack2;
 
    std::vector<thread::id> order;
 
@@ -106,8 +108,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenTwoDifferentPriorities_WhenSystemStarts_ThenHigherPriorityRunsFirstEvenIfRegisteredSecond)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack_lo{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack_hi{};
+   cyros::test::guarded_stack stack_lo;
+   cyros::test::guarded_stack stack_hi;
 
    std::vector<thread::id> order;
 
@@ -131,9 +133,9 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenThreeEqualPriorityThreads_WhenTheyYield_ThenTheyRoundRobinInRegistrationOrder)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s1{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s2{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s3{};
+   cyros::test::guarded_stack s1;
+   cyros::test::guarded_stack s2;
+   cyros::test::guarded_stack s3;
 
    std::vector<thread::id> order;
 
@@ -173,8 +175,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenTwoThreads_WhenOneNeverYields_ThenOtherDoesNotRunUntilFirstReturns)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s1{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s2{};
+   cyros::test::guarded_stack s1;
+   cyros::test::guarded_stack s2;
 
    std::vector<int> markers;
 
@@ -213,7 +215,7 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenThirtyEqualPriorityThreads_WhenSystemStarts_ThenThreadsObeyRoundRobinRules)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::array<std::byte, STACK_SIZE>, 30> stacks{};
+   std::array<cyros::test::guarded_stack, 30> stacks;
 
 
    std::vector<thread> threads;
@@ -252,7 +254,7 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenThirtyDifferentPriorityThreads_WhenSystemStarts_ThenThreadsExecuteInPriorityOrder)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::array<std::byte, STACK_SIZE>, 30> stacks{};
+   std::array<cyros::test::guarded_stack, 30> stacks;
 
 
    std::vector<thread> threads;
@@ -291,8 +293,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenSingleThread_WhenThreadCreatesAnotherThreadOfHigherPriority_ThenThreadIsImmediatelyPreempted)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_creator{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_child{};
+   cyros::test::guarded_stack s_creator;
+   cyros::test::guarded_stack s_child;
 
    thread child_thread;
 
@@ -343,8 +345,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenSingleThread_WhenThreadCreatesAnotherThreadOfLowerPriority_ThenCreatedThreadDoesNotRunUntilFirstThreadFinishes)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_creator{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_child{};
+   cyros::test::guarded_stack s_creator;
+   cyros::test::guarded_stack s_child;
 
    thread child_thread;
 
@@ -395,8 +397,8 @@ TEST(SingleCoreMultiThread_Test,
 TEST(SingleCoreMultiThread_Test,
      GivenSingleThread_WhenThreadCreatesAnotherThreadOfEqualPriority_ThenCreatedThreadDoesNotRunUntilFirstThreadYields)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_creator{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_child{};
+   cyros::test::guarded_stack s_creator;
+   cyros::test::guarded_stack s_child;
 
    thread child_thread;
 
@@ -458,8 +460,8 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_stack{};
+   cyros::test::guarded_stack target_stack;
+   cyros::test::guarded_stack joiner_stack;
 
    std::atomic<bool> target_started{false};
    std::atomic<bool> target_finished{false};
@@ -511,9 +513,9 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_hi_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_lo_stack{};
+   cyros::test::guarded_stack target_stack;
+   cyros::test::guarded_stack joiner_hi_stack;
+   cyros::test::guarded_stack joiner_lo_stack;
 
    std::atomic<int> phase{0}; // monotonic progress marker
    std::atomic<bool> target_finished{false};
@@ -580,9 +582,9 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> helper_stack{};
+   cyros::test::guarded_stack target_stack;
+   cyros::test::guarded_stack joiner_stack;
+   cyros::test::guarded_stack helper_stack;
 
    std::atomic<bool> target_finished{false};
    std::atomic<bool> joiner_called_join{false};
@@ -643,9 +645,9 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack_a{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack_b{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> stack_c{};
+   cyros::test::guarded_stack stack_a;
+   cyros::test::guarded_stack stack_b;
+   cyros::test::guarded_stack stack_c;
 
    std::atomic<int> order{0}; // record completion order
    std::atomic<bool> a_done{false};
@@ -720,8 +722,8 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_exiter{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_other{};
+   cyros::test::guarded_stack s_exiter;
+   cyros::test::guarded_stack s_other;
 
    std::vector<int> markers;
 
@@ -768,7 +770,7 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_exiter{};
+   cyros::test::guarded_stack s_exiter;
 
    std::atomic<bool> reached_inner{false};
    std::atomic<bool> returned_from_inner{false};
@@ -811,8 +813,8 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> target_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> joiner_stack{};
+   cyros::test::guarded_stack target_stack;
+   cyros::test::guarded_stack joiner_stack;
 
    std::atomic<bool> target_reached_exit{false};
    std::atomic<bool> joiner_returned{false};
@@ -863,7 +865,7 @@ TEST(SingleCoreMultiThread_Test,
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::array<std::byte, STACK_SIZE>, 6> stacks{};
+   std::array<cyros::test::guarded_stack, 6> stacks;
 
    std::vector<thread> threads;
    threads.reserve(stacks.size());

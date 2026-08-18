@@ -4,6 +4,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -51,11 +53,6 @@ constexpr int contract_reps = 3;
 // lifecycle, so cheap to raise.
 constexpr std::uint64_t tokens_total = 20'000;
 
-struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
-{
-   std::array<std::byte, STACK_SIZE> bytes;
-};
-
 class SyncSemaphore_Test : public ::testing::Test {};
 
 }  // namespace
@@ -72,7 +69,7 @@ TEST_F(SyncSemaphore_Test, GivenTokens_WhenSingleThreadDrivesTheCount_ThenAccoun
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> driver_stack{};
+   cyros::test::guarded_stack driver_stack;
 
    struct state
    {
@@ -132,7 +129,7 @@ TEST_F(SyncSemaphore_Test, GivenZeroCount_WhenAcquire_ThenBlocksUntilRelease)
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 3> stacks{};
+      static std::array<cyros::test::guarded_stack, 3> stacks;
 
       struct state
       {
@@ -148,7 +145,7 @@ TEST_F(SyncSemaphore_Test, GivenZeroCount_WhenAcquire_ThenBlocksUntilRelease)
             s.acquire_after_release.store(s.released_first.load(std::memory_order_acquire),
                                           std::memory_order_release);
          },
-         stacks[0].bytes,
+         stacks[0],
          thread::priority(1),
          core0
       );
@@ -160,7 +157,7 @@ TEST_F(SyncSemaphore_Test, GivenZeroCount_WhenAcquire_ThenBlocksUntilRelease)
       // lets this run, and the ordering flag then records the violation.
       thread witness(
          [&s]{ s.consumer_waiting.store(true, std::memory_order_release); },
-         stacks[1].bytes,
+         stacks[1],
          thread::priority(2),
          core0
       );
@@ -173,7 +170,7 @@ TEST_F(SyncSemaphore_Test, GivenZeroCount_WhenAcquire_ThenBlocksUntilRelease)
             s.released_first.store(true, std::memory_order_release);
             s.sem.release();
          },
-         stacks[2].bytes,
+         stacks[2],
          thread::priority(0),
          core1
       );
@@ -204,7 +201,7 @@ TEST_F(SyncSemaphore_Test, GivenProducersAndConsumersAcrossCores_WhenTokensFlow_
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -235,13 +232,13 @@ TEST_F(SyncSemaphore_Test, GivenProducersAndConsumersAcrossCores_WhenTokensFlow_
       };
 
       thread p0([&s, &producer_body]{ producer_body(s, tokens_total / 2); },
-                stacks[0].bytes, thread::priority(1), core0);
+                stacks[0], thread::priority(1), core0);
       thread p1([&s, &producer_body]{ producer_body(s, tokens_total / 2); },
-                stacks[1].bytes, thread::priority(1), core1);
+                stacks[1], thread::priority(1), core1);
 
       thread c0(
          [&s, &consumer_body]{ consumer_body(s); },
-         stacks[2].bytes, thread::priority(1), core2);
+         stacks[2], thread::priority(1), core2);
       thread c1(
          [&s, &consumer_body]{
             consumer_body(s);
@@ -254,7 +251,7 @@ TEST_F(SyncSemaphore_Test, GivenProducersAndConsumersAcrossCores_WhenTokensFlow_
             s.final_peek.store(s.sem.peek(), std::memory_order_release);
             s.post_drain_take.store(s.sem.try_acquire(), std::memory_order_release);
          },
-         stacks[3].bytes, thread::priority(1), core3);
+         stacks[3], thread::priority(1), core3);
 
       kernel::start();
 
@@ -282,7 +279,7 @@ TEST_F(SyncSemaphore_Test, GivenThreeParkedWaiters_WhenReleaseThree_ThenAllProce
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 7> stacks{};
+      static std::array<cyros::test::guarded_stack, 7> stacks;
 
       struct state
       {
@@ -302,12 +299,12 @@ TEST_F(SyncSemaphore_Test, GivenThreeParkedWaiters_WhenReleaseThree_ThenAllProce
                s.sem.acquire();
                s.proceeded.fetch_add(1, std::memory_order_acq_rel);
             },
-            stacks[i].bytes, thread::priority(1), waiter_core[i]);
+            stacks[i], thread::priority(1), waiter_core[i]);
 
          // Lower priority on the waiter's own core: proof of park.
          witnesses[i] = thread(
             [&s]{ s.parked.fetch_add(1, std::memory_order_acq_rel); },
-            stacks[3 + i].bytes, thread::priority(2), waiter_core[i]);
+            stacks[3 + i], thread::priority(2), waiter_core[i]);
       }
 
       thread releaser(
@@ -321,7 +318,7 @@ TEST_F(SyncSemaphore_Test, GivenThreeParkedWaiters_WhenReleaseThree_ThenAllProce
             }
             s.final_peek.store(s.sem.peek(), std::memory_order_release);
          },
-         stacks[6].bytes, thread::priority(0), core3);
+         stacks[6], thread::priority(0), core3);
 
       kernel::start();
 

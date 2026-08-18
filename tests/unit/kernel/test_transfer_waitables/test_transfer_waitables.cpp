@@ -4,6 +4,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -100,9 +102,9 @@ TEST_F(MultiCoreTransfer_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> witness_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack witness_stack;
 
       TransferResource r;
       std::atomic<bool> owner_ready{false};
@@ -198,10 +200,10 @@ TEST_F(MultiCoreTransfer_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> witness_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> barger_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack witness_stack;
+      cyros::test::guarded_stack barger_stack;
 
       TransferResource r;
       std::atomic<bool> owner_ready{false};
@@ -314,11 +316,11 @@ TEST_F(MultiCoreTransfer_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> low_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> low_witness_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> high_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> high_witness_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack low_stack;
+      cyros::test::guarded_stack low_witness_stack;
+      cyros::test::guarded_stack high_stack;
+      cyros::test::guarded_stack high_witness_stack;
 
       TransferResource r;
       std::atomic<bool> owner_ready{false};
@@ -472,8 +474,8 @@ TEST_F(MultiCoreTransfer_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> racer_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack racer_stack;
 
       TransferResource r;
       std::atomic<bool> racer_completed{false};
@@ -545,9 +547,9 @@ TEST_F(MultiCoreTransfer_Test,
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> witness_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack witness_stack;
 
       class PlainWaitable final : public waitable
       {

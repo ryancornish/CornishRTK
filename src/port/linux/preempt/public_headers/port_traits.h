@@ -18,7 +18,7 @@
  * @def CYROS_PORT_CONTEXT_SIZE
  * @brief Size of `port_context_t` in bytes.
  */
-#define CYROS_PORT_CONTEXT_SIZE  3584
+#define CYROS_PORT_CONTEXT_SIZE  512
 
 /**
  * @def CYROS_PORT_CONTEXT_ALIGN

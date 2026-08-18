@@ -40,6 +40,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -55,11 +57,6 @@ namespace
 
 constexpr auto STACK_SIZE = thread::min_stack_size + (16 * 1024);
 constexpr std::uint64_t poll_budget = 20'000'000;
-
-struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
-{
-   std::array<std::byte, STACK_SIZE> bytes;
-};
 
 template <typename Predicate>
 [[nodiscard]] bool bounded_poll(Predicate&& done, std::uint64_t budget = poll_budget) noexcept
@@ -114,7 +111,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -155,7 +152,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.stop_spinner.store(true, std::memory_order_release);
             s.m.unlock();
          },
-         stacks[0].bytes, thread::priority(5), core0);
+         stacks[0], thread::priority(5), core0);
 
       // N: better base priority than H, never blocks. Becomes ready only once H
       // owns the mutex, so it cannot interfere with the acquisition itself.
@@ -167,7 +164,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[1].bytes, thread::priority(3), core0);
+         stacks[1], thread::priority(3), core0);
 
       // U: the urgent waiter, on another core so it can run while core0 is busy.
       thread u(
@@ -178,7 +175,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m.lock();     // donates urgency 1 to H
             s.m.unlock();
          },
-         stacks[2].bytes, thread::priority(1), core2);
+         stacks[2], thread::priority(1), core2);
 
       // Conductor: bounded observation, and a bail that releases every gate so
       // the kernel can quiesce even when the property failed.
@@ -189,7 +186,7 @@ TEST_F(SyncMutexPiDerived_Test,
                s.stop_spinner.store(true, std::memory_order_release);
             }
          },
-         stacks[3].bytes, thread::priority(0), core3);
+         stacks[3], thread::priority(0), core3);
 
       kernel::start();
 
@@ -231,7 +228,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, bridges + 2> stacks{};
+      std::array<cyros::test::guarded_stack, bridges + 2> stacks;
 
       struct state
       {
@@ -255,7 +252,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.shared.unlock();
          },
-         stacks[0].bytes, thread::priority(20), core0);
+         stacks[0], thread::priority(20), core0);
       s.c = &c;   // the driver reads C's reported urgency through the public port
 
       // Each bridge: hold its own mutex, then block on the shared one. Base
@@ -275,7 +272,7 @@ TEST_F(SyncMutexPiDerived_Test,
                s.shared.unlock();
                s.own[i].unlock();
             },
-            stacks[i + 1].bytes,
+            stacks[i + 1],
             thread::priority(10),
             // Deliberately NOT core0. C spins there while holding the mutex, so
             // a bridge sharing that core would have the better base priority,
@@ -306,7 +303,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.release_c.store(true, std::memory_order_release);
          },
-         stacks[bridges + 1].bytes, thread::priority(0), core3);
+         stacks[bridges + 1], thread::priority(0), core3);
 
       kernel::start();
 
@@ -356,7 +353,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -389,7 +386,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.m.unlock();
          },
-         stacks[0].bytes, thread::priority(20), core0);
+         stacks[0], thread::priority(20), core0);
 
       thread a(
          [&s]{
@@ -399,7 +396,7 @@ TEST_F(SyncMutexPiDerived_Test,
                this_thread::yield();
             }
          },
-         stacks[1].bytes, thread::priority(10), core0);
+         stacks[1], thread::priority(10), core0);
 
       // The donor. Base 10, so it drives H's urgency onto exactly A's key.
       thread d(
@@ -410,7 +407,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m.lock();
             s.m.unlock();
          },
-         stacks[2].bytes, thread::priority(10), core1);
+         stacks[2], thread::priority(10), core1);
 
       thread driver(
          [&s]{
@@ -432,7 +429,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.stop.store(true, std::memory_order_release);
          },
-         stacks[3].bytes, thread::priority(0), core3);
+         stacks[3], thread::priority(0), core3);
 
       kernel::start();
 
@@ -479,7 +476,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 5> stacks{};
+      static std::array<cyros::test::guarded_stack, 5> stacks;
 
       struct state
       {
@@ -512,7 +509,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.m1.unlock();
          },
-         stacks[0].bytes, thread::priority(20), core0);
+         stacks[0], thread::priority(20), core0);
 
       thread h2(
          [&s]{
@@ -525,7 +522,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.m2.unlock();
          },
-         stacks[1].bytes, thread::priority(21), core0);
+         stacks[1], thread::priority(21), core0);
 
       s.h1 = &h1;
       s.h2 = &h2;
@@ -538,7 +535,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m1.lock();
             s.m1.unlock();
          },
-         stacks[2].bytes, thread::priority(donor_priority), core1);
+         stacks[2], thread::priority(donor_priority), core1);
 
       thread d2(
          [&s]{
@@ -548,7 +545,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m2.lock();
             s.m2.unlock();
          },
-         stacks[3].bytes, thread::priority(donor_priority), core2);
+         stacks[3], thread::priority(donor_priority), core2);
 
       thread driver(
          [&s]{
@@ -575,7 +572,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.stop.store(true, std::memory_order_release);
          },
-         stacks[4].bytes, thread::priority(0), core3);
+         stacks[4], thread::priority(0), core3);
 
       kernel::start();
 
@@ -622,7 +619,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 4> stacks{};
+      static std::array<cyros::test::guarded_stack, 4> stacks;
 
       struct state
       {
@@ -653,7 +650,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.mild.unlock();
          },
-         stacks[0].bytes, thread::priority(20), core0);
+         stacks[0], thread::priority(20), core0);
       s.h = &h;
 
       auto const waiter = [&s](mutex& m) {
@@ -666,8 +663,8 @@ TEST_F(SyncMutexPiDerived_Test,
          };
       };
 
-      thread w_mild(waiter(s.mild), stacks[1].bytes, thread::priority(mild_priority), core1);
-      thread w_keen(waiter(s.keen), stacks[2].bytes, thread::priority(keen_priority), core2);
+      thread w_mild(waiter(s.mild), stacks[1], thread::priority(mild_priority), core1);
+      thread w_keen(waiter(s.keen), stacks[2], thread::priority(keen_priority), core2);
 
       thread driver(
          [&s]{
@@ -688,7 +685,7 @@ TEST_F(SyncMutexPiDerived_Test,
             }
             s.drop_mild.store(true, std::memory_order_release);
          },
-         stacks[3].bytes, thread::priority(0), core3);
+         stacks[3], thread::priority(0), core3);
 
       kernel::start();
 
@@ -737,7 +734,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 6> stacks{};
+      static std::array<cyros::test::guarded_stack, 6> stacks;
 
       struct state
       {
@@ -770,7 +767,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m.unlock();                                  // hands the mutex to H
             s.l_released.store(true, std::memory_order_release);
          },
-         stacks[0].bytes, thread::priority(4), core1);
+         stacks[0], thread::priority(4), core1);
 
       thread h(
          [&s]{
@@ -782,7 +779,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.stop_spinner.store(true, std::memory_order_release);
             s.m.unlock();
          },
-         stacks[1].bytes, thread::priority(5), core0);
+         stacks[1], thread::priority(5), core0);
       s.h = &h;
 
       // Witness: worse base priority than H and on H's core, so it runs only
@@ -793,7 +790,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.h_parked.store(true, std::memory_order_release);
             s.n_gate.release();
          },
-         stacks[2].bytes, thread::priority(6), core0);
+         stacks[2], thread::priority(6), core0);
 
       // N: better base priority than H, never blocks, shares H's core.
       thread n(
@@ -804,7 +801,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[3].bytes, thread::priority(3), core0);
+         stacks[3], thread::priority(3), core0);
 
       // U: the urgent waiter. It must arrive AFTER the handover, otherwise it
       // would be the best waiter and the release would choose it, not H.
@@ -816,7 +813,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m.lock();     // donates urgency 1 to H
             s.m.unlock();
          },
-         stacks[4].bytes, thread::priority(1), core2);
+         stacks[4], thread::priority(1), core2);
 
       thread driver(
          [&s]{
@@ -834,7 +831,7 @@ TEST_F(SyncMutexPiDerived_Test,
                s.stop_spinner.store(true, std::memory_order_release);
             }
          },
-         stacks[5].bytes, thread::priority(0), core3);
+         stacks[5], thread::priority(0), core3);
 
       kernel::start();
 
@@ -881,7 +878,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 6> stacks{};
+      static std::array<cyros::test::guarded_stack, 6> stacks;
 
       struct state
       {
@@ -912,7 +909,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.stop_spinner.store(true, std::memory_order_release);
             s.m1.unlock();
          },
-         stacks[0].bytes, thread::priority(5), core0);
+         stacks[0], thread::priority(5), core0);
       s.c = &c;
 
       // N, base 2 on core0: never blocks. Beats C's base 5 and beats the
@@ -924,7 +921,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[1].bytes, thread::priority(2), core0);
+         stacks[1], thread::priority(2), core0);
 
       // B, base 3 on core1: the middle link. Holds m2, blocks on m1, and is
       // therefore a BRIDGE on m1's queue.
@@ -938,7 +935,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m1.unlock();
             s.m2.unlock();
          },
-         stacks[2].bytes, thread::priority(3), core1);
+         stacks[2], thread::priority(3), core1);
       s.b = &b;
 
       // Witness on B's core, worse base priority, so it runs only once B has
@@ -947,7 +944,7 @@ TEST_F(SyncMutexPiDerived_Test,
          [&s]{
             s.b_parked.store(true, std::memory_order_release);
          },
-         stacks[3].bytes, thread::priority(6), core1);
+         stacks[3], thread::priority(6), core1);
 
       // A, base 1 on core2: arrives last and should lift C to 1 THROUGH B.
       thread a(
@@ -959,7 +956,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m2.unlock();
             s.a_done.store(true, std::memory_order_release);
          },
-         stacks[4].bytes, thread::priority(1), core2);
+         stacks[4], thread::priority(1), core2);
 
       thread driver(
          [&s]{
@@ -975,7 +972,7 @@ TEST_F(SyncMutexPiDerived_Test,
                s.stop_spinner.store(true, std::memory_order_release);
             }
          },
-         stacks[5].bytes, thread::priority(0), core3);
+         stacks[5], thread::priority(0), core3);
 
       kernel::start();
 
@@ -1037,7 +1034,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 6> stacks{};
+      static std::array<cyros::test::guarded_stack, 6> stacks;
 
       struct state
       {
@@ -1070,7 +1067,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.stop_spinner.store(true, std::memory_order_release);
             s.m1.unlock();
          },
-         stacks[0].bytes, thread::priority(5), core0);
+         stacks[0], thread::priority(5), core0);
       s.c = &c;
 
       // N, base 2 on core0: never blocks. Beats C's base 5 and the urgency 3
@@ -1083,7 +1080,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[1].bytes, thread::priority(2), core0);
+         stacks[1], thread::priority(2), core0);
 
       // B, base 3 on core1: the middle link. Waits until N owns core0, so its
       // donation cannot land while C is still running and pass the round
@@ -1106,7 +1103,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m1.unlock();
             s.m2.unlock();
          },
-         stacks[2].bytes, thread::priority(3), core1);
+         stacks[2], thread::priority(3), core1);
       s.b = &b;
 
       // P, base 0 on B's core: released mid-window, then holds B off the core
@@ -1118,7 +1115,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[3].bytes, thread::priority(0), core1);
+         stacks[3], thread::priority(0), core1);
 
       // A, base 1 on core2: the donor. Fires at a fixed delay past every
       // possible landing of P, so in a round where P caught the window the
@@ -1139,7 +1136,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m2.lock();
             s.m2.unlock();
          },
-         stacks[4].bytes, thread::priority(1), core2);
+         stacks[4], thread::priority(1), core2);
 
       thread driver(
          [&s, rep]{
@@ -1177,7 +1174,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.failed_stage.store(2, std::memory_order_release);
             s.stop_spinner.store(true, std::memory_order_release);
          },
-         stacks[5].bytes, thread::priority(0), core3);
+         stacks[5], thread::priority(0), core3);
 
       kernel::start();
 
@@ -1229,7 +1226,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 3> stacks{};
+      static std::array<cyros::test::guarded_stack, 3> stacks;
 
       struct state
       {
@@ -1276,7 +1273,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[0].bytes, thread::priority(5), core0);
+         stacks[0], thread::priority(5), core0);
 
       thread n(
          [&s]{
@@ -1290,7 +1287,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[1].bytes, thread::priority(3), core0);
+         stacks[1], thread::priority(3), core0);
 
       thread driver(
          [&s]{
@@ -1307,7 +1304,7 @@ TEST_F(SyncMutexPiDerived_Test,
             // thread left that can.
             s.stop_spinner.store(true, std::memory_order_release);
          },
-         stacks[2].bytes, thread::priority(0), core3);
+         stacks[2], thread::priority(0), core3);
 
       kernel::start();
 
@@ -1371,7 +1368,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
       kernel::initialise();
 
-      static std::array<aligned_stack, 6> stacks{};
+      static std::array<cyros::test::guarded_stack, 6> stacks;
 
       struct state
       {
@@ -1410,7 +1407,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[0].bytes, thread::priority(5), core0);
+         stacks[0], thread::priority(5), core0);
       s.h = &h;
 
       // X: better base priority than the ceiling, so it decides the question.
@@ -1423,7 +1420,7 @@ TEST_F(SyncMutexPiDerived_Test,
                cyros_port_cpu_relax();
             }
          },
-         stacks[1].bytes, thread::priority(1), core0);
+         stacks[1], thread::priority(1), core0);
 
       // W: the middle link. Holds M, then parks on C, which makes it a bridge
       // on C's queue and the thing a correct fold has to look at.
@@ -1437,7 +1434,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.c.unlock();
             s.m.unlock();
          },
-         stacks[2].bytes, thread::priority(4), core1);
+         stacks[2], thread::priority(4), core1);
       s.w = &w;
 
       // Witness on W's core, worse base priority, so it runs only once W has
@@ -1446,7 +1443,7 @@ TEST_F(SyncMutexPiDerived_Test,
          [&s]{
             s.w_parked.store(true, std::memory_order_release);
          },
-         stacks[3].bytes, thread::priority(6), core1);
+         stacks[3], thread::priority(6), core1);
 
       // U: the source of the urgency that must reach H. Never touches C.
       thread u(
@@ -1457,7 +1454,7 @@ TEST_F(SyncMutexPiDerived_Test,
             s.m.lock();     // lifts W to 0, which must reach H through C
             s.m.unlock();
          },
-         stacks[4].bytes, thread::priority(0), core2);
+         stacks[4], thread::priority(0), core2);
 
       thread driver(
          [&s]{
@@ -1497,7 +1494,7 @@ TEST_F(SyncMutexPiDerived_Test,
 
             s.stop_all.store(true, std::memory_order_release);
          },
-         stacks[5].bytes, thread::priority(0), core3);
+         stacks[5], thread::priority(0), core3);
 
       kernel::start();
 

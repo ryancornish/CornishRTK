@@ -55,6 +55,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -86,11 +88,6 @@ constexpr std::uint64_t storm_interval_ticks  = 1;
  * across one of those is an interleaving a single long run never samples. */
 constexpr std::uint64_t pace_iterations = 20'000;
 constexpr int           reps            = 3;
-
-struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
-{
-   std::array<std::byte, STACK_SIZE> bytes;
-};
 
 struct storm_state
 {
@@ -155,7 +152,7 @@ TEST_F(MutexTimerStorm_Test, GivenAHighRateTickOnEveryCore_WhenMutexesAreContend
    time::initialise(tick_hz);   // global, and must precede kernel::start()
    kernel::initialise();
 
-   static std::array<aligned_stack, 4> stacks{};
+   static std::array<cyros::test::guarded_stack, 4> stacks;
    storm_state s;
 
    // core0: the pacer. Contends for the inner mutex and decides when to stop.
@@ -171,7 +168,7 @@ TEST_F(MutexTimerStorm_Test, GivenAHighRateTickOnEveryCore_WhenMutexesAreContend
 
          disarm_storm(h);
       },
-      stacks[0].bytes, thread::priority(5), core0);
+      stacks[0], thread::priority(5), core0);
 
    // core1: nests inner inside outer, so it queues behind core3's holder while
    // itself holding nothing, and behind core0/core2 on the inner one. This is
@@ -188,7 +185,7 @@ TEST_F(MutexTimerStorm_Test, GivenAHighRateTickOnEveryCore_WhenMutexesAreContend
          }
          disarm_storm(h);
       },
-      stacks[1].bytes, thread::priority(4), core1);
+      stacks[1], thread::priority(4), core1);
 
    // core2: pure contention on the inner mutex, at the best base priority, so
    // it is the thread most likely to be the one a boost has to beat.
@@ -202,7 +199,7 @@ TEST_F(MutexTimerStorm_Test, GivenAHighRateTickOnEveryCore_WhenMutexesAreContend
          }
          disarm_storm(h);
       },
-      stacks[2].bytes, thread::priority(3), core2);
+      stacks[2], thread::priority(3), core2);
 
    // core3: holds the outer mutex across a block on the semaphore, and is woken
    // by its OWN core's timer ISR. Worst base priority, so while it holds the
@@ -218,7 +215,7 @@ TEST_F(MutexTimerStorm_Test, GivenAHighRateTickOnEveryCore_WhenMutexesAreContend
          }
          disarm_storm(h);
       },
-      stacks[3].bytes, thread::priority(6), core3);
+      stacks[3], thread::priority(6), core3);
 
    kernel::start();
    kernel::finalise();

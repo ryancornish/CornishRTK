@@ -3,6 +3,8 @@
 #include <cyros/config/config.hpp>
 #include <cyros/port/port_traits.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <array>
@@ -45,8 +47,8 @@ class MultiCoreMultiThread_Test : public ::testing::Test
 TEST_F(MultiCoreMultiThread_Test,
        GivenTwoCoresAndOneThreadPinnedToEach_WhenKernelStarts_ThenBothThreadsRunOnExpectedCore)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s0{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s1{};
+   cyros::test::guarded_stack s0;
+   cyros::test::guarded_stack s1;
 
    bool ran0 = false;
    bool ran1 = false;
@@ -95,8 +97,8 @@ TEST_F(MultiCoreMultiThread_Test,
 TEST_F(MultiCoreMultiThread_Test,
        GivenTwoCores_WhenCore0CreatesAThreadPinnedToCore1AfterStart_ThenCore1RunsIt)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_creator{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> s_remote{};
+   cyros::test::guarded_stack s_creator;
+   cyros::test::guarded_stack s_remote;
 
    bool remote_ran = false;
    uint32_t remote_seen_core = std::numeric_limits<uint32_t>::max();
@@ -145,14 +147,14 @@ TEST_F(MultiCoreMultiThread_Test,
 {
    if (kernel::core_count() < 4)  GTEST_SKIP() << "Need at least 4 cores for this test";
 
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s0{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s1{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s2{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s3{};
+   cyros::test::guarded_stack s0;
+   cyros::test::guarded_stack s1;
+   cyros::test::guarded_stack s2;
+   cyros::test::guarded_stack s3;
 
    std::array<int, 4> stages{0};
 
-   auto make_thread = [&](uint32_t core_id, std::array<std::byte, STACK_SIZE>& stack) -> thread
+   auto make_thread = [&](uint32_t core_id, cyros::test::guarded_stack& stack) -> thread
    {
       return {
          [&, core_id]{
@@ -196,8 +198,8 @@ TEST_F(MultiCoreMultiThread_Test,
 TEST_F(MultiCoreMultiThread_Test,
        GivenTwoCores_WhenCore0PokesCore1WhileCore1IsIdle_ThenCore1WakesAndRunsQueuedWork)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s_core0{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s_core1_work{};
+   cyros::test::guarded_stack s_core0;
+   cyros::test::guarded_stack s_core1_work;
 
    bool core1_work_ran = false;
    thread core1_work; // Empty handle
@@ -247,8 +249,8 @@ TEST_F(MultiCoreMultiThread_Test,
 TEST_F(MultiCoreMultiThread_Test,
        GivenJoinersOnThreeCores_WhenTargetOnCore0CallsThreadExit_ThenEveryJoinerIsWokenAndReturns)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::byte, STACK_SIZE> s_target{};
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::array<std::byte, STACK_SIZE>, 3> s_joiners{};
+   cyros::test::guarded_stack s_target;
+   std::array<cyros::test::guarded_stack, 3> s_joiners;
 
    std::atomic<bool> target_exited{false};
    std::array<std::atomic<bool>, 3> joiner_returned{};
@@ -304,7 +306,7 @@ TEST_F(MultiCoreMultiThread_Test,
 TEST_F(MultiCoreMultiThread_Test,
        GivenEveryCoreRunningThreadsThatExitExplicitly_WhenSystemRuns_ThenAllTerminateAndTheRunWindsDown)
 {
-   alignas(CYROS_PORT_STACK_ALIGN) std::array<std::array<std::byte, STACK_SIZE>, 4> stacks{};
+   std::array<cyros::test::guarded_stack, 4> stacks;
 
    std::array<std::atomic<int>, 4> stages{};
 

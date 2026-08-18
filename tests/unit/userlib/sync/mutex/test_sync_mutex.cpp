@@ -4,6 +4,8 @@
 #include <cyros/port/port_traits.h>
 #include <cyros/port/port.h>
 
+#include <common/guarded_stack.hpp>
+
 #include "gtest/gtest.h"
 
 #include <type_traits>
@@ -122,11 +124,6 @@ constexpr int critical_section_widen = 8;
 // wires them through correctly.
 constexpr int handoff_reps = 50;
 
-struct alignas(CYROS_PORT_STACK_ALIGN) aligned_stack
-{
-   std::array<std::byte, STACK_SIZE> bytes;
-};
-
 // Each test owns its own kernel lifecycle, so the fixture is empty. Inheriting
 // from ::testing::Test (rather than bare TEST) keeps naming consistent with
 // the other kernel/userlib suites.
@@ -147,7 +144,7 @@ TEST_F(SyncMutex_Test, GivenNoContention_WhenSingleThreadDrivesTryLockAndLock_Th
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> driver_stack{};
+   cyros::test::guarded_stack driver_stack;
 
    struct state
    {
@@ -214,8 +211,8 @@ TEST_F(SyncMutex_Test, GivenHeldByAnotherCore_WhenTryLockProbes_ThenItFails)
 {
    kernel::initialise();
 
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> holder_stack{};
-   alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> observer_stack{};
+   cyros::test::guarded_stack holder_stack;
+   cyros::test::guarded_stack observer_stack;
 
    struct state
    {
@@ -309,7 +306,7 @@ TEST_F(SyncMutex_Test, GivenFourCoresHammeringOneMutex_WhenTheyLockRepeatedly_Th
 
       kernel::initialise();
 
-      static std::array<aligned_stack, contention_workers> worker_stacks{};
+      static std::array<cyros::test::guarded_stack, contention_workers> worker_stacks;
 
       struct state
       {
@@ -348,7 +345,7 @@ TEST_F(SyncMutex_Test, GivenFourCoresHammeringOneMutex_WhenTheyLockRepeatedly_Th
       for (std::size_t i = 0; i < contention_workers; ++i) {
          workers[i] = thread(
             worker_body,
-            worker_stacks[i].bytes,
+            worker_stacks[i],
             thread::priority(0),
             core_affinity::from_id(static_cast<std::uint32_t>(i))
          );
@@ -393,10 +390,10 @@ TEST_F(SyncMutex_Test, GivenWaiterParkedAndFreshCoreProbing_WhenOwnerUnlocks_The
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> witness_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> barger_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack waiter_stack;
+      cyros::test::guarded_stack witness_stack;
+      cyros::test::guarded_stack barger_stack;
 
       struct state
       {
@@ -523,11 +520,11 @@ TEST_F(SyncMutex_Test, GivenTwoWaitersOfDifferentPriorityParked_WhenOwnerUnlocks
 
       kernel::initialise();
 
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> owner_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> low_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> low_witness_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> high_stack{};
-      alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> high_witness_stack{};
+      cyros::test::guarded_stack owner_stack;
+      cyros::test::guarded_stack low_stack;
+      cyros::test::guarded_stack low_witness_stack;
+      cyros::test::guarded_stack high_stack;
+      cyros::test::guarded_stack high_witness_stack;
 
       struct state
       {
