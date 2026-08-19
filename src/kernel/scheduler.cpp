@@ -96,7 +96,7 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
       return schedule_hint::unwarranted;
    }
 
-   // A thread holding a pi_waitable can be more urgent than its base priority,
+   // A thread holding a base_mutex can be more urgent than its base priority,
    // so it cannot be filed under a fixed key. It goes on the holder list, which
    // the pick folds urgency over. Everyone else is filed at base_priority, which
    // never changes, so nothing ever re-keys the matrix.
@@ -139,7 +139,7 @@ void scheduler::set_thread_terminated(thread_control_block& tcb)
    CYROS_ASSERT(tcb.disposition == thread_disposition::terminating);
    CYROS_ASSERT(&tcb != idle_thread); // A core always needs somewhere to go
    CYROS_ASSERT(!tcb.is_enqueued());
-   CYROS_ASSERT(tcb.holds_nothing()); // Thread cannot own a pi_waitable on termination
+   CYROS_ASSERT(tcb.holds_nothing()); // Thread cannot own a base_mutex on termination
 
    tcb.state = thread_state::terminated;
 

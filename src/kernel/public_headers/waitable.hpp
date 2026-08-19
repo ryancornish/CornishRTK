@@ -136,7 +136,7 @@ class CYROS_PUBLIC wait_queue
     * The slow path exists because a waiter that itself HOLDS something can be
     * more urgent than its base: that is the transitive chain. Only such a waiter
     * can be, so the fold runs over the bridges alone rather than the whole queue,
-    * and bridge_mask is zero in the overwhelming majority of queues.
+    * and may_have_bridges is false for the overwhelming majority of queues.
     *
     * @param resource_owner The owner word of the resource this queue backs.
     *        Read UNDER the queue lock and excluded from the bridge fold: an
@@ -157,8 +157,9 @@ class CYROS_PUBLIC wait_queue
     *
     *        The lock-free CAS take is the one owner transition outside this
     *        lock, and racing it is UNREACHABLE rather than merely benign. A
-    *        fold arrives at a queue only through waitable_access::queue_top,
-    *        whose sole caller walks a thread's held_slots, and a mutex is filed
+    *        fold arrives at a queue only through
+    *        waitable_access::urgency_contribution, whose sole caller walks a
+    *        thread's held_slots, and a mutex is filed
     *        there only by claim_slot, called either after the CAS that made the
     *        owner or from the handover commit under this lock. So anything able
     *        to consult this queue already observes the owner word set. Stated
@@ -195,7 +196,7 @@ class CYROS_PUBLIC wait_queue
  * @brief A wait queue owned by a priority-inheritance resource.
  *
  * Nothing but composition: the queue that parks the waiters, plus the
- * inheritance state only a PI resource ever reads. Each forwarder supplies the
+ * inheritance state only base_mutex ever reads. Each forwarder supplies the
  * cache, so a resource holding one of these cannot forget its own bookkeeping,
  * and a plain waitable holding a bare wait_queue cannot accidentally pay for it.
  *
@@ -349,7 +350,7 @@ protected:
     * release frees it.
     *
     * A woken thread finds the resource already assigned to it, so the
-    * derived is_satisfied() must recognise ownership by id in addition to
+    * derived hook must recognise ownership by id in addition to
     * taking the resource when free. No fresh caller can interpose between
     * the release and the woken thread running, which is the barge-free
     * guarantee.

@@ -98,7 +98,7 @@ void pin_thread_to_core(thread_control_block& tcb) noexcept
 inline constexpr unsigned max_inheritance_depth = 8;
 
 /**
- * @brief min(base, best waiter of every held PI resource).
+ * @brief min(base, best waiter of every base_mutex held).
  *
  * The definition of effective priority, folded from current truth.
  *

@@ -46,7 +46,7 @@ private:
     * to look at.*/
    std::atomic<thread_control_block*> intake_head{nullptr};
 
-   /* Threads pinned here that hold at least one pi_waitable, i.e. exactly the
+   /* Threads pinned here that hold at least one base_mutex, i.e. exactly the
     * threads whose urgency can differ from their base priority. Core-local and
     * needs no atomics: see thread_control_block::holder_next.
     *

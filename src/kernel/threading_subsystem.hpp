@@ -71,7 +71,7 @@ enum class thread_disposition : uint8_t
 };
 
 /**
- * @brief Maximum pi_waitables one thread may own at once.
+ * @brief Maximum base_mutexes one thread may own at once.
  *
  * Deliberately a kernel constant and NOT user configuration. The bound has to
  * exist and be stated (it is what makes the urgency fold's worst case a number
@@ -102,7 +102,7 @@ struct thread_control_block
    /* The thread's own priority, fixed for its lifetime.
     *
     * There is no effective_priority field. Urgency is min(base, best waiter of
-    * every pi_waitable held) and is COMPUTED at the point of use by
+    * every base_mutex held) and is COMPUTED at the point of use by
     * thread_action::urgency(), never stored. A stored copy would be a cache whose
     * inputs live on other cores, which is what every priority-inheritance bug in
     * this project's history has been. */
@@ -215,7 +215,7 @@ struct thread_control_block
    std::atomic<thread_control_block*> intake_next{nullptr};
 
    /* Link in the owning core's list of READY threads that hold at least one
-    * pi_waitable. Self-pointer is the not-linked sentinel, as elsewhere.
+    * base_mutex. Self-pointer is the not-linked sentinel, as elsewhere.
     *
     * Membership is a property of being ready, not of holding: a thread joins at
     * set_thread_ready and leaves when picked. It is never listed while running,
@@ -228,9 +228,9 @@ struct thread_control_block
     * zero everywhere else, so the list is almost always empty and the pick
     * degenerates to the matrix head.
     *
-    * Needs no atomics: membership changes only in register_held and pi_release,
-    * both of which run in the holder's OWN context on its OWN core, and the
-    * only reader is that core's pick. */
+    * Needs no atomics: membership changes only in set_thread_ready and
+    * pick_next, both of which run on the thread's PINNED core, and the only
+    * reader is that same core's pick. */
    thread_control_block* holder_next{this};
 
    [[nodiscard]] constexpr bool is_listed_holder() const noexcept
@@ -255,7 +255,7 @@ struct thread_control_block
    }
 
    /**
-    * @brief True when this thread owns no pi_waitable. One load, one compare.
+    * @brief True when this thread owns no base_mutex. One load, one compare.
     */
    [[nodiscard]] constexpr bool holds_nothing() const noexcept
    {

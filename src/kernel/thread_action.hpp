@@ -36,7 +36,7 @@ schedule_hint global_ready_thread(thread_control_block& tcb);
 
 /**
  * @brief A thread's urgency, computed from truth: min(base, best waiter of
- *        every pi_waitable it holds).
+ *        every base_mutex it holds).
  *
  * This is the DEFINITION of priority inheritance, evaluated rather than read.
  * There is no stored effective priority and no walk maintaining one: a cache
