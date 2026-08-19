@@ -1,4 +1,5 @@
 #include <cyros/kernel/kernel.hpp>
+#include <cyros/kernel/base_mutex.hpp>
 #include <cyros/port/port.h>
 #include <cyros/port/port_traits.h>
 #include <cyros/config/config.hpp>
@@ -6,6 +7,7 @@
 #include "scheduler.hpp"
 #include "thread_action.hpp"
 #include "threading_subsystem.hpp"
+#include "base_mutex_access.hpp"
 #include "waitable_utilities.hpp"
 
 #include <bit>
@@ -122,7 +124,7 @@ inline constexpr unsigned max_inheritance_depth = 8;
 
       auto* held = target.held_slots[slot].load(std::memory_order_acquire);
       if (held == nullptr) continue; // bit was stale, see the ordering note on held_mask
-      floor = std::min(waitable_access::urgency_contribution(*held, depth), floor);
+      floor = std::min(base_mutex_access::urgency_contribution(*held, depth), floor);
    }
    return floor;
 }
@@ -284,7 +286,7 @@ void request_repick(thread_control_block& tcb)
       auto* const next_resource = target->blocked_on.load(std::memory_order_acquire);
       if (next_resource == nullptr) return;
 
-      auto* const next = waitable_access::holder_of(*next_resource);
+      auto* const next = base_mutex_access::holder_of(*next_resource);
       if (next == nullptr || next == target) return;
 
       target = next;

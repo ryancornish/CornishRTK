@@ -14,8 +14,22 @@
 #include "thread_action.hpp"
 #include "threading_subsystem.hpp"
 
+#include <algorithm>
+
 namespace cyros
 {
+
+std::uint8_t base_mutex::urgency_contribution(unsigned const depth) const noexcept
+{
+   auto const from_queue = queue.top(owner, depth);
+   if (uses_ceiling()) return std::min(ceiling_priority, from_queue);
+   return from_queue;
+}
+
+thread_control_block* base_mutex::holder() const noexcept
+{
+   return owner.load(std::memory_order_acquire);
+}
 
 /**
  * @brief Assert invariants of a destroyed mutex

@@ -2,75 +2,16 @@
 #define CYROS_WAITABLE_UTILITIES_VECTOR_HPP
 
 #include <cyros/config/config.hpp>
-#include <cyros/kernel/base_mutex.hpp>
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/port/port.h>
 
 #include "thread_action.hpp"
 #include "threading_subsystem.hpp"
 
-#include <algorithm>
 #include <array>
 
 namespace cyros
 {
-
-/* ============================================================================
- * waitable_access - attorney for the urgency fold
- *
- * The urgency fold needs one narrow operation on base_mutex, and its
- * internals. Granting friendship to the function itself would
- * force its declaration into the public header (a friend FUNCTION must be
- * visibly declared to be callable, a friend STRUCT declaration is
- * self-contained), and granting friendship to all of thread_action would
- * bleed access far wider than the fold needs. This attorney is the narrow
- * waist: the public header carries only "friend struct waitable_access", the
- * capability lives here in a kernel-internal header, and the fold consumes
- * these public statics with no friendship of its own, which is also what lets
- * it be an ordinary free helper.
- *
- * Keep this surface minimal on purpose: every method added here widens what
- * ANY kernel-internal code can do to a waitable, so a new entry needs the
- * same scrutiny a new friend would.
- * ========================================================================= */
-struct waitable_access
-{
-   /// What a held resource contributes to its holder's urgency. THE variation
-   /// point between the inversion protocols, and the only one.
-   ///
-   /// Inheritance answers the queue's best waiter. The owner word is passed
-   /// down rather than its value, so the fold reads it under the queue lock and
-   /// never recurses into the queue's own owner: see wait_queue::top.
-   ///
-   /// A ceiling answers its constant, but as a FLOOR on the boost rather than a
-   /// cap on it, hence the min. The constant alone was wrong and deterministic:
-   /// a waiter on a ceiling lock can itself be boosted from a DIFFERENT lock,
-   /// and answering the constant cuts that chain at this resource and
-   /// under-reports the holder. The asserted ceiling contract cannot catch it,
-   /// because it constrains the base priority of threads that LOCK this
-   /// resource and the urgency that goes missing belongs to a thread further
-   /// down the chain that never touches it. See cross-core-defects.md 10 and
-   /// GivenAChainThroughACeilingLock_WhenTheFarWaiterIsBoosted_...
-   ///
-   /// This costs the uncontended ceiling acquire nothing that matters: with no
-   /// waiters the queue has no bridges, so top() answers from its cached value
-   /// in two atomic loads and takes no lock. The lock appears only when bridges
-   /// exist, which is exactly the case whose answer is needed.
-   [[nodiscard]] static std::uint8_t urgency_contribution(base_mutex const& w, unsigned depth) noexcept
-   {
-      auto const from_queue = w.queue.top(w.owner, depth);
-      if (w.uses_ceiling()) return std::min(w.ceiling_priority, from_queue);
-      return from_queue;
-   }
-
-   /// Who holds this resource right now, for the prompt walk. Lossy by nature:
-   /// a stale answer costs a misdirected hint and never a wrong value.
-   [[nodiscard]] static thread_control_block* holder_of(base_mutex const& w) noexcept
-   {
-      return w.owner.load(std::memory_order_acquire);
-   }
-
-};
 
 class wait_node_vector
 {

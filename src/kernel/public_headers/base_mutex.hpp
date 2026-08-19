@@ -10,7 +10,6 @@
 namespace cyros
 {
 
-
 /**
  * @brief Thread-ownable resource with priority-inheritance semantics.
  *
@@ -137,7 +136,31 @@ private:
 
    void hand_over(reschedule_policy policy) noexcept;
 
-   friend struct waitable_access;
+   /**
+    * @brief What this mutex contributes to its holder's urgency.
+    *
+    * The one variation point between the inversion protocols. Inheritance
+    * answers the queue's best waiter. A ceiling answers its constant, but as a
+    * FLOOR on the boost rather than a cap on it, hence the min: a waiter on a
+    * ceiling lock can itself be boosted from a DIFFERENT lock, and answering
+    * the bare constant cuts that chain here and under-reports the holder. The
+    * asserted ceiling contract cannot catch that, because it constrains the
+    * base priority of threads that lock THIS mutex while the urgency that goes
+    * missing belongs to a thread further down the chain.
+    *
+    * @param depth Remaining recursion budget for the bridge walk.
+    */
+   [[nodiscard]] std::uint8_t urgency_contribution(unsigned depth) const noexcept;
+
+   /**
+    * @brief Who owns this right now, for the prompt walk.
+    *
+    * Lossy by nature: a stale answer costs a misdirected hint, never a wrong
+    * value.
+    */
+   [[nodiscard]] thread_control_block* holder() const noexcept;
+
+   friend struct base_mutex_access;
 };
 
 } // namespace cyros

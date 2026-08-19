@@ -158,9 +158,9 @@ class CYROS_PUBLIC wait_queue
     *        The lock-free CAS take is the one owner transition outside this
     *        lock, and racing it is UNREACHABLE rather than merely benign. A
     *        fold arrives at a queue only through
-    *        waitable_access::urgency_contribution, whose sole caller walks a
-    *        thread's held_slots, and a mutex is filed
-    *        there only by claim_slot, called either after the CAS that made the
+    *        base_mutex::urgency_contribution, whose sole caller walks a thread's
+    *        held_slots, and a mutex is filed there only by claim_slot, called
+    *        either after the CAS that made the
     *        owner or from the handover commit under this lock. So anything able
     *        to consult this queue already observes the owner word set. Stated
     *        as unreachable on purpose: calling it "the safe over-boost
@@ -188,7 +188,6 @@ class CYROS_PUBLIC wait_queue
    friend class pi_wait_queue;
    friend class waitable_arm_guard;
    friend class wait_node_vector;
-   friend struct waitable_access;
    friend std::size_t this_thread::wait_on_any(std::span<waitable_ref>) noexcept;
 };
 
@@ -226,7 +225,6 @@ class CYROS_PUBLIC pi_wait_queue
    wait_queue        queue;
    inheritance_cache pi;
 
-   friend struct waitable_access;
    friend class base_mutex;
 };
 
@@ -383,7 +381,6 @@ private:
 
    friend class wait_node_vector;
    friend class waitable_arm_guard;
-   friend struct waitable_access;
    friend std::size_t this_thread::wait_on_any(std::span<waitable_ref>) noexcept;
 };
 
