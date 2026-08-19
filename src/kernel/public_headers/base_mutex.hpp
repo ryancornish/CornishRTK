@@ -58,9 +58,10 @@ public:
 
    /**
     * @brief Non-blocking CAS take of a free resource.
-    * @return true when ownership was acquired.
     *
     * Never arms, so unlike lock() it cannot donate and cannot park.
+    *
+    * @return true when ownership was acquired.
     */
    [[nodiscard]] bool try_lock() noexcept;
 
@@ -72,38 +73,36 @@ public:
 protected:
    ~base_mutex();
 
-   /// Priority inheritance: contribute the best waiter's urgency.
+   /**
+    * @brief Priority inheritance flavoured
+    *
+    * Constructing a `base_mutex` with this _flavours_
+    * the resulting derived type with _priority inheritance_ semantics.
+    * Priority inheritance: contribute the best waiter's urgency.
+    */
    constexpr base_mutex() noexcept = default;
 
    /**
-    * @brief Priority ceiling: contribute @p ceiling for as long as it is held.
+    * @brief Priority ceiling flavoured
     *
-    * Immediate ceiling, the POSIX PTHREAD_PRIO_PROTECT shape. The boost applies
-    * on acquisition whether or not anyone is waiting, which is what prevents the
-    * inversion rather than repairing it afterwards.
+    * Constructing a `base_mutex` with this _flavours_
+    * the resulting derived type with _priority ceiling_ semantics.
+    * Priority ceiling: contribute @p ceiling for as long as it is held.
     *
     * @param ceiling Must be at least as urgent (numerically <=) as the base
     *        priority of every thread that can lock this. Asserted on each
-    *        acquire, since a ceiling below a locker's priority silently
-    *        reintroduces the inversion the protocol exists to prevent. POSIX
-    *        rejects the same misconfiguration with EINVAL.
+    *        acquire.
     */
    constexpr explicit base_mutex(std::uint8_t ceiling) noexcept : ceiling_priority(ceiling) {}
 
 private:
+   static constexpr std::uint8_t not_held = 0xFFu;
+   static constexpr std::uint8_t no_ceiling = 0xFFu;
+
    pi_wait_queue queue;
 
    std::atomic<thread_control_block*> owner{nullptr};
 
-   static constexpr std::uint8_t not_held = 0xFFu;
-
-   /* The inversion protocol, and the only thing that differs between the mutex
-    * types built on this. The fold asks a held resource one question, what do
-    * you contribute to your holder's urgency, and this is the whole answer:
-    * a constant for ceiling, the queue's best waiter for inheritance.
-    *
-    * Fixed at construction, so it is immutable and needs no atomic. */
-   static constexpr std::uint8_t no_ceiling = 0xFFu;
    std::uint8_t const ceiling_priority{no_ceiling};
 
    [[nodiscard]] constexpr bool uses_ceiling() const noexcept
@@ -111,15 +110,19 @@ private:
       return ceiling_priority != no_ceiling;
    }
 
-   /* Index of this resource's slot in its owner's held_slots, or not_held.
-    * Written from two contexts on two cores, the owner registering under its
-    * pi_lock and a releasing core committing a handover under the queue lock,
-    * so it is atomic to make the cross-thread handoff formal. Relaxed is
-    * enough. The two contexts are mutually excluded by the owner word's
+   /**
+    * @brief Index of this resource's slot in its owner's held_slots list, or not held.
+    *
+    * Written from two contexts on two cores:
+    * - The owner registering under its pi_lock
+    * - A releasing core committing a handover under the queue lock
+    *
+    * Therefore an atomic is needed to make the cross-thread handoff formal.
+    * Relaxed is enough. The two contexts are mutually excluded by the owner word's
     * transitions, only one of them can be claiming this mutex at a time, and
     * the new owner observes the value through the happens-before of the
-    * scheduler wake that publishes the handover rather than through either
-    * lock. Codegen for a relaxed byte is identical to a plain one. */
+    * scheduler wake that publishes the handover rather than through either lock.
+    */
    std::atomic<std::uint8_t> held_slot{not_held};
 
    void claim_slot(thread_control_block& tcb) noexcept;
