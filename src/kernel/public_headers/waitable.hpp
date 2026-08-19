@@ -13,12 +13,6 @@
 namespace cyros
 {
 
-class waitable;
-class base_mutex;
-class waitable_arm_guard;
-class wait_node_vector;
-struct waitable_access;
-
 /**
  * @brief Caller's instruction for whether signalling should trigger a
  *        reschedule on the *local* core.
@@ -31,11 +25,52 @@ enum class reschedule_policy
 };
 
 /**
+ * @brief The priority-inheritance state of a base_mutex's wait_queue.
+ *
+ * Owned by the base_mutex and passed through the wait_queue API to be
+ * consumend by wait_queue::top().
+ *
+ * Owns a 1-1 relationship of priority-inheritance details with a corresponding
+ * wait_queue.
+ *
+ * @note Private implementation detail of the kernel. Not a user-facing type!
+ */
+class CYROS_PUBLIC inheritance_cache
+{
+   static constexpr std::uint8_t no_waiter = 0xFF;
+
+   /**
+    * @brief Minimum base-priority of all waiters in the wait_queue
+    *
+    * Base-priorities are an immutable property of the thread, so this cache
+    * won't go stale.
+    */
+   std::atomic<std::uint8_t> top_priority{no_waiter};
+
+   /**
+    * @brief A 'sticky' hint that indicates there _may_ be a waiter in wait_queue
+    *        that itself holds another base_mutex (making it a bridge)
+    *
+    * Sticky in the sense that it is set when a holder arms on the wait_queue,
+    * and cleared only when the queue completely empties of waiters.
+    *
+    * If this is **false**, then there are certainly no bridges in the queue and
+    * we need not look (fast path).
+    * If this is **true**, then there _may_ be one or more bridges in the queue and
+    * we walk the queue to find them.
+    *
+    * The hint is thus an optimisation that errs only toward 'looking-for', never toward 'missing-a'
+    */
+   std::atomic<bool> may_have_bridges{false};
+
+   friend class wait_queue;
+};
+
+/**
  * @brief Intrusive priority-ordered list of waiting threads.
  *
  * Owns park-list mechanics and the commit-under-lock discipline that makes a
- * barge-free handoff possible. Owns nothing about what is being waited FOR, so
- * both waitable and the mutex compose one rather than sharing a base.
+ * barge-free handoff possible.
  *
  * @note Private implementation detail of the kernel. Not a user-facing type!
  */
@@ -44,26 +79,16 @@ class CYROS_PUBLIC wait_queue
    /**
     * @brief Per-thread parking record (one per TCB, reused).
     *
-    * Threaded into one or more queues while the thread is parked. Nested so it
-    * is unreachable to anything that cannot already drive a queue.
+    * Threaded into one or more queues while the thread is parked.
     */
    struct wait_node
    {
       thread_control_block* owner{nullptr};
       wait_node*            next {nullptr};
-
-      /* Was this waiter counted in its queue's bridge_count when it armed?
-       *
-       * Recorded rather than recomputed at departure, because a thread can
-       * acquire or release while armed, and a count maintained from a value that
-       * moved underneath it would drift. */
-      bool counted_as_bridge{false};
    };
 
-   using transfer_fn = function<void(uint32_t), 32, heap_policy::no_heap>;
+   using transfer_fn = function<void(thread::id), 32, heap_policy::no_heap>;
    using commit_fn   = function<void(thread_control_block*), 32, heap_policy::no_heap>;
-   static constexpr std::uint8_t no_waiter = 0xFF;
-
    constexpr wait_queue() noexcept = default;
 
    wait_queue(wait_queue&&)                 = delete;
@@ -71,13 +96,33 @@ class CYROS_PUBLIC wait_queue
    wait_queue& operator=(wait_queue&&)      = delete;
    wait_queue& operator=(wait_queue const&) = delete;
 
-   void arm   (wait_node& n) noexcept;
-   bool disarm(wait_node& n) noexcept;
+   /**
+    * @brief Add/remove a waiter onto the queue
+    *
+    * Generic waitable variant - no inheritance cache
+    */
+   void arm   (wait_node& node) noexcept { arm(node, nullptr); }
+   void disarm(wait_node& node) noexcept { disarm(node, nullptr); }
 
-   void wake_one(reschedule_policy) noexcept;
-   void wake_all(reschedule_policy) noexcept;
-   bool wake_one_and_transfer(transfer_fn const&, reschedule_policy) noexcept;
-   bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept;
+   void wake_one(reschedule_policy policy) noexcept { wake_one(policy, nullptr); }
+   void wake_all(reschedule_policy policy) noexcept { wake_all(policy, nullptr); }
+   bool wake_one_and_transfer(transfer_fn const& transfer, reschedule_policy policy) noexcept
+   {
+      return wake_one_and_transfer(transfer, policy, nullptr);
+   }
+
+   /**
+    * @brief Add/remove a waiter onto the queue
+    *
+    * base_mutex variant - permits an inheritance cache
+    */
+   void arm   (wait_node& node, inheritance_cache* pi) noexcept;
+   void disarm(wait_node& node, inheritance_cache* pi) noexcept;
+
+   void wake_one(reschedule_policy policy, inheritance_cache* pi) noexcept;
+   void wake_all(reschedule_policy policy, inheritance_cache* pi) noexcept;
+   bool wake_one_and_transfer(transfer_fn const& transfer, reschedule_policy policy, inheritance_cache* pi) noexcept;
+   bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy, inheritance_cache* pi) noexcept;
 
    [[nodiscard]] bool empty() const noexcept;
 
@@ -126,117 +171,117 @@ class CYROS_PUBLIC wait_queue
     *        forever and the answer is then conservative rather than wrong.
     */
    [[nodiscard]] std::uint8_t top(std::atomic<thread_control_block*> const& resource_owner,
-                                  unsigned depth) const noexcept;
+                                  unsigned depth,
+                                  inheritance_cache const& pi) const noexcept;
 
    void link  (wait_node&) noexcept;
    bool unlink(wait_node&) noexcept;
-   void refresh_top()      noexcept;
+   void refresh_top(inheritance_cache* pi) noexcept;
 
    spinlock   lock;
    wait_node* head{nullptr}; // base-priority-ordered, best at head
-   std::atomic<std::uint8_t> top_priority{no_waiter};
-
-   /* Waiters on this queue that themselves hold a pi_waitable, i.e. exactly the
-    * waiters whose urgency can be lower than their base priority. Tracking them
-    * separately keeps the transitive fold off the common path: a queue with no
-    * bridges answers from top_priority alone.
-    *
-    * Only a COUNT is kept, not the bridges themselves. Every waitable embeds a
-    * queue and every TCB embeds a waitable (its join), so anything stored per
-    * queue is paid for by every thread in the system; an array of four pointers
-    * here cost 40 bytes on each and blew the TCB budget immediately.
-    *
-    * The fold therefore snapshots the bridges under the lock, releases it, and
-    * only then recurses. That is what keeps queue locks un-nested: the recursion
-    * walks a wait-for graph, and holding a lock across it would deadlock the
-    * kernel on an application's deadlock rather than merely observing one.
-    *
-    * More bridges than the snapshot holds is NOT an error: top() then reports 0,
-    * the most urgent value, which over-boosts the holder. That costs a little
-    * fairness and never correctness, whereas under-reporting would resurrect the
-    * unbounded inversion this design exists to prevent. */
-   std::atomic<std::uint8_t> bridge_count{0};
-
-   /**
-    * @brief Undo a node's bridge contribution. Caller holds the queue lock.
-    */
-   void drop_bridge(wait_node&) noexcept;
 
    // The only types that may drive a queue.
    friend class waitable;
    friend class base_mutex;
+   friend class pi_wait_queue;
    friend class waitable_arm_guard;
    friend class wait_node_vector;
    friend struct waitable_access;
    friend std::size_t this_thread::wait_on_any(std::span<waitable_ref>) noexcept;
 };
 
+/**
+ * @brief A wait queue owned by a priority-inheritance resource.
+ *
+ * Nothing but composition: the queue that parks the waiters, plus the
+ * inheritance state only a PI resource ever reads. Each forwarder supplies the
+ * cache, so a resource holding one of these cannot forget its own bookkeeping,
+ * and a plain waitable holding a bare wait_queue cannot accidentally pay for it.
+ *
+ * @note Private implementation detail of the kernel. Not a user-facing type!
+ */
+class CYROS_PUBLIC pi_wait_queue
+{
+   using wait_node = wait_queue::wait_node;
+   using commit_fn = wait_queue::commit_fn;
+
+   void arm   (wait_node& node) noexcept { queue.arm(node, &pi); }
+   void disarm(wait_node& node) noexcept { queue.disarm(node, &pi); }
+
+   [[nodiscard]] bool empty() const noexcept { return queue.empty(); }
+
+   bool wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept
+   {
+      return queue.wake_one_and_commit(commit, policy, &pi);
+   }
+
+   [[nodiscard]] std::uint8_t top(std::atomic<thread_control_block*> const& resource_owner,
+                                  unsigned depth) const noexcept
+   {
+      return queue.top(resource_owner, depth, pi);
+   }
+
+   wait_queue        queue;
+   inheritance_cache pi;
+
+   friend struct waitable_access;
+   friend class base_mutex;
+};
+
+
 /* ============================================================================
  * waitable - kernel base class for blockable objects
+ * ----------------------------------------------------------------------------
+ * Inherit from waitable to make your object something threads can block ON
+ * (semaphore, event, thread-termination, a future alarm). The base owns a
+ * private wait_queue and exposes to the derived class:
  *
- * Inherit from waitable to make your object parkable. The base class owns
- * a private wait_queue and exposes:
- *   - block()             : stateless park; wake on any signal (caller accepts
- *                           the possibility of missed events - see below)
- *   - block_until(pred)   : park until a caller-supplied predicate holds
- *   - wake_one/wake_all   : protected; for derived classes to signal waiters
- *   - is_satisfied(self)  : virtual; overridden by derived primitives so
- *                           block_on_any can poll them
+ *   try_satisfy()           virtual. Attempt to satisfy the caller without
+ *                           blocking, consuming the resource if that is what
+ *                           satisfaction means. wait_on_any polls it between
+ *                           arm and park, which is the two-phase block that
+ *                           closes the lost-wakeup window. Runs in the calling
+ *                           thread's context, so an implementation that needs
+ *                           the caller's identity uses this_thread::id().
+ *   wake_one / wake_all     signal waiters. ISR-safe.
+ *   wake_one_and_transfer   barge-free handoff, see the protocol note below.
  *
- * Block-on-any is provided as a free function (block_on_any) that is a
- * friend of waitable.
+ * Threads wait via this_thread::wait_on(w) or wait_on_any(w0, w1, ...), never
+ * through methods on the waitable itself. Use composition instead of
+ * inheritance when your object merely uses blocking internally without being a
+ * wait target.
  *
- * Composition vs inheritance
- * --------------------------
- * Inherit waitable when your object IS something threads block ON
- * (mutex, semaphore, thread-termination, event, timer-source). Use plain
- * composition - an waitable member - when your object merely USES blocking
- * internally without being a wait target itself.
+ * Barging, and the transfer protocol
+ * ----------------------------------
+ * waitable is BARGE-PERMITTING by default: a wake does not reserve anything
+ * for the woken thread, so a fresh caller may take the resource first and the
+ * woken thread re-parks. That is cheap and right for counting semaphores,
+ * events and joins.
  *
- * The lost-wakeup problem and the two-phase block
- * -----------------------------------------------
- * A thread cannot simply "check, then park": between the check and the park,
- * another context may signal the condition, and the wakeup is lost. waitable
- * solves this with a two-phase block performed internally by block_until():
+ * Barge-free handoff, where a release commits the resource to the chosen
+ * waiter under the queue lock so nothing can interpose, is available through
+ * wake_one_and_transfer plus a try_satisfy that recognises ownership by id,
+ * plus renounce_if_assigned for the group-wait interaction. This CANNOT be
+ * built outside the kernel from wake_one: choosing the best waiter and
+ * committing to it must happen under the queue lock, which nothing else can
+ * reach. That is why the surface exists here.
  *
- *   1. arm   : record intent to block, under the queue lock. Any signal
- *              AFTER this point is guaranteed to reach the caller.
- *   2. check : evaluate the predicate. If true, abandon the block.
- *   3. park  : commit to blocking. A signal that arrived since arming is
- *              honoured, not lost. Loops on spurious wakeup.
- *
- * The raw three-phase primitives are NOT exposed.
+ * STATUS: no in-tree primitive currently derives a transfer-shaped waitable.
+ * The kernel mutex needs barge-free handoff WITH priority inheritance and gets
+ * both from base_mutex, which composes the same wait_queue directly and is
+ * deliberately not a waitable. This surface is the path for a barge-free
+ * primitive WITHOUT inheritance (a strict-fairness semaphore, a mailbox that
+ * hands its datum to exactly one waiter). test_transfer_waitables is its
+ * conformance test and is what keeps the dual-satisfaction contract honest.
  *
  * Spurious wakeups
  * ----------------
- * A woken thread is NOT guaranteed that its condition holds: the resource may
- * have been consumed by a higher-priority waiter, or by a fresh caller racing
- * in, before the woken thread runs. block_until() and block_on_any() handle
- * this by re-checking and re-blocking transparently. This is intrinsic to all
- * blocking primitives (cf. the mandatory while-loop around pthread_cond_wait)
- * and is not a Cyros-specific cost.
- *
- * Barging
- * -------
- * waitable is BARGE-PERMITTING by design: a wake does not reserve the
- * resource for the woken thread, so a fresh thread may acquire it between
- * the wake and the woken thread running. This is cheap, high-throughput, and
- * sufficient for many primitives (counting semaphore, event, join). If your
- * primitive requires strict, barge-free, priority-fair handoff, release it
- * through wake_one_and_transfer, which commits ownership to the chosen
- * waiter under the queue lock. If it additionally requires priority
- * inheritance (typically a mutex that must bound priority inversion), derive
- * from pi_waitable below, which packages the ownership protocol and the
- * inheritance bookkeeping together.
- *
- * Concurrency & ISR safety
- * ------------------------
- * wake_one() and wake_all() are safe to call from ISR context. A wake from
- * an ISR (or any context that cannot synchronously switch) defers its
- * reschedule via the weak reschedule contract - see reschedule_policy. List
- * mutation is protected by a per-queue lock; the queue is safe under SMP
- * and against concurrent block()/wake() on different cores.
+ * A woken thread is not guaranteed its condition holds: the resource may have
+ * been consumed before it runs. wait_on_any re-checks and re-parks
+ * transparently, the same mandatory loop as around pthread_cond_wait.
  * ========================================================================= */
+
 class CYROS_PUBLIC waitable
 {
 public:
@@ -253,15 +298,16 @@ protected:
    waitable() noexcept = default;
 
    /**
-    * @brief Override in derived primitives so wait_on_any can poll them.
+    * @brief Attempt to satisfy the calling thread without blocking.
     *
-    * @param caller The thread evaluating the predicate (always the currently
-    *               running thread on this core).
+    * Consume the resource if that is what satisfaction means (a semaphore
+    * decrements, a transfer-shaped primitive recognises ownership by
+    * this_thread::id()). Runs in the calling thread's context with no queue
+    * lock held.
     *
-    * @return true if waiter will not block (e.g. because it acquired the resource)
-    *         false if it will block.
+    * @return true when the caller is satisfied and will not block.
     */
-   virtual bool wait_condition(thread& caller) noexcept = 0;
+   virtual bool try_satisfy() noexcept = 0;
 
    /**
     * @brief Wake the single highest-priority waiting thread (if any).
@@ -350,7 +396,7 @@ private:
 class CYROS_PUBLIC non_blocking_token : public waitable
 {
 protected:
-   bool wait_condition(thread&) noexcept override
+   bool try_satisfy() noexcept override
    {
       return true;
    }

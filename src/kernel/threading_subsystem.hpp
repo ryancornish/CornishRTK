@@ -15,6 +15,7 @@
 namespace cyros
 {
 
+class base_mutex;
 
 void thread_launcher(void* tcb_ptr);
 
@@ -23,9 +24,8 @@ class thread_termination final : public waitable
    std::atomic<bool> terminated{false};
 
 protected:
-   bool wait_condition(thread& caller) noexcept override
+   bool try_satisfy() noexcept override
    {
-      (void)caller;
       return terminated.load(std::memory_order_acquire);
    }
 

@@ -474,7 +474,7 @@ void yield()
 
          // Lowest-index wins on ties
          for (std::size_t i = 0; waitable& waitable : waitables) {
-            if (waitable.wait_condition(*tcb.public_thread_handle)) {
+            if (waitable.try_satisfy()) {
                tcb.disposition = thread_disposition::none;
                chosen = i;
 

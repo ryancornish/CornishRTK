@@ -171,7 +171,7 @@ public:
          // observing the drop late only means the holder ran at its old urgency
          // slightly longer, which is safe. A boost needs a prompt, a de-boost
          // does not.
-         (void)waitables[i].get().queue.disarm(nodes[i]);
+         waitables[i].get().queue.disarm(nodes[i]);
       }
    }
 

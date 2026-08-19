@@ -36,9 +36,8 @@ void semaphore::acquire() noexcept
    return false;
 }
 
-bool semaphore::wait_condition(thread& caller) noexcept
+bool semaphore::try_satisfy() noexcept
 {
-   (void)caller;
    return try_acquire();
 }
 

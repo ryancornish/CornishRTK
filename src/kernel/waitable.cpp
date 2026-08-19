@@ -97,21 +97,15 @@ bool wait_queue::unlink(wait_node& node) noexcept
    return true;
 }
 
-void wait_queue::drop_bridge(wait_node& node) noexcept
-{
-   if (!node.counted_as_bridge) return;
-   node.counted_as_bridge = false;
-   bridge_count.fetch_sub(1, std::memory_order_release);
-}
-
 std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_owner,
-                             unsigned const depth) const noexcept
+                             unsigned const depth,
+                             inheritance_cache const& pi) const noexcept
 {
-   auto const cached = top_priority.load(std::memory_order_acquire);
+   auto const cached = pi.top_priority.load(std::memory_order_acquire);
 
    // Fast path: no waiter here holds anything, so none can be more urgent than
    // its base priority and the cache is exact. This is almost every queue.
-   if (bridge_count.load(std::memory_order_acquire) == 0) return cached;
+   if (!pi.may_have_bridges.load(std::memory_order_acquire)) return cached; // "acquire" pairs with store's "release"
 
    // Budget exhausted means a wait-for cycle, i.e. the application has
    // deadlocked. Answer conservatively instead of following it forever.
@@ -120,7 +114,7 @@ std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_
    // Snapshot under the lock, then release BEFORE recursing. Holding it across
    // the recursion would nest queue locks around the wait-for graph.
    static constexpr std::size_t max_snapshot = 4;
-   thread_control_block* bridges[max_snapshot];
+   std::array<thread_control_block*, max_snapshot> bridges{};
    std::size_t found = 0;
    bool overflow = false;
    {
@@ -133,7 +127,8 @@ std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_
       auto* const holder = resource_owner.load(std::memory_order_relaxed);
 
       for (auto* n = head; n != nullptr; n = n->next) {
-         if (!n->counted_as_bridge) continue;
+         // Re-derive from the current truth (stale answers are plausible and err toward over-boost.)
+         if (n->owner->holds_nothing()) continue;
          // The owner itself, still armed in its own queue between the winning
          // CAS and its disarm. Recursing into it would be a self-cycle that
          // exhausts the budget and answers 0. See the note on top()'s
@@ -144,7 +139,7 @@ std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_
          bridges[found++] = n->owner;
       }
    }
-   if (overflow) return 0; // over-boost, the safe direction
+   if (overflow) return 0; // Over-boost, the safe direction
 
    std::uint8_t best = cached;
    for (std::size_t i = 0; i < found; ++i) {
@@ -153,7 +148,7 @@ std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_
    return best;
 }
 
-void wait_queue::arm(wait_node& node) noexcept
+void wait_queue::arm(wait_node& node, inheritance_cache* pi) noexcept
 {
    spinlock_guard guard(lock);
 
@@ -161,11 +156,12 @@ void wait_queue::arm(wait_node& node) noexcept
    CYROS_ASSERT(node.next  == nullptr); // node must not already be on a list
 
    link(node);
-   node.counted_as_bridge = !node.owner->holds_nothing();
-   if (node.counted_as_bridge) {
-      bridge_count.fetch_add(1, std::memory_order_release);
+
+   if (pi != nullptr && !node.owner->holds_nothing()) {
+      // Adding a bridge, set the sticky hint
+      pi->may_have_bridges.store(true, std::memory_order_release); // "release" pairs with load's "acquire"
    }
-   refresh_top();
+   refresh_top(pi);
 }
 
 /**
@@ -176,28 +172,31 @@ void wait_queue::arm(wait_node& node) noexcept
  *         use. Kept because it is free and a caller that needs to know a top
  *         moved has no other way to find out.
  */
-bool wait_queue::disarm(wait_node& node) noexcept
+void wait_queue::disarm(wait_node& node, inheritance_cache* pi) noexcept
 {
    spinlock_guard guard(lock);
 
-   if (!unlink(node)) return false;
-   drop_bridge(node);
-
-   std::uint8_t const old_top = top_priority.load(std::memory_order_relaxed);
-   refresh_top();
-   return top_priority.load(std::memory_order_relaxed) != old_top;
+   if (!unlink(node)) return;
+   refresh_top(pi);
 }
 
-void wait_queue::refresh_top() noexcept
+void wait_queue::refresh_top(inheritance_cache* pi) noexcept
 {
+   if (pi == nullptr) return; // Nothing reads it, so do not maintain it
+
    // Requires the queue lock held. Release pairs with the acquire in top() so
    // a fold prompted by a queue change (via a doorbell, or by reaching this
    // queue through a bridge) observes the value that change produced.
-   top_priority.store(head != nullptr ? head->owner->base_priority : no_waiter,
-                      std::memory_order_release);
+   pi->top_priority.store(head != nullptr ? head->owner->base_priority : inheritance_cache::no_waiter,
+                          std::memory_order_release);
+
+   // No more waiters, so we can safely clear the sticky hint
+   if (head == nullptr) {
+      pi->may_have_bridges.store(false, std::memory_order_release); // "release" pairs with load's "acquire"
+   }
 }
 
-void wait_queue::wake_one(reschedule_policy policy) noexcept
+void wait_queue::wake_one(reschedule_policy policy, inheritance_cache* pi) noexcept
 {
    thread_control_block* chosen = nullptr;
    {
@@ -208,15 +207,14 @@ void wait_queue::wake_one(reschedule_policy policy) noexcept
       chosen = node->owner;
       head = node->next;
       node->next = nullptr;
-      drop_bridge(*node);
-      refresh_top();
+      refresh_top(pi);
    }
 
    schedule_hint hint = thread_action::global_ready_thread(*chosen);
    apply_reschedule_policy(policy, hint);
 }
 
-void wait_queue::wake_all(reschedule_policy policy) noexcept
+void wait_queue::wake_all(reschedule_policy policy, inheritance_cache* pi) noexcept
 {
    // Atomic batch admit. Preemption is held off for the entire batch so
    // every waiter lands on the ready matrix before any of them can run on this
@@ -235,8 +233,7 @@ void wait_queue::wake_all(reschedule_policy policy) noexcept
          chosen = node->owner;
          head = node->next;
          node->next = nullptr;
-         drop_bridge(*node);
-         refresh_top();
+         refresh_top(pi);
       }
       schedule_hint hint = thread_action::global_ready_thread(*chosen);
       if (hint == schedule_hint::warranted) {
@@ -249,7 +246,7 @@ void wait_queue::wake_all(reschedule_policy policy) noexcept
    cyros_port_preempt_enable(token);
 }
 
-bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy policy) noexcept
+bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy policy, inheritance_cache* pi) noexcept
 {
    thread_control_block* chosen = nullptr;
    {
@@ -260,8 +257,7 @@ bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy 
          chosen = node->owner;
          head = node->next;
          node->next = nullptr;
-         drop_bridge(*node);
-         refresh_top();
+         refresh_top(pi);
       }
       CYROS_ASSERT(chosen == nullptr || chosen->id != 0);
 
@@ -285,13 +281,13 @@ bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy 
    return true;
 }
 
-bool wait_queue::wake_one_and_transfer(transfer_fn const& transfer, reschedule_policy policy) noexcept
+bool wait_queue::wake_one_and_transfer(transfer_fn const& transfer, reschedule_policy policy, inheritance_cache* pi) noexcept
 {
    return wake_one_and_commit(
       [&transfer](thread_control_block* chosen) {
          transfer(chosen != nullptr ? chosen->id : 0);
       },
-      policy);
+      policy, pi);
 }
 
 /* ============================================================================

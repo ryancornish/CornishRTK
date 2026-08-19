@@ -58,9 +58,8 @@ public:
    void wake_all_no_set() noexcept { wake_all(); }
 
 protected:
-   bool wait_condition(thread& caller) noexcept override
+   bool try_satisfy() noexcept override
    {
-      (void)caller;
       return condition.load(std::memory_order_acquire);
    }
 };
@@ -379,17 +378,18 @@ public:
    }
 
 protected:
-   bool wait_condition(thread& caller) noexcept override
+   bool try_satisfy() noexcept override
    {
-      // Record the caller's id every time we're polled. The last write wins;
-      // for a single waiter that's exactly its id.
-      seen_caller_id.store(caller.get_id(), std::memory_order_relaxed);
+      // try_satisfy runs in the calling thread's context, so this_thread::id()
+      // is the waiter's identity. That is the contract a transfer-shaped
+      // primitive relies on to recognise ownership, so pin it here.
+      seen_caller_id.store(this_thread::id(), std::memory_order_relaxed);
       return go.load(std::memory_order_acquire);
    }
 };
 
 TEST_F(SingleCoreWaitables_Test,
-       GivenWaiter_WhenIsSatisfiedIsCalled_ThenCallerArgIsTheWaitingThread)
+       GivenWaiter_WhenTrySatisfyRuns_ThenThisThreadIdIsTheWaitingThread)
 {
    alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> waiter_stack{};
    alignas(CYROS_PORT_STACK_ALIGN) static std::array<std::byte, STACK_SIZE> signaler_stack{};

@@ -31,7 +31,7 @@ public:
    [[nodiscard]] bool try_acquire_until(time::duration d) noexcept;
 
 protected:
-   bool wait_condition(thread&) noexcept override;
+   bool try_satisfy() noexcept override;
 
 private:
    std::atomic<std::size_t> counter;

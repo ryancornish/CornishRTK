@@ -91,7 +91,8 @@ protected:
    constexpr explicit base_mutex(std::uint8_t ceiling) noexcept : ceiling_priority(ceiling) {}
 
 private:
-   wait_queue queue;
+   pi_wait_queue queue;
+
    std::atomic<thread_control_block*> owner{nullptr};
 
    static constexpr std::uint8_t not_held = 0xFFu;

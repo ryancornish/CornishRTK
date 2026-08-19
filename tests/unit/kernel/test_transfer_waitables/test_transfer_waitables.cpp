@@ -36,7 +36,7 @@ class MultiCoreTransfer_Test : public ::testing::Test {};
  *
  * Deliberately mirrors the shape a real priority_mutex would use: a single
  * atomic owner id, 0 meaning free, taken by CAS when uncontended and passed
- * by ownership on release when contended. wait_condition() recognises BOTH the
+ * by ownership on release when contended. try_satisfy() recognises BOTH the
  * uncontended take and "ownership was already transferred to me while parked",
  * which is what lets a wake_one_and_transfer-released resource still compose with
  * wait_on / wait_on_any.
@@ -74,7 +74,7 @@ public:
    void barge_wake_one() noexcept { wake_one(); }
 
 protected:
-   bool wait_condition(thread& /*caller*/) noexcept override
+   bool try_satisfy() noexcept override
    {
       std::uint32_t expected = 0;
       if (owner.compare_exchange_strong(expected, this_thread::id(), std::memory_order_acq_rel)) {
@@ -114,7 +114,7 @@ TEST_F(MultiCoreTransfer_Test,
 
       thread owner_thread(
          [&]{
-            // Must win the first CAS deterministically: wait_condition()'s
+            // Must win the first CAS deterministically: try_satisfy()'s
             // uncontended-take branch is the SAME CAS try_acquire() performs,
             // so without this gate a waiter that reaches wait_on(r) first
             // would take r itself and this ASSERT would fail.
@@ -187,7 +187,7 @@ TEST_F(MultiCoreTransfer_Test,
  * the resource as free.
  *
  * If barging occurred, the parked waiter would remain blocked forever (its
- * wait_condition() would keep failing, since the resource was taken by
+ * try_satisfy() would keep failing, since the resource was taken by
  * someone else) and the test would hang / time out rather than fail cleanly,
  * so this is run under the stress loop to build confidence across many
  * timing windows rather than relying on a single lucky/unlucky interleaving.
@@ -453,7 +453,7 @@ TEST_F(MultiCoreTransfer_Test,
  *
  * The property that makes wake_one_and_transfer's empty-case commit have to happen
  * under the SAME lock as the pop: a thread on another core may be mid-arm
- * (about to poll wait_condition and park) at the exact moment release() finds
+ * (about to poll try_satisfy and park) at the exact moment release() finds
  * the queue empty. If the empty-case commit (owner = 0) happened outside the
  * lock, the arming thread could poll-see "still owned", commit to park, and
  * then the late owner=0 store would leave it parked forever with no future
@@ -485,7 +485,7 @@ TEST_F(MultiCoreTransfer_Test,
             // Unlike every other test in this suite, deliberately NO
             // owner_ready gate here: this test's whole point is the
             // unsynchronised race, so racer may legitimately win the
-            // initial CAS via wait_condition's uncontended-take branch before
+            // initial CAS via try_satisfy's uncontended-take branch before
             // this thread ever runs. That is a valid, expected outcome (see
             // racer's comment below), not a bug, so this must not assert
             // success. Only release what was actually acquired: if racer
@@ -507,7 +507,7 @@ TEST_F(MultiCoreTransfer_Test,
       thread racer(
          [&]{
             // May observe the resource as already free (take it directly via
-            // wait_condition's CAS branch) or as still owned (park, then be
+            // try_satisfy's CAS branch) or as still owned (park, then be
             // handed ownership if release's pop-and-commit hasn't happened
             // yet, or free it itself if the CAS branch fires on a later
             // poll). Either outcome is correct; only NOT COMPLETING is a bug.
@@ -556,7 +556,7 @@ TEST_F(MultiCoreTransfer_Test,
       public:
          std::atomic<bool> condition{false};
       protected:
-         bool wait_condition(thread&) noexcept override
+         bool try_satisfy() noexcept override
          {
             return condition.load(std::memory_order_acquire);
          }
