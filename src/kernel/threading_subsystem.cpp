@@ -1,9 +1,7 @@
 #include "threading_subsystem.hpp"
 
-#include "thread_action.hpp"
-
 #include "align.hpp"
-#include "thread_action.hpp"
+#include "scheduler.hpp"
 
 namespace cyros
 {
@@ -22,7 +20,7 @@ thread::thread(entry_fn&& entry, std::span<std::byte> stack, priority priority, 
       std::move(entry),
       this
    );
-   thread_action::register_thread(*tcb);
+   thread_registry::register_thread(*tcb);
 }
 
 
@@ -59,7 +57,7 @@ thread& thread::operator=(thread&& other) noexcept
 {
    CYROS_ASSERT(tcb != nullptr);
 
-   return thread_action::urgency(*tcb);
+   return urgency(*tcb);
 }
 
 void thread::join() noexcept
@@ -173,5 +171,47 @@ void thread_ready_matrix::remove_thread(thread_control_block& tcb) noexcept
    CYROS_ASSERT(removed); // caller vouched the thread was enqueued
    if (matrix[priority].empty()) bitmap &= ~(1u << priority);
 }
+
+
+namespace this_thread
+{
+
+
+[[nodiscard]] thread::id id()
+{
+   return scheduler_for_this_core().current_thread_id();
+}
+
+[[nodiscard]] thread::priority priority()
+{
+   return scheduler_for_this_core().current_thread_urgency();
+}
+
+[[noreturn]] void thread_exit()
+{
+   auto& tcb = scheduler_for_this_core().get_current_thread();
+
+   // Flag the thread's intent to terminate, the arbiter will handle the state
+   // transition and teardown on next reschedule (requested immediately).
+   // Any preemption landing before this point is okay as eventually the scheduler
+   //  will pick this thread again and continue teardown.
+   tcb.disposition = thread_disposition::terminating;
+   // Any preemption landing after this point will cause the arbiter to retire
+   // this thread and never return. Most of the time, this window is not preempted
+   // and so we manually trigger a reschedule which is guaranteed to not pick this thread
+   // again.
+   cyros_port_thread_yield();
+
+   CYROS_PORT_UNREACHABLE(); // Bug: The arbiter declined to retire this thread!
+}
+
+void yield()
+{
+   // Strong request: an explicit yield deliberately gives up the CPU and
+   // relies on the reschedule round-trip having completed on return.
+   cyros_port_thread_yield();
+}
+
+} // namespace this_thread
 
 } // namespace cyros

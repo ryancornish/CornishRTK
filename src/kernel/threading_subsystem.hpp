@@ -103,7 +103,7 @@ struct thread_control_block
     *
     * There is no effective_priority field. Urgency is min(base, best waiter of
     * every base_mutex held) and is COMPUTED at the point of use by
-    * thread_action::urgency(), never stored. A stored copy would be a cache whose
+    * urgency(), never stored. A stored copy would be a cache whose
     * inputs live on other cores, which is what every priority-inheritance bug in
     * this project's history has been. */
    uint8_t base_priority;
@@ -354,6 +354,29 @@ public:
    void remove_thread(thread_control_block& tcb) noexcept;
 
 };
+
+/**
+ * @brief The kernel's global thread bookkeeping.
+ *
+ * Admission to and removal from the set of threads the kernel knows about, which
+ * is global state rather than anything a thread does to itself. Both are DEFINED
+ * IN kernel.cpp, where that state lives.
+ */
+namespace thread_registry
+{
+
+/**
+ * @brief Admit a thread: assign its id, count it, pin it to a core, and ready it
+ *        if the kernel is already running.
+ */
+void register_thread(thread_control_block& tcb);
+
+/**
+ * @brief Update the kernel's accounting for a thread leaving the system.
+ */
+void unregister_thread(thread_control_block& tcb);
+
+} // namespace thread_registry
 
 } // namespace cyros
 

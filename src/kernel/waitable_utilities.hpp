@@ -5,7 +5,6 @@
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/port/port.h>
 
-#include "thread_action.hpp"
 #include "threading_subsystem.hpp"
 
 #include <array>
@@ -13,6 +12,7 @@
 namespace cyros
 {
 
+// TODO: Replace with std::inplace_vector?
 class wait_node_vector
 {
 private:

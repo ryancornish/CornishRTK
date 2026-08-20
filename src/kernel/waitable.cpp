@@ -26,13 +26,58 @@
 #include <cyros/kernel/waitable.hpp>
 #include <cyros/port/port.h>
 
+#include "base_mutex_access.hpp"
 #include "scheduler.hpp"
-#include "thread_action.hpp"
+#include "waitable_utilities.hpp"
 #include "threading_subsystem.hpp"
+
+#include <algorithm>
+#include <bit>
 
 namespace cyros
 {
 
+namespace
+{
+
+/* How far a transitive donation is followed before the answer is taken to be
+ * maximally urgent.
+ *
+ * Real chains are short: the deepest the suite builds is 6, and the flagship PI
+ * test is 2. The budget is not a performance knob, it is what stops a wait-for
+ * cycle (a deadlocked application) from being walked forever. Exhausting it
+ * yields 0, which over-boosts, which is the safe direction. */
+inline constexpr unsigned max_inheritance_depth = 8;
+
+/**
+ * @brief min(base, best waiter of every base_mutex held).
+ *
+ * The definition of effective priority, folded from current truth.
+ *
+ * Evaluable by any core at any time and with no pi_lock: held_slots is a bounded
+ * array of atomics and the queue tops are maintained atomics for exactly that.
+ * The one restriction is on queue locks, see urgency_at.
+ */
+[[nodiscard]] std::uint8_t donated_floor(thread_control_block const& target, unsigned const depth) noexcept
+{
+   // Fast path: holds nothing, so urgency is base priority by definition. This
+   // is the overwhelming majority of calls, measured at 98.9 percent of picks in
+   // the only test in the suite that exercises mutexes at all, and 100 percent
+   // everywhere else.
+   auto mask = target.held_mask.load(std::memory_order_acquire);
+   if (mask == 0) return target.base_priority;
+
+   std::uint8_t floor = target.base_priority;
+   while (mask != 0) {
+      auto const slot = static_cast<std::size_t>(std::countr_zero(mask));
+      mask &= static_cast<std::uint8_t>(mask - 1); // clear lowest set bit
+
+      auto* held = target.held_slots[slot].load(std::memory_order_acquire);
+      if (held == nullptr) continue; // bit was stale, see the ordering note on held_mask
+      floor = std::min(base_mutex_access::urgency_contribution(*held, depth), floor);
+   }
+   return floor;
+}
 
 /**
  * @brief Applies the caller's reschedule_policy to a completed wake.
@@ -40,7 +85,7 @@ namespace cyros
  * Governs only the LOCAL pend: cross-core wakes have already emitted their IPI via the
  * ready path before this runs, so 'never' does not (and must not) suppress those.
  */
-static void apply_reschedule_policy(reschedule_policy const policy, schedule_hint const hint)
+void apply_reschedule_policy(reschedule_policy const policy, schedule_hint const hint)
 {
    if (policy == reschedule_policy::never) {
       return;
@@ -50,6 +95,8 @@ static void apply_reschedule_policy(reschedule_policy const policy, schedule_hin
       cyros_port_pend_reschedule();
    }
 }
+
+} // namespace
 
 /* ============================================================================
  * wait_queue
@@ -143,7 +190,7 @@ std::uint8_t wait_queue::top(std::atomic<thread_control_block*> const& resource_
 
    std::uint8_t best = cached;
    for (std::size_t i = 0; i < found; ++i) {
-      best = std::min(best, thread_action::urgency_at(*bridges[i], depth - 1));
+      best = std::min(best, urgency_at(*bridges[i], depth - 1));
    }
    return best;
 }
@@ -210,7 +257,7 @@ void wait_queue::wake_one(reschedule_policy policy, inheritance_cache* pi) noexc
       refresh_top(pi);
    }
 
-   schedule_hint hint = thread_action::global_ready_thread(*chosen);
+   schedule_hint hint = global_ready_thread(*chosen);
    apply_reschedule_policy(policy, hint);
 }
 
@@ -235,7 +282,7 @@ void wait_queue::wake_all(reschedule_policy policy, inheritance_cache* pi) noexc
          node->next = nullptr;
          refresh_top(pi);
       }
-      schedule_hint hint = thread_action::global_ready_thread(*chosen);
+      schedule_hint hint = global_ready_thread(*chosen);
       if (hint == schedule_hint::warranted) {
          aggregate_hint = schedule_hint::warranted;
       }
@@ -276,7 +323,7 @@ bool wait_queue::wake_one_and_commit(commit_fn const& commit, reschedule_policy 
    // delivery. Only the TCB is touched out here. The wait_node lives on the
    // waiter's stack and is only dereferenced under the lock, matching the
    // wake_one discipline.
-   schedule_hint hint = thread_action::global_ready_thread(*chosen);
+   schedule_hint hint = global_ready_thread(*chosen);
    apply_reschedule_policy(policy, hint);
    return true;
 }
@@ -315,5 +362,158 @@ bool waitable::wake_one_and_transfer(transfer_fn const& transfer, reschedule_pol
    return queue.wake_one_and_transfer(transfer, policy);
 }
 
+
+
+std::uint8_t urgency(thread_control_block const& tcb) noexcept
+{
+   return donated_floor(tcb, max_inheritance_depth);
+}
+
+std::uint8_t urgency_at(thread_control_block const& tcb, unsigned const depth) noexcept
+{
+   return donated_floor(tcb, depth);
+}
+
+void commit_to_block(thread_control_block& tcb)
+{
+   auto token = cyros_port_preempt_disable();
+
+   // Atomic CAS prevents a race between a blocking thread and an ISR.
+   // Hazard: Without RMW, the thread could read 'prepared', an ISR could
+   // clear the disposition, and the thread would blindly overwrite it to 'committed'.
+   auto expected = thread_disposition::prepared;
+   if (tcb.disposition.compare_exchange(expected, thread_disposition::committed)) {
+      cyros_port_pend_reschedule(); // Delayed until preempt_enable()
+   }
+
+   cyros_port_preempt_enable(token);
+}
+
+void request_repick(thread_control_block& tcb)
+{
+   /* Prompt every core that could now want to run something different, by
+    * walking the wait-for chain rather than shouting at all of them.
+    *
+    * The donor knows only the holder it failed to CAS against. If that holder is
+    * itself blocked, its urgency rose too, and so did the urgency of whatever
+    * holds the resource IT is parked on, all the way down. The thread that can
+    * actually act is at the far end, and its core has no other reason to pick.
+    *
+    * blocked_on is what makes that chain walkable. Every read in here is a fact
+    * whose staleness costs a misdirected or a missing prompt and never a wrong
+    * value, so no lock is taken and nothing is retried: a lost prompt is
+    * repaired by the next reschedule on that core, exactly as a doorbell is
+    * allowed to be.
+    *
+    * Every owner met is prompted, not just the last one. That costs at most one
+    * hint per hop and it is what keeps a stale state read from silently dropping
+    * the prompt that mattered. Bounded by the same depth budget the fold uses,
+    * so a wait-for cycle in the application terminates the walk instead of
+    * spinning in it. */
+   auto const this_core = cyros_port_get_core_id();
+   auto* target = &tcb;
+
+   for (unsigned hop = 0; hop < max_inheritance_depth; ++hop) {
+      if (target->pinned_core == this_core) {
+         cyros_port_pend_reschedule();
+      } else {
+         cyros_port_send_reschedule_ipi(target->pinned_core);
+      }
+
+      // Deliberately no thread_state check before continuing. blocked_on is
+      // published while the waiter is armed, whether or not the scheduler has
+      // parked it yet, so a ready or still-running waiter genuinely has
+      // somewhere to pass this on. Gating on state == blocked here once
+      // reintroduced an unbounded inversion: a waiter preempted between arming
+      // and parking is rotated out ready with blocked_on set, it does not
+      // re-donate when it resumes, and stopping the walk at it silences the
+      // far end of the chain, which is the thread the walk exists to reach.
+      auto* const next_resource = target->blocked_on.load(std::memory_order_acquire);
+      if (next_resource == nullptr) return;
+
+      auto* const next = base_mutex_access::holder_of(*next_resource);
+      if (next == nullptr || next == target) return;
+
+      target = next;
+   }
+}
+
+/* The caller side of the two-phase block this file opens by describing. Lives
+ * here for its access: it is friended by both waitable and wait_queue, and it
+ * drives wait_node_vector and waitable_arm_guard. */
+namespace this_thread
+{
+
+[[nodiscard]] std::size_t wait_on_any(std::span<waitable_ref> waitables) noexcept
+{
+   CYROS_ASSERT(!waitables.empty());
+   CYROS_ASSERT_OP(waitables.size(), <=, config::max_wait_nodes);
+
+   auto& tcb = scheduler_for_this_core().get_current_thread();
+   wait_node_vector nodes(waitables.size(), tcb);
+
+   while (true) {
+      tcb.disposition = thread_disposition::prepared;
+      std::optional<std::size_t> chosen;
+
+      {
+         // All waitable wakes are serialised on the arm_guard.
+         // If a wake fires BEFORE the arm_guard:
+         // - Thread is not readied because we are not registered.
+         waitable_arm_guard arm_guard(waitables, nodes);
+         // If a wake fires AFTER the arm_guard:
+         // - Thread is readied and we are no longer 'prepared' to block.
+
+         // Lowest-index wins on ties
+         for (std::size_t i = 0; waitable& waitable : waitables) {
+            if (waitable.try_satisfy()) {
+               tcb.disposition = thread_disposition::none;
+               chosen = i;
+
+               // Leave the queue we just acquired from IMMEDIATELY, rather than
+               // at the guard below. An owner still armed in its own resource's
+               // queue is a cycle in the wait-for graph: the fold reads that
+               // queue, finds the owner listed as a bridge, and recurses back
+               // into the owner until the depth budget runs out and answers 0.
+               // That is not the harmless over-boost it looks like. A thread
+               // folding to 0 can never be beaten by set_thread_ready's
+               // urgency < current comparison, so its core stops raising
+               // preemption hints entirely while the window is open.
+               //
+               // Safe to do early: we own it, so no release can transfer it to
+               // us in the meantime, which is the only thing the other nodes
+               // have to stay armed for.
+               waitable.queue.disarm(nodes[i]);
+               break;
+            }
+            ++i;
+         }
+
+         if (!chosen) {
+            // Nothing was satisfied. Park, unless a wake beat us to it.
+            commit_to_block(tcb);
+         }
+      } // arm_guard: disarm all (and de-boost any holder whose top we lowered)
+
+      if (chosen) {
+         // The sweep must run here, AFTER the disarm above: while any node of
+         // ours was still armed, a racing release could commit a transfer to
+         // us. With every node off every queue no further transfer can choose
+         // us, so the set of in-flight assignments is frozen and the ones we
+         // are not returning are handed back. The contract this enforces: on
+         // return the caller owns exactly waitables[chosen], plus whatever it
+         // already owned before the call.
+         for (std::size_t i = 0; waitable& waitable : waitables) {
+            if (i != chosen) {
+               waitable.renounce_if_assigned(tcb.id);
+            }
+            ++i;
+         }
+         return *chosen;
+      }
+   }
+}
+
+} // namespace this_thread
 
 } // namespace cyros

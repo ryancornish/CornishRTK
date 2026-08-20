@@ -2,12 +2,13 @@ name = "kernel"
 kind = "core"
 
 sources = [
+  "base_mutex.cpp",
+  "core.cpp",
   "kernel.cpp",
   "scheduler.cpp",
+  "spinlock.cpp",
   "threading_subsystem.cpp",
   "waitable.cpp",
-  "base_mutex.cpp",
-  "spinlock.cpp",
 ]
 
 sources_excluded_from_archive = [
@@ -15,12 +16,12 @@ sources_excluded_from_archive = [
 ]
 
 public_headers = [
-  "public_headers/visibility.hpp -> cyros/kernel/visibility.hpp",
-  "public_headers/kernel.hpp -> cyros/kernel/kernel.hpp",
-  "public_headers/function.hpp -> cyros/kernel/function.hpp",
-  "public_headers/spinlock.hpp -> cyros/kernel/spinlock.hpp",
-  "public_headers/thread.hpp -> cyros/kernel/thread.hpp",
-  "public_headers/waitable.hpp -> cyros/kernel/waitable.hpp",
   "public_headers/base_mutex.hpp -> cyros/kernel/base_mutex.hpp",
   "public_headers/core.hpp -> cyros/kernel/core.hpp",
+  "public_headers/function.hpp -> cyros/kernel/function.hpp",
+  "public_headers/kernel.hpp -> cyros/kernel/kernel.hpp",
+  "public_headers/spinlock.hpp -> cyros/kernel/spinlock.hpp",
+  "public_headers/thread.hpp -> cyros/kernel/thread.hpp",
+  "public_headers/visibility.hpp -> cyros/kernel/visibility.hpp",
+  "public_headers/waitable.hpp -> cyros/kernel/waitable.hpp",
 ]

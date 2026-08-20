@@ -3,7 +3,7 @@
  * @brief The kernel mutex: ownership, inheritance, and its own blocking loop.
  *
  * The blocking loop here is deliberately NOT shared with wait_on_any. Only the
- * commit step is, via thread_action::commit_to_block, because that is the part
+ * commit step is, via commit_to_block, because that is the part
  * where a lost wakeup hides. Arming one source and arming a span differ enough
  * that a common abstraction would cost more readability than it saves.
  */
@@ -11,7 +11,7 @@
 #include <cyros/kernel/base_mutex.hpp>
 #include <cyros/port/port.h>
 
-#include "thread_action.hpp"
+#include "scheduler.hpp"
 #include "threading_subsystem.hpp"
 
 #include <algorithm>
@@ -133,7 +133,7 @@ bool base_mutex::acquire_condition(thread_control_block& tcb) noexcept
    // while holding a resource (asserted at teardown), so a live read here is
    // part of that same contract.
    if (expected != nullptr) {
-      thread_action::request_repick(*expected);
+      request_repick(*expected);
    }
    return false;
 }
@@ -156,7 +156,7 @@ void base_mutex::check_ceiling_contract(thread_control_block const& tcb) const n
 
 bool base_mutex::try_lock() noexcept
 {
-   auto& tcb = thread_action::get_current_thread_on_this_core();
+   auto& tcb = scheduler_for_this_core().get_current_thread();
    check_ceiling_contract(tcb);
 
    thread_control_block* expected = nullptr;
@@ -169,7 +169,7 @@ bool base_mutex::try_lock() noexcept
 
 void base_mutex::lock() noexcept
 {
-   auto& tcb = thread_action::get_current_thread_on_this_core();
+   auto& tcb = scheduler_for_this_core().get_current_thread();
    check_ceiling_contract(tcb);
 
    wait_queue::wait_node node{};
@@ -210,7 +210,7 @@ void base_mutex::lock() noexcept
 
       // Park, unless a wake already revoked the intent. Control resumes here
       // once something readies us, which for a mutex means a handover.
-      thread_action::commit_to_block(tcb);
+      commit_to_block(tcb);
       queue.disarm(node);
       tcb.blocked_on.store(nullptr, std::memory_order_release);
 
@@ -225,7 +225,7 @@ void base_mutex::lock() noexcept
 
 void base_mutex::unlock(reschedule_policy policy) noexcept
 {
-   auto& tcb = thread_action::get_current_thread_on_this_core();
+   auto& tcb = scheduler_for_this_core().get_current_thread();
    CYROS_ASSERT_OP(owner.load(std::memory_order_relaxed), ==, &tcb); // Release by non-owner
 
    // Retire from the held slots FIRST, so a fold running during the handover no

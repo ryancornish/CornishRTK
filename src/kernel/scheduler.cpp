@@ -1,6 +1,5 @@
 #include "scheduler.hpp"
 
-#include "thread_action.hpp"
 
 #include <cyros/kernel/core.hpp>
 
@@ -81,7 +80,7 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
       if (tcb.is_enqueued() && !tcb.holds_nothing()) {
          ready_matrix.remove_thread(tcb);
          link_holder(tcb);
-         if (thread_action::urgency(tcb) < current_thread_urgency()) {
+         if (urgency(tcb) < current_thread_urgency()) {
             return schedule_hint::warranted;
          }
       }
@@ -106,7 +105,7 @@ schedule_hint scheduler::set_thread_ready(thread_control_block& tcb)
       link_holder(tcb);
    }
 
-   if (thread_action::urgency(tcb) < current_thread_urgency()) {
+   if (urgency(tcb) < current_thread_urgency()) {
       return schedule_hint::warranted;
    }
    return schedule_hint::unwarranted;
@@ -143,7 +142,7 @@ void scheduler::set_thread_terminated(thread_control_block& tcb)
 
    tcb.state = thread_state::terminated;
 
-   thread_action::unregister_thread(tcb);
+   thread_registry::unregister_thread(tcb);
 
    cyros_port_context_destroy(tcb.context());
 
@@ -157,7 +156,7 @@ void scheduler::set_thread_terminated(thread_control_block& tcb)
 
 uint8_t scheduler::current_thread_urgency() const
 {
-   return current_thread ? thread_action::urgency(*current_thread) : 0;
+   return current_thread ? urgency(*current_thread) : 0;
 }
 
 thread_control_block* scheduler::pick_next()
@@ -173,7 +172,7 @@ thread_control_block* scheduler::pick_next()
    thread_control_block* best_holder = nullptr;
    std::uint8_t best_holder_urgency = 0xFF;
    for (auto* h = holders_head; h != nullptr; h = h->holder_next) {
-      auto const u = thread_action::urgency(*h);
+      auto const u = urgency(*h);
       if (u < best_holder_urgency) {
          best_holder_urgency = u;
          best_holder = h;
