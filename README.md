@@ -1,174 +1,258 @@
 # Cyros
 
-Cyros is a small, modern C++ real-time kernel for embedded systems.
+Cyros is a small real-time kernel for embedded systems, written in modern C++.
 
-I'm building it around one idea: an RTOS should be something you can *read*
-before you *trust*. The core is intentionally tiny, the layers are cleanly
-separated, and almost everything beyond the bare minimum is opt-in.
+The idea it is built around: an RTOS should be something you can *read* before
+you *trust*. The core is deliberately small, the layer boundaries are strict,
+and everything beyond scheduling and blocking is a component you opt into.
 
-> **Status: early work-in-progress.** What follows is the design I'm building
-> toward. Not all of it exists yet, and the parts that do are still moving.
-> See [Project Status](#project-status) for an honest breakdown of what's
-> actually there today. APIs *will* change.
+> **Status: work in progress.** The architecture described here exists and is
+> under test, but APIs still move. See [Status](#status) for what is real
+> today.
 
-## Why I'm building this
+## Design ethos
 
-Most RTOSes make two choices I wanted to avoid:
+**The kernel has no concept of time.** Most RTOS cores read "real-time" as
+"the scheduler counts ticks" and end up with timekeeping tangled through
+everything. In Cyros the kernel knows whether a thread is ready, running, or
+blocked, and what it is blocked on. That is all. Time lives in a separate
+driver that sits beside the kernel, not beneath it, and anything time-flavoured
+is built by composing the two. If your system needs no clock, you can build a
+valid Cyros with no time driver at all.
 
-1. **They bake time into the scheduler.** "Real-time" gets read as "the
-   scheduler counts ticks," and timekeeping ends up tangled through the core.
-2. **They ship a kitchen sink.** One giant config header tries to anticipate
-   every use case, and you pay (in code size and in cognitive load) for
-   features you never enable.
+**Derived truth over cached state.** Where the kernel needs a value that other
+cores can change, it computes the value at the point of use instead of storing
+a copy and propagating updates. The clearest example is priority inheritance:
+there is no stored "effective priority" anywhere. A thread's urgency is
+computed from its base priority and the waiters actually queued on the locks it
+actually holds, at the moment the scheduler asks. Cross-core notifications
+carry no values either, only the fact that a core should look again. A stale
+notification costs a redundant scheduling pass, never a wrong answer.
 
-Cyros keeps a tight, time-agnostic core instead, and layers everything else on
-top as components and features you choose to include.
+**Pay only for what you enable.** Features are separate components with their
+own headers and sources, selected at build time. There is no master
+configuration header trying to anticipate every use case, and a feature you do
+not select costs you nothing in code size or in reading.
+
+**The hosted build is the real kernel.** The scheduler, the blocking machinery,
+and the synchronisation primitives run identically on a desktop and on a
+target, because the port boundary is cut below all of them. The test suites run
+the actual kernel, under genuine SMP and genuine asynchronous preemption, on a
+development machine.
 
 ## Architecture
 
-Cyros is organised into four layers. I take the boundaries between them
-seriously: each layer depends only on the ones it's allowed to, and I've picked
-the seams deliberately so behaviour stays consistent across very different
-targets.
+Four layers. Each depends only on what sits below it, and the kernel and the
+time driver deliberately do not depend on each other.
 
 ```
         +-------------------------------------------------+
         |  userlib                                        |
-        |  Mutex, and other opt-in primitives & features  |
+        |  opt-in features: sync primitives, round-robin  |
         +-------------------------------------------------+
                  |                          |
                  v                          v
         +-------------------+      +-------------------+
         |  kernel           |      |  time driver      |
-        |  schedulers,      |      |  monotonic time,  |
-        |  threads,         |      |  scheduled        |
-        |  waitable         |      |  callbacks        |
+        |  per-core         |      |  monotonic time,  |
+        |  schedulers,      |      |  scheduled        |
+        |  threads,         |      |  callbacks        |
+        |  waitables,       |      |  (periodic,       |
+        |  mutex core       |      |  tickless, sim)   |
         +-------------------+      +-------------------+
                  |                          |
                  v                          v
         +-------------------------------------------------+
         |  port  (C ABI)                                  |
-        |  context switching, IRQ control, cores, time    |
+        |  contexts, interrupt & preemption control,      |
+        |  core startup, inter-core signalling, time src  |
         +-------------------------------------------------+
 ```
 
-### Port layer
+### Port
 
-The port is the hardware (or host) abstraction layer. I expose it as a plain
-**C ABI** so it can be implemented in C or assembly. It provides context
-creation/switching, critical-section (interrupt) control, multi-core startup
-and inter-core signalling, and the low-level time source.
+The port is the hardware (or host) abstraction, exposed as a plain C ABI so it
+can be implemented in C or assembly. It provides opaque CPU contexts and the
+switch between them, interrupt masking and preemption control as balanced
+save/restore pairs, multi-core startup, an inter-core reschedule signal, and
+the low-level time source.
 
-The part I care most about here is *where the cut is made*. I slice the port at
-exactly the depth where the scheduler and all higher-level kernel policy run
-identically whether the port is:
+The cut is placed so that everything above it is policy and everything below
+it is mechanism. The kernel never sees a fiber, a pthread, or a signal frame,
+only a context it asks the port to create, switch, and destroy.
 
-- on **Linux**, using [Boost.Context](https://www.boost.org/doc/libs/release/libs/context/)
-  to create and switch cooperative contexts, or
-- on **bare metal** - an ARM Cortex-M port is my intended first target.
+Two Linux ports exist today:
 
-The kernel never sees a fiber or a thread, only an opaque context. So an
-application built on Cyros gets *nearly* reproducible behaviour between a
-hosted unit test and the real device. That's useful to me while developing the
-kernel, and it should be just as useful to anyone building on top of it.
+- **linux_coop** builds contexts on raw fcontext switching. Cooperative,
+  simple, and fast to debug against.
+- **linux_preempt** delivers genuine asynchronous preemption in a hosted
+  process. Cores are threads, interrupts are POSIX signals, and a running
+  thread can be preempted between any two instructions, exactly the asynchrony
+  a hardware interrupt provides. It is built on
+  [sigctx](external/sigctx), a small self-contained C library for capturing
+  and resuming CPU contexts from signal handlers, developed alongside Cyros
+  and vendored here.
 
-There's one asymmetry I can't design away: a real bare-metal port can preempt a
-task from an external interrupt, while the Linux/Boost.Context port is
-cooperative by nature. So ports declare their scheduling type (preemptive or
-cooperative) and environment (bare-metal or simulation), and the kernel adapts.
+Ports declare their scheduling model, and the kernel adapts. The intended
+first bare-metal target is ARM Cortex-M.
 
-### Kernel layer
+### Kernel
 
-The kernel is, more than anything, a set of **per-core schedulers** in an SMP
-arrangement.
+The kernel is a set of per-core schedulers in an SMP arrangement, plus the
+blocking machinery that connects them.
 
-It has **no concept of time.** This is the deliberately radical choice - an
-RTOS core that doesn't know what a second is. The kernel only cares whether a
-thread is `ready`, `running`, or `blocked`, and what it's blocked *on*: an
-abstract object I call a **`waitable`**.
+Scheduling is fixed-priority and per-core. Every thread is pinned to one core,
+chosen at registration from its affinity mask, and priorities are ordered
+globally across the system rather than per core. Core-local scheduler state is
+only ever touched by its owning core. When another core needs something done
+to a thread, it records the request as a flag on the thread itself and rings
+the owning core with an inter-core signal. There are no cross-core message
+queues and no payloads in flight, so there is nothing to fill up and nothing
+to deliver out of order.
 
-Each core owns its own scheduler state. Core-local structures are only ever
-mutated by their owning core; cross-core operations go through an explicit
-message inbox plus an inter-core interrupt. The kernel gives you thread creation
-and the blocking/unblocking machinery, and not much else.
+Blocking is built on one abstraction, the **waitable**. A waitable owns a
+priority-ordered queue of parked threads and a single derived-class hook that
+answers whether the calling thread can proceed without blocking. Wakes come in
+barge-permitting flavours (`wake_one`, `wake_all`) and a committed-handoff
+flavour (`wake_one_and_transfer`) for primitives that must not let a late
+arrival barge past a woken waiter. A thread can block on several waitables at
+once with `wait_on_any`.
 
-> The `waitable` abstraction works well as a notification-style primitive, but
-> I'm not happy with it yet for *conditional acquisition* - the mutex-locking
-> case, where waking is contingent on a predicate. Expect this area to change.
+Mutual exclusion is not built on the waitable. The kernel carries a separate
+**mutex core** (`base_mutex`) with ownership, barge-free handoff, and priority
+inheritance built in. Mutexes are deliberately excluded from group waits, and
+the type system enforces that rather than a runtime check. The split keeps the
+general waitable cheap: primitives that never own anything never pay for
+inheritance machinery.
 
-### Time driver layer
+Priority inversion is handled by two protocols, chosen per lock at the
+declaration site:
 
-The time driver sits **parallel to** the kernel, not underneath it. It depends
-on the port, but the kernel and the time driver don't depend on each other.
+- **Inheritance** (`sync::mutex`). A holder's urgency is raised to its most
+  urgent waiter, transitively through chains of waiting holders, with the
+  chain walk bounded at a fixed depth.
+- **Immediate ceiling** (`sync::cemutex`). The holder runs at the lock's
+  ceiling priority from acquisition to release, whether or not anyone is
+  waiting. Cheaper to evaluate and more predictable, at the price of paying
+  the boost on every acquisition.
 
-Because I keep time outside the core, it's genuinely optional. If you want
-nothing to do with time, you can omit the time driver entirely (along with any
-feature that transitively needs it) and still have a valid Cyros instance. If
-you already have your own timer infrastructure, you can implement the time
-driver interface yourself and sidestep mine completely.
+Both are folds over current truth, computed when the scheduler picks, never
+stored, so there is no propagation and nothing to go stale.
 
-I ship a few time driver implementations to pick between:
+Thread lifetime also runs through the scheduler. A thread ends by returning
+from its entry function or by calling `this_thread::thread_exit()`, either way
+the scheduler retires it on its own core, releases its resources, and signals
+joiners through an ordinary waitable. Stacks are caller-owned buffers, and the
+kernel states its minimum stack size as a compile-time constant.
 
-- a **periodic (tickful)** driver,
-- a **tickless** driver, and
-- a **simulation** driver for deterministic host-side testing.
+### Time driver
 
-### userlib layer
+The time driver depends on the port and nothing else. It provides a monotonic
+`time_point`, durations, and one-shot or recurring scheduled callbacks. Three
+implementations ship: a periodic (tickful) driver, a tickless driver, and a
+simulation driver that makes host-side tests deterministic.
 
-userlib is where the convenient, user-facing primitives live - the things built
-*on top of* the kernel primitives (thread creation and `waitable` blocking).
+Because the kernel does not know the driver exists, replacing it with your own
+timer infrastructure means implementing one interface, not excavating the
+scheduler.
 
-My guiding principle here is **pick-and-choose**. userlib is a set of features,
-and a downstream project includes only the ones it wants:
+### userlib
 
-- Don't want a heap? Omit the allocator feature.
-- Already have your own allocator? Omit mine and use yours.
-- Want synchronization primitives but no time-based variants? Take a `sync`
-  feature without timed methods; a separate feature can combine `sync` with the
-  time driver to provide the timed variants.
+User-facing features, each one optional:
 
-Features can compose with each other and with the time driver, but I don't
-force anything on you.
+- **sync**: `mutex` and `cemutex` as thin facades over the kernel's mutex
+  core, and a counting `semaphore` built on the waitable.
+- **round_robin**: time-slicing for equal-priority threads, built by composing
+  the time driver with the scheduler's public surface. The kernel needed no
+  changes to support it, which is the layering doing its job: even the classic
+  "scheduler feature" is an optional component outside the scheduler.
+
+## A taste of the API
+
+```cpp
+#include <cyros/kernel/kernel.hpp>
+#include <cyros/kernel/thread.hpp>
+#include <cyros/sync/mutex.hpp>
+
+using namespace cyros;
+
+sync::mutex log_lock;
+
+std::array<std::byte, 32 * 1024> stack;
+
+int main()
+{
+   kernel::initialise();
+
+   thread worker(
+      []{
+         log_lock.lock();
+         // ...
+         log_lock.unlock();
+      },
+      stack,
+      thread::priority(4)
+   );
+
+   kernel::start();
+}
+```
+
+Threads take a caller-owned stack, a priority (lower number is more urgent),
+and optionally a core-affinity mask. `this_thread::` provides `id()`,
+`priority()`, `yield()`, `thread_exit()`, and the blocking entry points
+`wait_on` / `wait_on_any`. Critical sections and preemption control are RAII
+guards under `this_core::`. Building a new blocking primitive means deriving
+from `waitable` and implementing one hook.
+
+## Methodology
+
+The unit suites run against both Linux ports, so every kernel test executes
+once cooperatively and once under real asynchronous preemption. A separate
+port-contract suite pins down the port ABI's guarantees (mask ownership,
+nesting and overlap of interrupt and preemption regions) independently of the
+kernel that relies on them. Consumer tests build small complete applications
+against a packaged Cyros to keep the public headers honest.
+
+The working rules are simple to state. Concurrency claims are tested under the
+preemptive port, not argued from the source. Fixes are verified against the
+failure they fix, ideally by re-introducing the defect and watching the test
+catch it. Costs that matter are measured, and bounds that matter are written
+down next to the code that has them.
 
 ## Building
 
-Cyros is assembled with **Cyros-Builder**, a separate Python-based tool I'm
-writing alongside it. It reads component and profile descriptions, selects the
-port, time driver, and feature set you want, and produces a packaged library
-plus headers.
+Cyros is assembled by [Cyros-Builder](../cyros-builder), a companion tool that
+reads the component and profile descriptions in this repository and produces a
+packaged static library plus headers for a chosen port, time driver, and
+feature set. The `component.toml` and `feature.toml` files throughout the tree
+and the profiles under `build/profiles/` exist for it. Build instructions and
+the profile format live in that project.
 
-The component layout in this repo (the `component.toml` files, public header
-mappings, and build profiles) is tailored for that builder. For build
-instructions, the profile format, and how feature opt-in works mechanically,
-see the Cyros-Builder project.
+## Status
 
-## Project Status
+Implemented and under test:
 
-Cyros is in early development. Roughly where things stand:
+- Per-core SMP scheduling with fixed priorities, core affinity, and global
+  priority ordering.
+- Threads: creation onto caller-owned stacks, termination through the
+  scheduler, join built on an ordinary waitable.
+- The waitable model, group waits, and the committed-handoff wake.
+- The kernel mutex core with priority inheritance (transitive, bounded) and
+  immediate-ceiling protocols, surfaced as `sync::mutex` and `sync::cemutex`.
+- A counting semaphore.
+- Round-robin time-slicing as an opt-in feature.
+- Both Linux ports, including preemptive scheduling driven by POSIX signals.
+- Time drivers: periodic, tickless, simulation.
 
-**Implemented and under test**
+Planned:
 
-- Per-core SMP scheduler with fixed-priority selection and core affinity.
-- Thread creation, joining, and the `waitable` blocking model
-  (`wait_for`, `wait_for_any`).
-- Linux / Boost.Context simulation port.
-- Time driver implementations (periodic, tickless, simulation).
-- A `Mutex` in `userlib`.
+- Timed blocking: `sleep_for` and the timed lock and acquire variants, built
+  by composing the time driver with the existing group wait.
+- A bare-metal port, ARM Cortex-M first.
+- Migration as an explicit user API (threads are pinned today).
+- More userlib features, including an optional allocator.
+- Example projects and on-device demos.
 
-**In flux / being redesigned**
-
-- Reschedule semantics that behave identically on cooperative (Linux) and
-  preemptive (bare-metal) ports.
-- Spinlock and cross-core synchronisation details.
-- The `waitable` interface, particularly conditional acquisition.
-- The time driver public interface (moving away from a singleton-style API).
-
-**Planned**
-
-- A bare-metal port (ARM Cortex-M first).
-- More `userlib` features - additional sync primitives, an optional heap, and
-  so on.
-- Example projects, including on-device demos.
-
-If you're poking at the scheduler or thinking about a port, I'd genuinely like
-the feedback.
+If you are reading the scheduler or considering writing a port, feedback is
+welcome.
