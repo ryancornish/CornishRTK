@@ -26,9 +26,20 @@ public:
 
    [[nodiscard]] bool try_acquire() noexcept;
 
-   [[nodiscard]] bool try_acquire_for(time::time_point tp) noexcept;
+   /**
+    * @brief try_acquire, blocking up to @p d / until @p tp for a token.
+    *
+    * PROVIDED BY THE CHRONO FEATURE. sync is time-free: these are declared
+    * here so the type is complete, and their definitions live in chrono.
+    * Calling one without chrono in the package is a link error naming the
+    * method, which is the intended diagnosis, not a bug. Merely instantiating
+    * a semaphore never references them, so sync alone stays link-clean.
+    *
+    * A deadline at or before now degrades to plain try_acquire.
+    */
+   [[nodiscard]] bool try_acquire_for(time::duration d) noexcept;
 
-   [[nodiscard]] bool try_acquire_until(time::duration d) noexcept;
+   [[nodiscard]] bool try_acquire_until(time::time_point tp) noexcept;
 
 protected:
    bool try_satisfy() noexcept override;

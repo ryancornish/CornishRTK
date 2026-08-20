@@ -102,6 +102,9 @@ public:
 private:
    struct thread_control_block* tcb{nullptr};
 
+   // Kernel-internal attorney, defined only in kernel/diagnostics.cpp.
+   friend struct diagnostics_access;
+
 public:
    /**
     * @brief Budget for the kernel-private part of the TCB, everything except

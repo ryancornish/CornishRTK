@@ -1,0 +1,10 @@
+[test]
+name   = "test_diagnostics"
+source = "test_diagnostics.cpp"
+config = "test_diagnostics_config.hpp"
+
+[components]
+features = ["sync"]
+
+[link]
+system_libraries = ["boost_context", "gtest", "gtest_main"]

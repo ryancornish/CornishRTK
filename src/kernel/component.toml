@@ -4,6 +4,7 @@ kind = "core"
 sources = [
   "base_mutex.cpp",
   "core.cpp",
+  "diagnostics.cpp",
   "kernel.cpp",
   "scheduler.cpp",
   "spinlock.cpp",
@@ -18,6 +19,7 @@ sources_excluded_from_archive = [
 public_headers = [
   "public_headers/base_mutex.hpp -> cyros/kernel/base_mutex.hpp",
   "public_headers/core.hpp -> cyros/kernel/core.hpp",
+  "public_headers/diagnostics.hpp -> cyros/kernel/diagnostics.hpp",
   "public_headers/function.hpp -> cyros/kernel/function.hpp",
   "public_headers/kernel.hpp -> cyros/kernel/kernel.hpp",
   "public_headers/spinlock.hpp -> cyros/kernel/spinlock.hpp",

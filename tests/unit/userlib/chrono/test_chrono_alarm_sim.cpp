@@ -337,3 +337,92 @@ TEST_F(ChronoAlarmSim_Test, GivenTimedWait_WhenNothingReleases_ThenTheAlarmIndex
    EXPECT_EQ(index, 1u); // the deadline
    EXPECT_EQ(count_after, 0u);
 }
+
+/* Stage 2: the timed methods themselves, chrono-owned definitions on the
+ * sync-declared semaphore. */
+
+TEST_F(ChronoAlarmSim_Test, GivenTimedAcquire_WhenNothingReleases_ThenItReturnsFalseAtTheDeadline)
+{
+   sync::semaphore sem(0);
+   bool got = true;
+   uint64_t returned_at = 0;
+
+   thread waiter(
+      [&]{
+         got = sem.try_acquire_until(time::time_point{40});
+         returned_at = time::now().value;
+      },
+      s_a, thread::priority(1)
+   );
+
+   thread pumper([&]{ pump_until(time::time_point{80}); }, s_pump, thread::priority(20));
+
+   kernel::start();
+
+   EXPECT_FALSE(got);
+   EXPECT_EQ(returned_at, 40u);
+   EXPECT_EQ(sem.peek(), 0u);
+}
+
+TEST_F(ChronoAlarmSim_Test, GivenTimedAcquire_WhenReleasedBeforeTheDeadline_ThenItReturnsTrueAndConsumes)
+{
+   sync::semaphore sem(0);
+   bool got = false;
+
+   thread waiter(
+      [&]{
+         got = sem.try_acquire_for(time::duration{60});
+      },
+      s_a, thread::priority(1)
+   );
+
+   thread releaser(
+      [&]{
+         pump_until(time::time_point{15});
+         sem.release();
+      },
+      s_b, thread::priority(10)
+   );
+
+   thread pumper([&]{ pump_until(time::time_point{100}); }, s_pump, thread::priority(20));
+
+   kernel::start();
+
+   EXPECT_TRUE(got);
+   EXPECT_EQ(sem.peek(), 0u); // consumed, not merely observed
+}
+
+TEST_F(ChronoAlarmSim_Test, GivenAPastDeadline_WhenTryAcquireUntilRuns_ThenItDegradesToTryAcquireWithoutBlocking)
+{
+   sync::semaphore with_token(1);
+   sync::semaphore without_token(0);
+   bool took = false;
+   bool missed = true;
+
+   thread caller(
+      [&]{
+         time::simulation::advance_to(time::time_point{20});
+         took   = with_token.try_acquire_until(time::time_point{5});
+         missed = without_token.try_acquire_until(time::time_point{5});
+      },
+      s_a, thread::priority(1)
+   );
+
+   // No pumper: if the empty-semaphore case blocked, the suite would hang.
+   kernel::start();
+
+   EXPECT_TRUE(took);
+   EXPECT_FALSE(missed);
+}
+
+TEST_F(ChronoAlarmSim_Test, GivenZeroDuration_WhenTryAcquireForRuns_ThenItDegradesToTryAcquire)
+{
+   sync::semaphore sem(0);
+   bool got = true;
+
+   thread caller([&]{ got = sem.try_acquire_for(time::duration{0}); }, s_a, thread::priority(1));
+
+   kernel::start();
+
+   EXPECT_FALSE(got);
+}

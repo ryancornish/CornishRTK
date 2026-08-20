@@ -186,3 +186,26 @@ TEST_F(ChronoAlarmPreempt_Test, GivenABusySpinner_WhenTheAlarmFires_ThenTheWoken
    EXPECT_TRUE(woke.load());
    EXPECT_TRUE(spinner_saw_wake.load()); // observed mid-spin, so the wake preempted
 }
+
+TEST_F(ChronoAlarmPreempt_Test, GivenTimedAcquire_WhenNothingReleases_ThenItTimesOutUnderTheRealTimer)
+{
+   sync::semaphore sem(0);
+   bool got = true;
+   uint64_t before = 0;
+   uint64_t after = 0;
+
+   thread waiter(
+      [&]{
+         time::start();
+         before = time::now().value;
+         got = sem.try_acquire_for(time::from_milliseconds(10));
+         after = time::now().value;
+      },
+      s_a, thread::priority(1)
+   );
+
+   kernel::start();
+
+   EXPECT_FALSE(got);
+   EXPECT_GE(after - before, 10u);
+}

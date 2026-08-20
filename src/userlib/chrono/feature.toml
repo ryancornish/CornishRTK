@@ -4,10 +4,12 @@ description = "Time-flavoured blocking: alarm waitable, sleep_for/sleep_until"
 dependencies = [
    "kernel",
    "time",
+   "sync",
 ]
 
 sources = [
   "alarm.cpp",
+  "semaphore_timed.cpp",
 ]
 
 public_headers = [

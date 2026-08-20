@@ -240,15 +240,17 @@ Implemented and under test:
 - The waitable model, group waits, and the committed-handoff wake.
 - The kernel mutex core with priority inheritance (transitive, bounded) and
   immediate-ceiling protocols, surfaced as `sync::mutex` and `sync::cemutex`.
+- A lock-free blocking-chain query with advisory deadlock detection, reading
+  the same published state the scheduler folds urgency from.
 - A counting semaphore.
 - Round-robin time-slicing as an opt-in feature.
+- The `chrono` feature: an `alarm` waitable, `sleep_for`/`sleep_until`, and
+  timed semaphore acquisition, all composed over the time driver.
 - Both Linux ports, including preemptive scheduling driven by POSIX signals.
 - Time drivers: periodic, tickless, simulation.
 
 Planned:
 
-- Timed blocking: `sleep_for` and the timed lock and acquire variants, built
-  by composing the time driver with the existing group wait.
 - A bare-metal port, ARM Cortex-M first.
 - Migration as an explicit user API (threads are pinned today).
 - More userlib features, including an optional allocator.
