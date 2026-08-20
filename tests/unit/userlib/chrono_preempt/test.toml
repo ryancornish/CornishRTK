@@ -1,0 +1,15 @@
+[test]
+name   = "test_chrono_alarm_preempt"
+source = "test_chrono_alarm_preempt.cpp"
+config = "test_chrono_alarm_preempt_config.hpp"
+
+# Preempt + periodic: the alarm callback runs in a genuine timer ISR and wakes
+# a genuinely blocked thread. This is the suite that gives the ISR-safe wake
+# claim a consumer, so it asserts order and lower bounds, never exact ticks
+[components]
+port        = "linux_preempt"
+time_driver = "periodic"
+features    = ["chrono", "sync"]
+
+[link]
+system_libraries = ["gtest", "gtest_main"]

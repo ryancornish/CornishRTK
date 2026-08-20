@@ -1,0 +1,16 @@
+name = "chrono"
+description = "Time-flavoured blocking: alarm waitable, sleep_for/sleep_until"
+
+dependencies = [
+   "kernel",
+   "time",
+]
+
+sources = [
+  "alarm.cpp",
+]
+
+public_headers = [
+  "public_headers/alarm.hpp -> cyros/chrono/alarm.hpp",
+  "public_headers/chrono.hpp -> cyros/chrono/chrono.hpp",
+]

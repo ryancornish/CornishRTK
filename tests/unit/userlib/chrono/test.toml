@@ -1,0 +1,14 @@
+[test]
+name   = "test_chrono_alarm_sim"
+source = "test_chrono_alarm_sim.cpp"
+config = "test_chrono_alarm_sim_config.hpp"
+
+# Simulation + coop: virtual time is advanced explicitly by a pumper thread, so
+# every deadline fires at an exact tick and the suite is fully deterministic
+[components]
+port        = "linux_coop"
+time_driver = "simulation"
+features    = ["chrono", "sync"]
+
+[link]
+system_libraries = ["boost_context", "gtest", "gtest_main"]
